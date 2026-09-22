@@ -148,6 +148,7 @@
   let loadedHistorySessionId = null;
   let activeSessionLoad = null;
   let sidebarSwipe = null;
+  let sidebarCollapsed = localStorage.getItem('cc-web-sidebar-collapsed') === '1';
   let pendingAttachments = [];
   let uploadingAttachments = [];
   let loginPasswordValue = ''; // store login password for force-change flow
@@ -171,6 +172,7 @@
   const sidebar = $('#sidebar');
   const sidebarOverlay = $('#sidebar-overlay');
   const menuBtn = $('#menu-btn');
+  const sidebarCollapseBtn = $('#sidebar-collapse-btn');
   const chatMain = document.querySelector('.chat-main');
   const newChatSplit = sidebar.querySelector('.new-chat-split');
   const newChatBtn = $('#new-chat-btn');
@@ -3517,6 +3519,49 @@
   });
 
   // --- Sidebar ---
+  // 桌面端把整列会话收起，状态存 localStorage，刷新后保持。
+  // 收起后侧栏被裁成 0 宽，列内的按钮也跟着看不见了，展开入口是聊天头部的 ☰。
+  let endSidebarAnim = null;
+
+  function setSidebarCollapsed(collapsed, options = {}) {
+    const next = !!collapsed;
+    const animate = options.animate !== false
+      && next !== sidebarCollapsed
+      && window.matchMedia('(min-width: 769px)').matches;
+
+    sidebarCollapsed = next;
+    localStorage.setItem('cc-web-sidebar-collapsed', next ? '1' : '0');
+
+    // 上一轮动画还没收尾就又点了：先把它结掉，避免两套 class 叠在一起
+    if (endSidebarAnim) endSidebarAnim();
+
+    if (!animate) {
+      app.classList.toggle('sidebar-collapsed', next);
+      return;
+    }
+
+    // 先让"脱离文档流"那套样式落地，再翻 collapsed，transform 才有过渡起点
+    app.classList.add('sidebar-animating');
+    void sidebar.offsetWidth;
+    app.classList.toggle('sidebar-collapsed', next);
+
+    let timer = null;
+    const finish = () => {
+      clearTimeout(timer);
+      sidebar.removeEventListener('transitionend', onEnd);
+      app.classList.remove('sidebar-animating');
+      if (endSidebarAnim === finish) endSidebarAnim = null;
+    };
+    function onEnd(e) {
+      if (e.target === sidebar && e.propertyName === 'transform') finish();
+    }
+    sidebar.addEventListener('transitionend', onEnd);
+    // 标签页切到后台时 transitionend 可能不触发，留个兜底别把 animating 态留在身上
+    timer = setTimeout(finish, 500);
+    endSidebarAnim = finish;
+  }
+  setSidebarCollapsed(sidebarCollapsed);
+
   function openSidebar() {
     sidebar.classList.add('open');
     sidebarOverlay.hidden = false;
@@ -3980,8 +4025,18 @@
   });
 
   menuBtn.addEventListener('click', () => {
+    // 桌面端 ☰ 只有侧栏收起时才露出，点它就是把会话列表展开回来；
+    // 移动端它仍然是抽屉开关。断点和 CSS 里的 769px 保持一致。
+    if (window.matchMedia('(min-width: 769px)').matches) {
+      setSidebarCollapsed(false);
+      return;
+    }
     sidebar.classList.contains('open') ? closeSidebar() : openSidebar();
   });
+
+  if (sidebarCollapseBtn) {
+    sidebarCollapseBtn.addEventListener('click', () => setSidebarCollapsed(true));
+  }
 
   sidebarOverlay.addEventListener('click', closeSidebar);
   document.addEventListener('touchstart', handleSidebarSwipeStart, { passive: true });

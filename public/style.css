@@ -455,6 +455,8 @@ body {
   min-height: -webkit-fill-available;
   width: 100%;
   overflow: hidden;
+  /* 侧栏收放动画期间会 absolute 定位到这里 */
+  position: relative;
 }
 
 body.session-loading-active {
@@ -813,6 +815,40 @@ body.session-loading-active {
   flex-shrink: 0;
 }
 .brand { font-size: 12px; color: var(--text-muted); }
+
+/* 桌面端收起整列会话：宽度压到 0（.sidebar 本来就 overflow:hidden，内容直接裁掉），
+   聊天区自动铺满；展开入口交给聊天头部那个本来只在移动端露脸的 ☰。
+   移动端侧栏是抽屉，已经有 ☰ 开关，所以这套规则只在 769px 以上生效。 */
+@media (min-width: 769px) {
+  .app.sidebar-collapsed .sidebar {
+    width: 0;
+    min-width: 0;
+    border-right: none;
+  }
+  .app.sidebar-collapsed .menu-btn { display: block; }
+
+  /* 过渡期间把侧栏摘出文档流、改用 transform 滑动：transform 只走合成层，
+     而直接过渡 width 会让整条消息列表每帧重新排版，那才是收放卡顿的来源。
+     让出来的槽位改由 .app 的 padding-left 顶着，一次收放只重排一次布局。 */
+  .app.sidebar-animating .sidebar {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 50;
+    width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
+    border-right: 1px solid var(--border-color);
+    transition: transform 0.25s ease;
+    will-change: transform;
+  }
+  .app.sidebar-animating:not(.sidebar-collapsed) {
+    padding-left: var(--sidebar-width);
+  }
+  .app.sidebar-animating.sidebar-collapsed .sidebar {
+    transform: translateX(-100%);
+  }
+}
 
 /* === Chat Main === */
 .chat-main {
@@ -1967,6 +2003,8 @@ body.session-loading-active {
     z-index: 99;
   }
   .menu-btn { display: block; }
+  /* 移动端侧栏是抽屉，收起由 ☰ 和滑动手势负责，不需要这个按钮 */
+  .sidebar-collapse-btn { display: none; }
   .msg { max-width: 95%; }
   .input-area { padding: 8px 10px; padding-bottom: max(10px, var(--safe-bottom)); }
   .messages { padding: 12px 8px; gap: 10px; }
@@ -2051,6 +2089,13 @@ body.session-loading-active {
   margin-right: 8px;
 }
 .settings-btn:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+
+/* 收起按钮沿用 ⚙ 的整套外观（含主题覆盖），只调间距和字号 */
+.sidebar-collapse-btn {
+  margin-right: 0;
+  margin-left: 8px;
+  font-size: 15px;
+}
 
 /* === Settings Overlay & Panel === */
 .settings-overlay {
