@@ -33,7 +33,8 @@
 
   const SLASH_COMMANDS = [
     { cmd: '/clear', desc: '清除当前会话' },
-    { cmd: '/model', desc: '查看/切换模型' },
+    { cmd: '/model', desc: '查看/切换模型（含思考强度）' },
+    { cmd: '/effort', desc: '查看/切换思考强度' },
     { cmd: '/mode', desc: '查看/切换权限模式' },
     { cmd: '/cost', desc: '查看会话费用' },
     { cmd: '/compact', desc: '压缩上下文' },
@@ -63,10 +64,21 @@
   const SIDEBAR_SWIPE_TRIGGER = 72;
   const SIDEBAR_SWIPE_MAX_VERTICAL_DRIFT = 42;
 
+  // 网关不可用时的兜底候选。正常情况下由服务端 model_options 动态覆盖。
   const MODEL_OPTIONS = [
     { value: 'opus', label: 'Opus', desc: '最强大，1M 上下文' },
     { value: 'sonnet', label: 'Sonnet', desc: '平衡性能，1M 上下文' },
     { value: 'haiku', label: 'Haiku', desc: '最快速，适合简单任务' },
+  ];
+
+  // claude CLI --effort 的合法取值（服务端会用 CLI 权威列表覆盖）
+  const EFFORT_OPTIONS = [
+    { value: 'default', label: '默认', desc: '清除设置，不传 --effort，由 CLI 决定' },
+    { value: 'low', label: 'low', desc: '最省 token，适合简单改动' },
+    { value: 'medium', label: 'medium', desc: '中等推理强度' },
+    { value: 'high', label: 'high', desc: '较强推理，日常复杂任务' },
+    { value: 'xhigh', label: 'xhigh', desc: '更强推理，跨文件重构/排障' },
+    { value: 'max', label: 'max', desc: '最强推理，最慢最贵' },
   ];
 
   const MODE_PICKER_OPTIONS = [
@@ -127,6 +139,9 @@
   const sessionGoalState = new Map(); // sessionId -> { active, turns, lastFeedback }
   const SESSION_GOAL_STATE_CAP = 100;
   let pendingGoalForNewSession = null;
+  let currentEffort = '';
+  // 服务端推送的网关可用模型 / effort 列表，null 表示尚未拿到
+  let modelCatalog = null;
   let currentAgent = AGENT_LABELS[localStorage.getItem('cc-web-agent')] ? localStorage.getItem('cc-web-agent') : DEFAULT_AGENT;
   let currentTheme = (document.documentElement.dataset.theme || localStorage.getItem('cc-web-theme') || 'washi');
   let codexConfigCache = null;
@@ -1252,6 +1267,7 @@
     setCurrentSessionRunningState(false);
     currentCwd = null;
     currentModel = currentAgent === 'claude' ? 'opus' : '';
+    currentEffort = '';
     isGenerating = false;
     pendingText = '';
     pendingAttachments = [];
@@ -1292,6 +1308,7 @@
       localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
     }
     currentModel = snapshot.model || '';
+    currentEffort = snapshot.effort || '';
     if (!preserveStreaming) {
       renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
     }
@@ -1511,6 +1528,16 @@
 	    const configuredModels = Array.isArray(activeProfile?.models) ? activeProfile.models : [];
 	    configuredModels.forEach((model) => addBaseOption(model, model, 'Profile 已配置模型'));
 
+	    // local 模式下没有 custom profile，Profile 列表为空，
+	    // 回落到服务端下发的候选（~/.codex/config.toml 当前模型 + 网关 gpt 系列）
+	    if (options.length === 0) {
+	      const fallback = Array.isArray(modelCatalog?.codexModels) ? modelCatalog.codexModels : [];
+	      fallback.forEach((item) => {
+	        if (item && typeof item === 'object') addBaseOption(item.value, item.label || item.value, item.desc || '');
+	        else addBaseOption(String(item), '', '网关可用模型');
+	      });
+	    }
+
 	    return options;
 	  }
 
@@ -1694,6 +1721,7 @@
           loginOverlay.hidden = true;
           app.hidden = false;
           send({ type: 'get_codex_config' });
+          send({ type: 'list_models' });
           // Check if must change password
           if (msg.mustChangePassword) {
             showForceChangePassword();
@@ -1938,10 +1966,25 @@
       case 'model_changed':
         if (msg.model) {
           currentModel = msg.model;
+          if (msg.effort !== undefined) currentEffort = msg.effort || '';
           if (currentSessionId) {
-            updateCachedSession(currentSessionId, (snapshot) => { snapshot.model = msg.model; });
+            updateCachedSession(currentSessionId, (snapshot) => {
+              snapshot.model = msg.model;
+              if (msg.effort !== undefined) snapshot.effort = msg.effort || '';
+            });
           }
         }
+        break;
+
+      case 'effort_changed':
+        currentEffort = msg.effort || '';
+        if (currentSessionId) {
+          updateCachedSession(currentSessionId, (snapshot) => { snapshot.effort = currentEffort; });
+        }
+        break;
+
+      case 'model_options':
+        modelCatalog = msg;
         break;
 
       case 'resume_generating':
@@ -3417,6 +3460,12 @@
           showModelPicker();
           return;
         }
+        if (cmd === '/effort') {
+          hideCmdMenu();
+          msgInput.value = '';
+          showEffortPicker();
+          return;
+        }
         if (cmd === '/mode') {
           hideCmdMenu();
           msgInput.value = '';
@@ -3451,6 +3500,12 @@
         hideCmdMenu();
         msgInput.value = '';
         showModelPicker();
+        return;
+      }
+      if (cmd === '/effort') {
+        hideCmdMenu();
+        msgInput.value = '';
+        showEffortPicker();
         return;
       }
       if (cmd === '/mode') {
@@ -3535,11 +3590,22 @@
 	      }
 	      showOptionPicker('选择 Codex 模型', baseOptions, current.base || '', (baseValue) => {
 	        const base = String(baseValue || '').trim();
+	        // catalog 里每个模型自带支持的 reasoning 档位，按所选模型渲染；拿不到时用通用三档
+	        const hit = (modelCatalog?.codexModels || []).find((m) => m && m.value === base);
+	        const levels = Array.isArray(hit?.efforts) && hit.efforts.length > 0 ? hit.efforts : null;
 	        const thinkingOptions = [
-	          { value: '', label: '无 (默认)', desc: '不附加 (medium/high/xhigh) 后缀' },
-	          { value: 'medium', label: 'medium', desc: '中等 thinking' },
-	          { value: 'high', label: 'high', desc: '更强 thinking' },
-	          { value: 'xhigh', label: 'xhigh', desc: '最强 thinking' },
+	          {
+	            value: '',
+	            label: '无 (默认)',
+	            desc: hit?.defaultEffort ? `用模型默认 (${hit.defaultEffort})` : '不附加 (level) 后缀',
+	          },
+	          ...(levels
+	            ? levels.map((l) => ({ value: l.value, label: l.value, desc: l.desc || 'thinking 强度' }))
+	            : [
+	              { value: 'medium', label: 'medium', desc: '中等 thinking' },
+	              { value: 'high', label: 'high', desc: '更强 thinking' },
+	              { value: 'xhigh', label: 'xhigh', desc: '最强 thinking' },
+	            ]),
 	        ];
 	        showOptionPicker('选择 Thinking 强度', thinkingOptions, current.level || '', (lvl) => {
 	          const level = String(lvl || '').trim().toLowerCase();
@@ -3549,8 +3615,64 @@
 	      });
 	      return;
 	    }
-	    showOptionPicker('选择模型', MODEL_OPTIONS, currentModel, (value) => {
-	      send({ type: 'message', text: `/model ${value}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+	    // 先选模型，再选 effort，一次点完两项
+	    showOptionPicker('选择模型', getClaudeModelOptions(), currentModel, (value) => {
+	      showOptionPicker('选择思考强度 (effort)', getEffortOptions(), currentEffort || 'default', (eff) => {
+	        send({ type: 'message', text: `/model ${value} ${eff}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+	      });
+    });
+  }
+
+  // 模型候选：优先用服务端给的列表（settings.json 的 modelPicker 登记项，或网关全量），
+  // 拿不到时回落到内置别名。别名排在前面（稳定、跟随配置切换），后面是具体模型名。
+  function getClaudeModelOptions() {
+    if (!modelCatalog) return MODEL_OPTIONS;
+    const ids = Array.isArray(modelCatalog.models) ? modelCatalog.models : [];
+    const aliases = Array.isArray(modelCatalog.aliases) ? modelCatalog.aliases : [];
+    if (ids.length === 0 && aliases.length === 0) return MODEL_OPTIONS;
+    // 服务端给了槽位真实模型名时按它显示，与终端 /model 一致；否则沿用内置的 Opus/Sonnet/Haiku
+    const aliasModels = modelCatalog.aliasModels || {};
+    const opts = aliases.map((a) => {
+      const hit = MODEL_OPTIONS.find((o) => o.value === a);
+      return {
+        value: a,
+        label: aliasModels[a] || (hit ? hit.label : a),
+        desc: aliasModels[a] ? `${a} 槽位` : (hit ? hit.desc : '内置别名'),
+      };
+    });
+    ids.forEach((item) => {
+      // 服务端给的可能是字符串（网关模型名）或带 label/desc 的对象（settings.json 登记项）
+      if (item && typeof item === 'object') {
+        opts.push({ value: item.value, label: item.label || item.value, desc: item.desc || '' });
+        return;
+      }
+      const id = String(item);
+      opts.push({
+        value: id,
+        label: id,
+        desc: id.startsWith('claude-') ? 'Claude 原生模型' : '网关其他模型（经网关转换）',
+      });
+    });
+    return opts;
+  }
+
+  // effort 候选：服务端给的是 claude --help 里的权威列表，首项固定为「默认」
+  function getEffortOptions() {
+    const levels = Array.isArray(modelCatalog?.efforts) ? modelCatalog.efforts : [];
+    if (levels.length === 0) return EFFORT_OPTIONS;
+    return [EFFORT_OPTIONS[0], ...levels.map((l) => {
+      const hit = EFFORT_OPTIONS.find((o) => o.value === l);
+      return { value: l, label: l, desc: hit ? hit.desc : '思考强度' };
+    })];
+  }
+
+  function showEffortPicker() {
+    if (currentAgent === 'codex') {
+      appendSystemMessage('Codex 的思考强度随模型一起设定（形如 gpt-5.5(high)），请使用 /model 选择。');
+      return;
+    }
+    showOptionPicker('选择思考强度 (effort)', getEffortOptions(), currentEffort || 'default', (eff) => {
+      send({ type: 'message', text: `/effort ${eff}`, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
     });
   }
 
@@ -3614,6 +3736,13 @@
       // /model without argument → show interactive picker
       if (text === '/model' || text === '/model ') {
         showModelPicker();
+        msgInput.value = '';
+        autoResize();
+        return;
+      }
+      // /effort without argument → show interactive picker
+      if (text === '/effort' || text === '/effort ') {
+        showEffortPicker();
         msgInput.value = '';
         autoResize();
         return;

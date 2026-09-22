@@ -723,6 +723,17 @@ let MODEL_MAP = {
   haiku: 'claude-haiku-4-5-20251001',
 };
 
+// claude CLI 的 --effort 合法取值（来源：claude --help，传错值时 CLI 也会回显这份列表）
+const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+// 网关模型列表缓存。/v1/models 是标准端点，但仍可能不可用（离线、
+// 第三方中转未实现），失败时回落到 MODEL_MAP 的别名，不阻塞 /model。
+const GATEWAY_MODELS_TTL_MS = 5 * 60 * 1000;
+let gatewayModelsCache = { models: null, ts: 0 };
+
+// 非对话模型（向量/重排/OCR）不能用于 -p 会话，从候选列表里剔除
+const NON_CHAT_MODEL_RE = /(embedding|reranker|rerank|ocr)/i;
+
 const VALID_AGENTS = new Set(['claude', 'codex']);
 
 // Final fallback only. New Codex sessions prefer:
@@ -751,7 +762,7 @@ const DEFAULT_CODEX_CONFIG = {
 function splitCodexModelSpec(model) {
   const raw = String(model || '').trim();
   if (!raw) return { raw: '', base: '', reasoning: '' };
-  const match = raw.match(/^(.*)\((medium|high|xhigh)\)\s*$/i);
+  const match = raw.match(/^(.*)\((low|medium|high|xhigh|max|ultra)\)\s*$/i);
   if (!match) return { raw, base: raw, reasoning: '' };
   return {
     raw,
@@ -820,6 +831,51 @@ function resolveDefaultCodexModel() {
   }
   const localModel = String(readCodexLocalConfigSnapshot().config.model || '').trim();
   return localModel || DEFAULT_CODEX_MODEL;
+}
+
+// 终端 codex 的 /model 列表就是这个 catalog，路径由 ~/.codex/config.toml 的
+// model_catalog_json 给出。返回 [] 表示没配或读不出，调用方需回落。
+function readCodexModelCatalog() {
+  try {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    const toml = fs.readFileSync(path.join(homeDir, '.codex', 'config.toml'), 'utf8');
+    const match = toml.match(/^\s*model_catalog_json\s*=\s*"([^"]+)"/m);
+    if (!match) return [];
+    const catalogPath = match[1].startsWith('~') ? path.join(homeDir, match[1].slice(1)) : match[1];
+    const entries = JSON.parse(fs.readFileSync(catalogPath, 'utf8'))?.models || [];
+    return entries
+      .filter((e) => e?.slug && e.visibility === 'list' && e.supported_in_api !== false)
+      .sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999))
+      .map((e) => ({
+        value: e.slug,
+        label: e.display_name || e.slug,
+        desc: e.description || 'Codex 模型',
+        // 每个模型支持的 reasoning 档位不一定相同，交给前端按所选模型渲染
+        efforts: (e.supported_reasoning_levels || [])
+          .filter((l) => l?.effort)
+          .map((l) => ({ value: l.effort, desc: l.description || 'thinking 强度' })),
+        defaultEffort: e.default_reasoning_level || '',
+      }));
+  } catch {
+    return [];
+  }
+}
+
+// Codex 的 /model 候选，与终端 codex 同源：优先用 catalog。
+// catalog 没配时回落到 ~/.codex/config.toml 的当前模型 + 网关里 Codex 能用的 gpt 系列，
+// 两者都不可用时至少还剩 config.toml 那一个，选择器不会空着。
+async function loadCodexModelOptions() {
+  const catalog = readCodexModelCatalog();
+  if (catalog.length > 0) return catalog;
+  const localModel = String(readCodexLocalConfigSnapshot().config.model || '').trim();
+  const gateway = await fetchGatewayModels();
+  // Codex CLI 走 OpenAI Responses 协议，网关里只有 gpt 系列能直接用
+  const usable = (gateway || []).filter((id) => /^gpt-/i.test(id));
+  return normalizeCodexModelList([localModel, ...usable]).map((id) => ({
+    value: id,
+    label: id,
+    desc: id === localModel ? '~/.codex/config.toml 当前模型' : '网关可用模型',
+  }));
 }
 
 function loadModelConfig() {
@@ -1159,20 +1215,33 @@ function prepareCodexCustomRuntime(config, session = null) {
   };
 }
 
-// Read ~/.claude.json for model name overrides
+// 槽位模型名要不要补 [1m]：只有 Claude 原生模型、且没禁用 1M 上下文时才补。
+// 第三方模型经网关转换，不认这个后缀；CLAUDE_CODE_DISABLE_1M_CONTEXT 与终端口径保持一致。
+function withContextSuffix(model, settingsEnv = {}) {
+  const id = String(model || '').trim();
+  if (!id || id.endsWith('[1m]') || !id.startsWith('claude-')) return id;
+  const disabled = settingsEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT || process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  return disabled === '1' ? id : id + '[1m]';
+}
+
+// Read ~/.claude/settings.json (fallback ~/.claude.json) for model name overrides
 function loadClaudeJsonModelMap() {
   try {
-    const p = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json');
-    if (!fs.existsSync(p)) return null;
-    const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
-    const env = raw?.env || {};
+    let env = {};
+    // 新版 claude CLI 的配置在 ~/.claude/settings.json 的 env 块；老位置 ~/.claude.json 作为回落
+    try { env = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')).env || {}; } catch {}
+    if (!env.ANTHROPIC_DEFAULT_OPUS_MODEL && !env.ANTHROPIC_DEFAULT_SONNET_MODEL
+        && !env.ANTHROPIC_DEFAULT_HAIKU_MODEL && !env.ANTHROPIC_MODEL) {
+      const p = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude.json');
+      if (!fs.existsSync(p)) return null;
+      env = JSON.parse(fs.readFileSync(p, 'utf8'))?.env || {};
+    }
     const map = {};
-    // Append [1m] to opus/sonnet for 1M context window; haiku uses model name as-is
-    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL + '[1m]';
-    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = env.ANTHROPIC_DEFAULT_SONNET_MODEL + '[1m]';
+    if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) map.opus = withContextSuffix(env.ANTHROPIC_DEFAULT_OPUS_MODEL, env);
+    if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) map.sonnet = withContextSuffix(env.ANTHROPIC_DEFAULT_SONNET_MODEL, env);
     if (env.ANTHROPIC_DEFAULT_HAIKU_MODEL) map.haiku = env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
     // Fallback: ANTHROPIC_MODEL maps to opus slot
-    if (!map.opus && env.ANTHROPIC_MODEL) map.opus = env.ANTHROPIC_MODEL + '[1m]';
+    if (!map.opus && env.ANTHROPIC_MODEL) map.opus = withContextSuffix(env.ANTHROPIC_MODEL, env);
     return Object.keys(map).length > 0 ? map : null;
   } catch {
     return null;
@@ -1209,18 +1278,97 @@ function applyCustomTemplateToSettings(tpl) {
   }
 }
 
+// 解析查询网关所需的凭据。优先级与 claude CLI 一致：
+// settings.json 的 env 块覆盖进程环境变量。
+function resolveGatewayCreds() {
+  let settingsEnv = {};
+  try {
+    settingsEnv = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')).env || {};
+  } catch {}
+  const base = settingsEnv.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL || '';
+  const token = settingsEnv.ANTHROPIC_AUTH_TOKEN || settingsEnv.ANTHROPIC_API_KEY
+    || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || '';
+  return { base: base.replace(/\/+$/, ''), token };
+}
+
+// 读 settings.json 的 modelPicker.options 与 ANTHROPIC_CUSTOM_MODEL_OPTION，
+// 即终端 claude CLI 的 /model 选择器里那几行自定义模型。返回 [] 表示没登记。
+function loadClaudePickerModels() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
+    const env = raw?.env || {};
+    const out = [];
+    const seen = new Set();
+    const push = (model, label, desc) => {
+      const id = String(model || '').trim();
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      out.push({ value: id, label: label || id, desc: desc || '终端 /model 同款' });
+    };
+    for (const o of (raw?.modelPicker?.options || [])) push(o?.model, o?.label, o?.description);
+    // ANTHROPIC_CUSTOM_MODEL_OPTION 在 CLI 里自带一行 picker 条目，这里补齐
+    push(env.ANTHROPIC_CUSTOM_MODEL_OPTION || process.env.ANTHROPIC_CUSTOM_MODEL_OPTION, '',
+      env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION || process.env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION);
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// 从网关拉取可用模型列表。返回 null 表示不可用，调用方需回落到 MODEL_MAP。
+async function fetchGatewayModels() {
+  const now = Date.now();
+  if (gatewayModelsCache.models && now - gatewayModelsCache.ts < GATEWAY_MODELS_TTL_MS) {
+    return gatewayModelsCache.models;
+  }
+  const { base, token } = resolveGatewayCreds();
+  if (!base || !token) return null;
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 8000);
+    let res;
+    try {
+      res = await fetch(`${base}/v1/models`, {
+        headers: { Authorization: `Bearer ${token}`, 'x-api-key': token, 'anthropic-version': '2023-06-01' },
+        signal: ac.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    const ids = (Array.isArray(body?.data) ? body.data : [])
+      .map((m) => String(m?.id || '').trim())
+      .filter((id) => id && !NON_CHAT_MODEL_RE.test(id));
+    if (ids.length === 0) throw new Error('empty model list');
+    // Claude 系列排前面：cc-web 的 claude agent 走 Anthropic 协议，原生模型最稳
+    ids.sort((a, b) => {
+      const ca = a.startsWith('claude-') ? 0 : 1;
+      const cb = b.startsWith('claude-') ? 0 : 1;
+      return ca !== cb ? ca - cb : a.localeCompare(b);
+    });
+    gatewayModelsCache = { models: ids, ts: now };
+    plog('INFO', 'gateway_models_fetched', { count: ids.length });
+    return ids;
+  } catch (e) {
+    // 不缓存失败结果，下次调用可重试
+    plog('WARN', 'gateway_models_failed', { error: e.message });
+    return null;
+  }
+}
+
 function applyModelConfig() {
   const config = loadModelConfig();
   if (config.mode === 'custom' && config.activeTemplate) {
     const tpl = (config.templates || []).find(t => t.name === config.activeTemplate);
     if (tpl) {
-      if (tpl.opusModel) MODEL_MAP.opus = tpl.opusModel.endsWith('[1m]') ? tpl.opusModel : tpl.opusModel + '[1m]';
-      if (tpl.sonnetModel) MODEL_MAP.sonnet = tpl.sonnetModel.endsWith('[1m]') ? tpl.sonnetModel : tpl.sonnetModel + '[1m]';
+      if (tpl.opusModel) MODEL_MAP.opus = withContextSuffix(tpl.opusModel);
+      if (tpl.sonnetModel) MODEL_MAP.sonnet = withContextSuffix(tpl.sonnetModel);
       if (tpl.haikuModel) MODEL_MAP.haiku = tpl.haikuModel;
       return;
     }
   }
-  // mode === 'local': read model names from ~/.claude.json
+  // mode === 'local': read model names from ~/.claude/settings.json (fallback ~/.claude.json)
   const localMap = loadClaudeJsonModelMap();
   if (localMap) {
     if (localMap.opus) MODEL_MAP.opus = localMap.opus;
@@ -2535,6 +2683,9 @@ wss.on('connection', (ws, req) => {
       case 'set_mode':
         handleSetMode(ws, msg.sessionId, msg.mode);
         break;
+      case 'list_models':
+        handleListModels(ws);
+        break;
       case 'list_sessions':
         sendSessionList(ws);
         break;
@@ -2885,6 +3036,32 @@ function handleSaveCodexConfig(ws, newConfig) {
   });
 }
 
+// 把可选模型推给前端，供 /model 选择器动态渲染。
+// 优先对齐终端 claude CLI：三个别名槽位按真实模型名显示，登记项里与槽位重复的不再列一遍；
+// 没登记时回落到网关全量，网关也不可用时回落到 MODEL_MAP 的别名，保证选择器始终有内容。
+// codexModels 是 Codex agent 专用的候选，与 claude 的列表互不影响。
+async function handleListModels(ws) {
+  const picker = loadClaudePickerModels();
+  const gateway = picker.length > 0 ? null : await fetchGatewayModels();
+  const codexModels = await loadCodexModelOptions();
+  // 槽位对应的真实模型名，去掉 [1m] 后缀，与终端 /model 的显示口径一致
+  const aliasModels = {};
+  for (const [k, v] of Object.entries(MODEL_MAP)) aliasModels[k] = String(v).replace(/\[1m\]$/, '');
+  const slotted = new Set(Object.values(aliasModels));
+  const models = picker.length > 0
+    ? picker.filter((o) => !slotted.has(o.value))
+    : (gateway || Object.values(MODEL_MAP));
+  wsSend(ws, {
+    type: 'model_options',
+    models,
+    codexModels,
+    aliases: Object.keys(MODEL_MAP),
+    aliasModels,
+    efforts: CLAUDE_EFFORT_LEVELS,
+    source: picker.length > 0 ? 'settings' : (gateway ? 'gateway' : 'fallback'),
+  });
+}
+
 // === Local Config Snapshot Handlers ===
 function handleReadClaudeLocalConfig(ws) {
   let settings = {};
@@ -3059,6 +3236,7 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           title: session.title,
           mode: session.permissionMode || 'yolo',
           model: sessionModelLabel(session),
+          effort: session.effort || '',
           agent: getSessionAgent(session),
           cwd: session.cwd || null,
           totalCost: session.totalCost || 0,
@@ -3122,22 +3300,96 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         }
       } else if (!modelInput) {
         const current = session?.model ? modelShortName(session.model) || session.model : 'opus (默认)';
-        wsSend(ws, { type: 'system_message', message: `当前模型: ${current}\n可选: opus, sonnet, haiku` });
+        wsSend(ws, {
+          type: 'system_message',
+          message: `当前模型: ${current}（effort: ${session?.effort || '默认'}）\n`
+            + `别名: ${Object.keys(MODEL_MAP).join(', ')}\n`
+            + `也可直接填网关模型名，或用 /model <模型> <effort> 一次设定`,
+        });
       } else {
         const modelKey = modelInput.toLowerCase();
-        if (!MODEL_MAP[modelKey]) {
-          wsSend(ws, { type: 'system_message', message: `无效模型: ${modelInput}\n可选: opus, sonnet, haiku` });
-        } else {
-          const model = MODEL_MAP[modelKey];
-          if (session) {
-            session.model = model;
-            session.updated = new Date().toISOString();
-            saveSession(session);
+        const aliased = MODEL_MAP[modelKey];
+        // 别名优先；否则按 settings.json 登记项或网关模型名处理。
+        // 网关列表已缓存时校验，未缓存则放行，避免因网关暂时不可达而卡住切换。
+        let model = aliased;
+        if (!model) {
+          const cached = gatewayModelsCache.models;
+          const picker = loadClaudePickerModels().map((o) => o.value);
+          if (!picker.includes(modelInput) && cached && !cached.includes(modelInput)) {
+            wsSend(ws, {
+              type: 'system_message',
+              message: `无效模型: ${modelInput}\n别名: ${Object.keys(MODEL_MAP).join(', ')}\n或直接输入 /model 打开选择器查看网关可用模型`,
+            });
+            break;
           }
-          wsSend(ws, { type: 'model_changed', model: modelKey });
-          wsSend(ws, { type: 'system_message', message: `模型已切换为: ${modelKey}` });
+          model = modelInput;
         }
+        // 可选的第二个参数：effort，实现一次性设定模型与思考强度。
+        // 'default' 是清除哨兵，表示不传 --effort、交回 CLI 默认。
+        const effortInput = parts[2] ? parts[2].toLowerCase() : '';
+        if (effortInput && effortInput !== 'default' && !CLAUDE_EFFORT_LEVELS.includes(effortInput)) {
+          wsSend(ws, {
+            type: 'system_message',
+            message: `无效 effort: ${parts[2]}\n可选: ${CLAUDE_EFFORT_LEVELS.join(', ')}, default`,
+          });
+          break;
+        }
+        if (session) {
+          session.model = model;
+          if (effortInput === 'default') session.effort = '';
+          else if (effortInput) session.effort = effortInput;
+          session.updated = new Date().toISOString();
+          saveSession(session);
+        }
+        const label = aliased ? modelKey : model;
+        // 保存后以 session.effort 为准，'default' 已被归一化成空串
+        const effLabel = session?.effort || '默认';
+        wsSend(ws, { type: 'model_changed', model: label, effort: session?.effort || '' });
+        wsSend(ws, {
+          type: 'system_message',
+          message: `模型已切换为: ${label}（effort: ${effLabel}）`,
+        });
       }
+      break;
+    }
+
+    case '/effort': {
+      // Codex 的思考强度编码在模型名后缀里（如 gpt-5.4(high)），由 /model 统一处理
+      if (agent === 'codex') {
+        const cur = splitCodexModelSpec(session?.model || '').reasoning || '默认';
+        wsSend(ws, {
+          type: 'system_message',
+          message: `Codex 的思考强度随模型一起设定（形如 gpt-5.5(high)）。\n当前: ${cur}\n请使用 /model 选择。`,
+        });
+        break;
+      }
+      const effortInput = parts[1] ? parts[1].toLowerCase() : '';
+      if (!effortInput) {
+        wsSend(ws, {
+          type: 'system_message',
+          message: `当前 effort: ${session?.effort || '默认（未指定，由 CLI 决定）'}\n可选: ${CLAUDE_EFFORT_LEVELS.join(', ')}, default（恢复默认）`,
+        });
+        break;
+      }
+      // 'default' 是清除哨兵：恢复成不传 --effort
+      const isReset = effortInput === 'default';
+      if (!isReset && !CLAUDE_EFFORT_LEVELS.includes(effortInput)) {
+        wsSend(ws, {
+          type: 'system_message',
+          message: `无效 effort: ${parts[1]}\n可选: ${CLAUDE_EFFORT_LEVELS.join(', ')}, default`,
+        });
+        break;
+      }
+      if (session) {
+        session.effort = isReset ? '' : effortInput;
+        session.updated = new Date().toISOString();
+        saveSession(session);
+      }
+      wsSend(ws, { type: 'effort_changed', effort: isReset ? '' : effortInput });
+      wsSend(ws, {
+        type: 'system_message',
+        message: isReset ? 'effort 已恢复默认（不传 --effort）' : `effort 已切换为: ${effortInput}`,
+      });
       break;
     }
 
@@ -3350,7 +3602,9 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         type: 'system_message',
         message: agent === 'codex'
           ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文\n/init — 分析项目并生成/更新 AGENTS.md'
-          : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n/init — 分析项目并生成/更新 CLAUDE.md',
+          : base + `\n/model [名称] [effort] — 查看/切换模型，可同时设定 effort（别名: ${Object.keys(MODEL_MAP).join(', ')}，或填网关模型名）`
+            + `\n/effort [级别] — 查看/切换思考强度（${CLAUDE_EFFORT_LEVELS.join(', ')}）`
+            + '\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n/init — 分析项目并生成/更新 CLAUDE.md',
       });
       break;
     }
@@ -3411,6 +3665,7 @@ function handleNewSession(ws, msg) {
     title: session.title,
     mode: session.permissionMode,
     model: sessionModelLabel(session),
+    effort: session.effort || '',
     agent,
     cwd: session.cwd,
     totalCost: 0,
@@ -3490,6 +3745,7 @@ function handleLoadSession(ws, sessionId) {
     title: session.title,
     mode: session.permissionMode || 'yolo',
     model: sessionModelLabel(session),
+    effort: session.effort || '',
     agent: getSessionAgent(session),
     hasUnread: hadUnread,
     cwd: effectiveCwd,
@@ -3856,6 +4112,7 @@ function handleMessage(ws, msg, options = {}) {
       title: session.title,
       mode: session.permissionMode || 'yolo',
       model: sessionModelLabel(session),
+      effort: session.effort || '',
       agent: getSessionAgent(session),
       cwd: session.cwd || null,
       totalCost: session.totalCost || 0,
