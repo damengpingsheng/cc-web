@@ -1883,6 +1883,95 @@
         renderSessionList();
         break;
 
+      case 'imported_messages_appended': {
+        // Native CLI history grew without changing existing messages.
+        const appended = Array.isArray(msg.messages) ? msg.messages : [];
+        if (msg.sessionId === currentSessionId && appended.length > 0) {
+          const welcome = messagesDiv.querySelector('.welcome-msg');
+          if (welcome) welcome.remove();
+          const frag = document.createDocumentFragment();
+          appended.forEach((m) => frag.appendChild(buildMsgElement(m)));
+          messagesDiv.appendChild(frag);
+          scrollToBottom();
+          updateScrollbar();
+        }
+        if (msg.sessionId === currentSessionId && msg.totalUsage) {
+          setStatsDisplay({ totalUsage: msg.totalUsage });
+        }
+        updateCachedSession(msg.sessionId, (snapshot) => {
+          snapshot.messages = (snapshot.messages || []).concat(cloneMessages(appended));
+          snapshot.updated = msg.updated;
+          if (msg.totalUsage) snapshot.totalUsage = deepClone(msg.totalUsage);
+        });
+        sessions = sessions.map((session) => session.id === msg.sessionId
+          ? { ...session, updated: msg.updated || session.updated }
+          : session);
+        renderSessionList();
+        break;
+      }
+
+      case 'imported_messages_replaced': {
+        // Codex can update the current assistant/tool message without appending one.
+        const replacement = Array.isArray(msg.messages) ? msg.messages : [];
+        const fromIndex = Number.isInteger(msg.fromIndex) ? msg.fromIndex : -1;
+        const previousTotal = Number.isInteger(msg.previousTotal) ? msg.previousTotal : -1;
+        const historyTotal = Number.isInteger(msg.historyTotal) ? msg.historyTotal : -1;
+        const validRange = fromIndex >= 0 && previousTotal >= fromIndex;
+        let cacheMismatch = false;
+
+        updateCachedSession(msg.sessionId, (snapshot) => {
+          const cachedMessages = Array.isArray(snapshot.messages) ? snapshot.messages : [];
+          if (validRange && cachedMessages.length === previousTotal) {
+            snapshot.messages = cachedMessages.slice(0, fromIndex).concat(cloneMessages(replacement));
+          } else if (replacement.length > 0 || historyTotal !== previousTotal) {
+            cacheMismatch = true;
+          }
+          snapshot.updated = msg.updated;
+          if (msg.totalUsage) snapshot.totalUsage = deepClone(msg.totalUsage);
+        });
+        if (cacheMismatch) invalidateSessionCache(msg.sessionId);
+
+        if (activeSessionLoad?.sessionId === msg.sessionId && activeSessionLoad.snapshot) {
+          const loadingMessages = activeSessionLoad.snapshot.messages || [];
+          if (validRange && loadingMessages.length === previousTotal) {
+            activeSessionLoad.snapshot.messages = loadingMessages
+              .slice(0, fromIndex)
+              .concat(cloneMessages(replacement));
+            activeSessionLoad.snapshot.updated = msg.updated;
+            if (msg.totalUsage) activeSessionLoad.snapshot.totalUsage = deepClone(msg.totalUsage);
+          }
+        }
+
+        if (msg.sessionId === currentSessionId) {
+          if (msg.totalUsage) setStatsDisplay({ totalUsage: msg.totalUsage });
+          const changesMessages = replacement.length > 0 || historyTotal !== previousTotal;
+          if (changesMessages) {
+            const renderedMessages = Array.from(messagesDiv.children)
+              .filter((element) => element.classList.contains('msg'));
+            if (validRange && renderedMessages.length === previousTotal) {
+              const wasNearBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight <= 24;
+              renderEpoch++;
+              for (let i = fromIndex; i < renderedMessages.length; i++) renderedMessages[i].remove();
+              const welcome = messagesDiv.querySelector('.welcome-msg');
+              if (welcome) welcome.remove();
+              const frag = document.createDocumentFragment();
+              replacement.forEach((message) => frag.appendChild(buildMsgElement(message)));
+              messagesDiv.appendChild(frag);
+              if (wasNearBottom) scrollToBottom();
+              updateScrollbar();
+            } else {
+              openSession(msg.sessionId, { forceSync: true, blocking: false });
+            }
+          }
+        }
+
+        sessions = sessions.map((session) => session.id === msg.sessionId
+          ? { ...session, updated: msg.updated || session.updated }
+          : session);
+        renderSessionList();
+        break;
+      }
+
       case 'text_delta':
         if (!isGenerating || !document.getElementById('streaming-msg')) startGenerating();
         pendingText += msg.text;

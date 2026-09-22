@@ -1143,18 +1143,6 @@ function copyCodexThreadRollouts(threadId, targetHomeDir) {
   }
 }
 
-function prepareCodexLocalRuntimeHome(homeDir) {
-  fs.mkdirSync(homeDir, { recursive: true });
-  const sourceHome = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex');
-  for (const filename of ['config.toml', 'auth.json']) {
-    try {
-      const source = path.join(sourceHome, filename);
-      if (!fs.existsSync(source)) continue;
-      fs.copyFileSync(source, path.join(homeDir, filename));
-    } catch {}
-  }
-}
-
 function ensureCodexSessionHome(session) {
   if (!session?.id) return CODEX_RUNTIME_HOME;
   if (!session.codexHomeDir) session.codexHomeDir = codexSessionHomeDir(session.id);
@@ -1164,15 +1152,18 @@ function ensureCodexSessionHome(session) {
 }
 
 function prepareCodexCustomRuntime(config, session = null) {
-  const homeDir = ensureCodexSessionHome(session);
   if (!config || config.mode !== 'custom') {
-    prepareCodexLocalRuntimeHome(homeDir);
+    // local 模式复用本机 ~/.codex，不做 per-session 隔离：浏览器下发的轮次直接落进
+    // 原生历史，与 Claude 共享 ~/.claude 的模型对称——codex CLI 能直接看到，重开时
+    // syncImportedSession 读到的也是最新历史，不再被陈旧 rollout 覆盖丢失。
+    // 不返回 homeDir，buildCodexSpawnSpec 便不设 CODEX_HOME，交由 CLI 使用默认 ~/.codex。
     if (session) {
-      session.codexHomeDir = homeDir;
+      session.codexHomeDir = '';
       session.codexRuntimeKey = 'local';
     }
-    return { mode: 'local', homeDir, runtimeKey: 'local' };
+    return { mode: 'local', runtimeKey: 'local' };
   }
+  const homeDir = ensureCodexSessionHome(session);
   const profiles = Array.isArray(config.profiles) ? config.profiles : [];
   const activeProfile = profiles.find((profile) => profile.name === config.activeProfile) || null;
   if (!activeProfile) {
@@ -1840,7 +1831,7 @@ function handleGroupDelete(ws, msg) {
   groups.splice(groups.indexOf(group), 1);
   saveGroups();
   for (const sessionId of sessionIds) {
-    try { deleteSessionCleanup(sessionId); } catch {}
+    try { stopImportedSync(ws, sessionId); deleteSessionCleanup(sessionId); } catch {}
   }
   plog('INFO', 'group_delete', { deletedSessions: sessionIds.length });
   broadcastGroupUpdate();
@@ -1956,6 +1947,7 @@ class FileTailer {
     this.onLine = onLine;
     this.offset = 0;
     this.buffer = '';
+    this.fileKey = null;
     this.watcher = null;
     this.interval = null;
     this.stopped = false;
@@ -1978,6 +1970,12 @@ class FileTailer {
   readNew() {
     try {
       const stat = fs.statSync(this.filePath);
+      const fileKey = `${stat.dev}:${stat.ino}`;
+      if (this.fileKey !== fileKey || stat.size < this.offset) {
+        this.fileKey = fileKey;
+        this.offset = 0;
+        this.buffer = '';
+      }
       if (stat.size <= this.offset) return;
       const buf = Buffer.alloc(stat.size - this.offset);
       const fd = fs.openSync(this.filePath, 'r');
@@ -1997,6 +1995,235 @@ class FileTailer {
     this.stopped = true;
     if (this.watcher) { this.watcher.close(); this.watcher = null; }
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
+  }
+}
+
+// === Imported Session Sync ===
+// Imported Claude and Codex sessions are backed by their native CLI JSONL files.
+// Keep the cc-web snapshot in sync while a browser is viewing an imported session.
+
+const importedSyncWatchers = new Map(); // sessionId -> { tailer, timer, subscribers:Set<ws> }
+const IMPORTED_SYNC_DEBOUNCE_MS = 400;
+
+function resolveImportedSessionSource(session) {
+  if (!session) return null;
+  const agent = getSessionAgent(session);
+
+  if (agent === 'codex') {
+    if (!session.codexThreadId || !session.importedRolloutPath) return null;
+    const filePath = path.resolve(session.importedRolloutPath);
+    const sessionsRoot = path.resolve(CODEX_SESSIONS_DIR);
+    if (filePath !== sessionsRoot && !filePath.startsWith(`${sessionsRoot}${path.sep}`)) return null;
+    if (!fs.existsSync(filePath)) return null;
+    return {
+      agent,
+      runtimeId: session.codexThreadId,
+      filePath,
+      projectDir: 'codex',
+      cwd: session.cwd || null,
+    };
+  }
+
+  if (!session.claudeSessionId) return null;
+  const localMeta = resolveClaudeSessionLocalMeta(session.claudeSessionId);
+  if (!localMeta?.filePath) return null;
+  return {
+    agent,
+    runtimeId: session.claudeSessionId,
+    filePath: localMeta.filePath,
+    projectDir: localMeta.projectDir || '',
+    cwd: localMeta.cwd || null,
+  };
+}
+
+function parseImportedSessionSource(source) {
+  if (!source) return null;
+  if (source.agent === 'codex') {
+    const parsed = parseCodexRolloutFile(source.filePath);
+    if (!parsed || parsed.meta?.threadId !== source.runtimeId) return null;
+    return parsed;
+  }
+
+  let content;
+  try { content = fs.readFileSync(source.filePath, 'utf8'); } catch { return null; }
+  return {
+    messages: parseJsonlToMessages(content.split('\n')),
+    totalUsage: null,
+    meta: { cwd: source.cwd, updatedAt: null },
+  };
+}
+
+function normalizeUsageTotals(usage) {
+  return {
+    inputTokens: Number(usage?.inputTokens) || 0,
+    cachedInputTokens: Number(usage?.cachedInputTokens) || 0,
+    outputTokens: Number(usage?.outputTokens) || 0,
+  };
+}
+
+function usageTotalsEqual(left, right) {
+  return left.inputTokens === right.inputTokens &&
+    left.cachedInputTokens === right.cachedInputTokens &&
+    left.outputTokens === right.outputTokens;
+}
+
+function firstChangedMessageIndex(previous, next) {
+  const commonLength = Math.min(previous.length, next.length);
+  for (let i = 0; i < commonLength; i++) {
+    if (JSON.stringify(previous[i]) !== JSON.stringify(next[i])) return i;
+  }
+  return previous.length === next.length ? -1 : commonLength;
+}
+
+function syncImportedSession(sessionId) {
+  const session = loadSession(sessionId);
+  const source = resolveImportedSessionSource(session);
+  if (!source) return { session, change: null };
+
+  const parsed = parseImportedSessionSource(source);
+  if (!parsed || !Array.isArray(parsed.messages)) return { session, change: null };
+
+  const previous = Array.isArray(session.messages) ? session.messages : [];
+  const next = parsed.messages;
+  const previousTotal = previous.length;
+
+  // Preserve cc-web-only fields that native history does not contain.
+  for (let i = 0; i < previousTotal && i < next.length; i++) {
+    if (previous[i]?.attachments && !next[i]?.attachments) {
+      next[i].attachments = previous[i].attachments;
+    }
+  }
+
+  let fromIndex = -1;
+  if (source.agent === 'claude') {
+    // Claude history is append-only in the existing sync contract.
+    if (next.length > previousTotal) fromIndex = previousTotal;
+  } else if (next.length >= previousTotal) {
+    // Codex 会在不增加条数的情况下更新当前 assistant/工具消息，故同长度也需 diff。
+    // 但当解析出的原生历史比已落盘的更短时（例如浏览器下发的轮次经隔离 CODEX_HOME
+    // 运行、尚未回落到原生 rollout），绝不能用更短历史覆盖，否则会截断掉 cc-web 已通过
+    // handleProcessComplete 持久化的轮次；此时保持 fromIndex = -1，跳过覆盖。
+    fromIndex = firstChangedMessageIndex(previous, next);
+  }
+
+  const previousUsage = normalizeUsageTotals(session.totalUsage);
+  const nextUsage = source.agent === 'codex'
+    ? normalizeUsageTotals(parsed.totalUsage)
+    : previousUsage;
+  const usageChanged = !usageTotalsEqual(previousUsage, nextUsage);
+  if (fromIndex < 0 && !usageChanged) return { session, change: null };
+
+  if (fromIndex >= 0) session.messages = next;
+  if (source.agent === 'codex') session.totalUsage = nextUsage;
+  if (!session.cwd && (parsed.meta?.cwd || source.cwd)) session.cwd = parsed.meta?.cwd || source.cwd;
+  if (!session.importedFrom && source.projectDir) session.importedFrom = source.projectDir;
+  session.updated = parsed.meta?.updatedAt || new Date().toISOString();
+  saveSession(session);
+
+  const effectiveFromIndex = fromIndex >= 0 ? fromIndex : next.length;
+  const changedMessages = fromIndex >= 0 ? next.slice(fromIndex) : [];
+  const added = Math.max(0, next.length - previousTotal);
+
+  plog('INFO', 'imported_session_synced', {
+    sessionId: sessionId.slice(0, 8),
+    agent: source.agent,
+    prevCount: previousTotal,
+    newCount: next.length,
+    fromIndex: effectiveFromIndex,
+    added,
+    usageChanged,
+  });
+
+  return {
+    session,
+    change: {
+      previousTotal,
+      fromIndex: effectiveFromIndex,
+      messages: changedMessages,
+      added,
+      usageChanged,
+    },
+  };
+}
+
+function sendImportedSessionChange(client, sessionId, synced, change) {
+  const payload = {
+    sessionId,
+    messages: change.messages,
+    updated: synced.updated,
+    historyTotal: synced.messages.length,
+    totalUsage: getSessionAgent(synced) === 'codex' ? (synced.totalUsage || null) : null,
+  };
+
+  if (change.fromIndex === change.previousTotal && change.messages.length > 0) {
+    wsSend(client, { type: 'imported_messages_appended', ...payload });
+    return;
+  }
+
+  wsSend(client, {
+    type: 'imported_messages_replaced',
+    ...payload,
+    fromIndex: change.fromIndex,
+    previousTotal: change.previousTotal,
+  });
+}
+
+// Subscribe one WebSocket to a native history file. Subscribers share one tailer.
+function startImportedSync(ws, sessionId) {
+  const session = loadSession(sessionId);
+  const source = resolveImportedSessionSource(session);
+  if (!source) return;
+
+  const existing = importedSyncWatchers.get(sessionId);
+  if (existing) {
+    existing.subscribers.add(ws);
+    return;
+  }
+
+  const state = { tailer: null, timer: null, subscribers: new Set([ws]) };
+
+  const onChange = () => {
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      // Streaming events own the snapshot while cc-web is running this session.
+      if (activeProcesses.has(sessionId)) return;
+
+      const { session: synced, change } = syncImportedSession(sessionId);
+      if (!synced || !change) return;
+
+      for (const client of state.subscribers) {
+        if (client.readyState !== 1) continue;
+        if (wsSessionMap.get(client) !== sessionId) continue;
+        sendImportedSessionChange(client, sessionId, synced, change);
+      }
+    }, IMPORTED_SYNC_DEBOUNCE_MS);
+  };
+
+  // FileTailer reports complete lines; parsing remains centralized above.
+  state.tailer = new FileTailer(source.filePath, onChange);
+  state.tailer.start();
+  importedSyncWatchers.set(sessionId, state);
+
+  plog('INFO', 'imported_sync_started', {
+    sessionId: sessionId.slice(0, 8),
+    agent: source.agent,
+    runtimeId: String(source.runtimeId).slice(0, 8),
+  });
+}
+
+// Remove a subscription and release the tailer after the last subscriber leaves.
+function stopImportedSync(ws, sessionId = null) {
+  const targets = sessionId ? [sessionId] : [...importedSyncWatchers.keys()];
+  for (const id of targets) {
+    const state = importedSyncWatchers.get(id);
+    if (!state) continue;
+    state.subscribers.delete(ws);
+    if (state.subscribers.size > 0) continue;
+    if (state.timer) clearTimeout(state.timer);
+    state.tailer?.stop();
+    importedSyncWatchers.delete(id);
+    plog('INFO', 'imported_sync_stopped', { sessionId: id.slice(0, 8) });
   }
 }
 
@@ -3721,6 +3948,12 @@ function handleLoadSession(ws, sessionId) {
       saveSession(session);
     }
   }
+  // Refresh native CLI history before sending the session snapshot.
+  if (!activeProcesses.has(sessionId)) {
+    const { session: synced } = syncImportedSession(sessionId);
+    if (synced) Object.assign(session, synced);
+  }
+
   const { recentMessages, olderChunks } = splitHistoryMessages(session.messages);
   const effectiveCwd = session.cwd || activeProcesses.get(sessionId)?.cwd || null;
 
@@ -3728,6 +3961,8 @@ function handleLoadSession(ws, sessionId) {
   for (const [, entry] of activeProcesses) {
     if (entry.ws === ws) entry.ws = null;
   }
+  // Stop the previous native-history subscription when switching sessions.
+  stopImportedSync(ws);
 
   wsSessionMap.set(ws, sessionId);
 
@@ -3792,6 +4027,9 @@ function handleLoadSession(ws, sessionId) {
       toolCalls: entry.toolCalls || [],
     });
   }
+
+  // Follow subsequent native CLI updates while this session remains open.
+  startImportedSync(ws, sessionId);
 }
 
 function sqlQuote(value) {
@@ -3891,6 +4129,7 @@ function deleteSessionCleanup(sessionId) {
 
 function handleDeleteSession(ws, sessionId) {
   try {
+    stopImportedSync(ws, sessionId);
     deleteSessionCleanup(sessionId);
     sendSessionList(ws);
   } catch {
@@ -3935,6 +4174,7 @@ function handleDisconnect(ws, wsId) {
     }
   }
   wsSessionMap.delete(ws);
+  stopImportedSync(ws);
   plog('INFO', 'ws_disconnect', { wsId, activeProcessesAffected: affectedSessions });
 }
 
@@ -3945,6 +4185,7 @@ function handleDetachView(ws) {
       entry.wsDisconnectTime = new Date().toISOString();
     }
   }
+  stopImportedSync(ws);
   wsSessionMap.delete(ws);
 }
 
@@ -4657,6 +4898,8 @@ function handleListCodexSessions(ws) {
   for (const filePath of getCodexRolloutFiles()) {
     const parsed = parseCodexRolloutFile(filePath);
     if (!parsed?.meta?.threadId) continue;
+    // subagent 派生的子线程不是独立会话，终端 codex 也不列它们
+    if (parsed.meta.source === 'subagent') continue;
     if (seen.has(parsed.meta.threadId)) continue;
     seen.add(parsed.meta.threadId);
     const title = parsed.meta.title || parsed.meta.threadId.slice(0, 20);
@@ -4729,6 +4972,7 @@ function handleImportCodexSession(ws, msg) {
   };
 
   saveSession(session);
+  stopImportedSync(ws);
   wsSessionMap.set(ws, id);
   wsSend(ws, {
     type: 'session_info',
@@ -4750,6 +4994,7 @@ function handleImportCodexSession(ws, msg) {
     remoteCwd: session.remoteCwd || '',
   });
   sendSessionList(ws);
+  startImportedSync(ws, id);
 }
 
 function handleListCwdSuggestions(ws) {
