@@ -139,6 +139,10 @@
   const sessionGoalState = new Map(); // sessionId -> { active, turns, lastFeedback }
   const SESSION_GOAL_STATE_CAP = 100;
   let pendingGoalForNewSession = null;
+  // 输入框历史回溯（↑/↓）。promptHistoryIndex < 0 表示不在回溯态，此时 ↑ 只在输入框为空时接管。
+  let promptHistory = [];
+  let promptHistoryIndex = -1;
+  const PROMPT_HISTORY_CAP = 200;
   // 会话内搜索（Ctrl+F）。searchHits 是按文档序排好的 <mark> 元素，searchIndex < 0 表示无当前项。
   let searchHits = [];
   let searchIndex = -1;
@@ -1323,6 +1327,7 @@
     if (!preserveStreaming) {
       closeMsgSearch();   // 整棵消息树被重建，旧的 mark 引用全部失效
       renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
+      rebuildPromptHistory(snapshot.messages || []);
     }
     highlightActiveSession();
     renderSessionList();
@@ -4157,6 +4162,7 @@
     }
     hideCmdMenu();
     hideOptionPicker();
+    pushPromptHistory(text);
 
     // B+: /goal awareness (set/clear/status) + /clear resets goal state for this session
     const goalCmd = classifyGoalCommand(text);
@@ -4237,6 +4243,52 @@
     renderPendingAttachments();
     autoResize();
     startGenerating();
+  }
+
+  // 切会话时按该会话的历史重建：来源是已渲染的用户消息，
+  // 带 kind 的（local-command 卡片等）不是用户手敲的内容，排除。
+  function rebuildPromptHistory(messages) {
+    promptHistory = [];
+    for (const m of messages || []) {
+      if (m.role !== 'user' || m.kind) continue;
+      const text = typeof m.content === 'string' ? m.content.trim() : '';
+      if (text) promptHistory.push(text);
+    }
+    if (promptHistory.length > PROMPT_HISTORY_CAP) {
+      promptHistory = promptHistory.slice(-PROMPT_HISTORY_CAP);
+    }
+    promptHistoryIndex = -1;
+  }
+
+  function pushPromptHistory(text) {
+    if (!text) return;
+    if (promptHistory[promptHistory.length - 1] !== text) promptHistory.push(text);
+    if (promptHistory.length > PROMPT_HISTORY_CAP) promptHistory.shift();
+    promptHistoryIndex = -1;
+  }
+
+  // step: -1 往更早，1 往更新。返回是否接管了这次按键。
+  function recallPrompt(step) {
+    if (promptHistory.length === 0) return false;
+    if (promptHistoryIndex < 0) {
+      if (step > 0) return false;
+      promptHistoryIndex = promptHistory.length - 1;
+    } else {
+      const next = promptHistoryIndex + step;
+      if (next < 0) return true;                 // 已到最早，停住不再往上
+      if (next >= promptHistory.length) {        // 翻回最新之后 → 清空并退出回溯
+        promptHistoryIndex = -1;
+        msgInput.value = '';
+        autoResize();
+        return true;
+      }
+      promptHistoryIndex = next;
+    }
+    msgInput.value = promptHistory[promptHistoryIndex];
+    autoResize();
+    const end = msgInput.value.length;
+    msgInput.setSelectionRange(end, end);
+    return true;
   }
 
   function autoResize() {
@@ -4376,6 +4428,7 @@
 
   msgInput.addEventListener('input', () => {
     autoResize();
+    promptHistoryIndex = -1;   // 用户一改动内容就退出历史回溯
     const val = msgInput.value;
     // Show slash command menu
     if (val.startsWith('/') && !val.includes('\n')) {
@@ -4392,6 +4445,14 @@
       if (e.key === 'ArrowUp') { e.preventDefault(); navigateCmdMenu(-1); return; }
       if (e.key === 'Tab') { e.preventDefault(); selectCmdMenuItem(); return; }
       if (e.key === 'Escape') { hideCmdMenu(); return; }
+    }
+    // 历史回溯：输入框为空时 ↑ 调出上一条发过的内容；已在回溯态则继续翻。
+    // 一旦用户改动内容就退出回溯（见下面的 input 监听），↑/↓ 随即恢复成光标移动。
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown')
+        && (promptHistoryIndex >= 0 || (e.key === 'ArrowUp' && !msgInput.value))
+        && recallPrompt(e.key === 'ArrowUp' ? -1 : 1)) {
+      e.preventDefault();
+      return;
     }
     if (e.key === 'Enter' && !e.shiftKey) {
       if (isMobileInputMode()) {
