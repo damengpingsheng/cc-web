@@ -23,6 +23,9 @@
   --info: #5b7ea1;                 /* 縹色 blue-gray */
   --scrollbar-thumb: #c9baa9;
   --scrollbar-track: transparent;
+  --search-hit-bg: #ffe9a8;        /* 会话内搜索：普通命中 */
+  --search-hit-current-bg: #ffb454;/* 会话内搜索：当前命中 */
+  --search-hit-current-ring: #c2610c;
   --sidebar-width: 280px;
   --header-height: 52px;
   --input-max-height: 200px;
@@ -1187,6 +1190,92 @@ body.session-loading-active {
     right: 2px;
   }
 }
+/* === 会话内搜索 === */
+.msg-search {
+  position: absolute;
+  top: 10px;
+  right: 22px;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 6px 5px 9px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-bubble-assistant);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.13);
+}
+/* display:flex 会压过 hidden 属性，必须显式关掉 */
+.msg-search[hidden] { display: none; }
+.msg-search-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.msg-search input {
+  width: 190px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  padding: 2px 0;
+}
+.msg-search input::placeholder { color: var(--text-muted); }
+.msg-search-count {
+  flex-shrink: 0;
+  min-width: 34px;
+  text-align: right;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.msg-search-count.empty { color: var(--danger); }
+.msg-search-btn {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.msg-search-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+.msg-search-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+mark.search-hit {
+  background: var(--search-hit-bg);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+mark.search-hit.current {
+  background: var(--search-hit-current-bg);
+  box-shadow: 0 0 0 1px var(--search-hit-current-ring);
+}
+/* 窄屏让出跳转按钮与滚动条的位置 */
+@media (max-width: 560px) {
+  .msg-search { left: 12px; right: 12px; }
+  .msg-search input { width: auto; flex: 1; min-width: 0; }
+}
+
 /* === 长会话跳转（到最前 / 到最后） === */
 /* 只显示「能去的方向」：到顶只剩向下，到底只剩向上，中间两枚都在 */
 .scroll-jump {

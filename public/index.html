@@ -91,6 +91,14 @@
       </div>
 
       <div class="messages-wrap">
+        <div id="msg-search" class="msg-search" hidden>
+          <svg class="msg-search-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.8" cy="6.8" r="4.3"/><path d="M10 10l3.6 3.6"/></svg>
+          <input id="msg-search-input" type="text" placeholder="搜索本会话" autocomplete="off" spellcheck="false" aria-label="搜索当前会话消息">
+          <span id="msg-search-count" class="msg-search-count"></span>
+          <button type="button" id="msg-search-prev" class="msg-search-btn" title="上一个 (Shift+Enter)" aria-label="上一个匹配">‹</button>
+          <button type="button" id="msg-search-next" class="msg-search-btn" title="下一个 (Enter)" aria-label="下一个匹配">›</button>
+          <button type="button" id="msg-search-close" class="msg-search-btn" title="关闭 (Esc)" aria-label="关闭搜索">✕</button>
+        </div>
         <div id="messages" class="messages">
           <div class="welcome-msg">
             <div class="welcome-icon">✿</div>

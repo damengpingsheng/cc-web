@@ -139,6 +139,12 @@
   const sessionGoalState = new Map(); // sessionId -> { active, turns, lastFeedback }
   const SESSION_GOAL_STATE_CAP = 100;
   let pendingGoalForNewSession = null;
+  // 会话内搜索（Ctrl+F）。searchHits 是按文档序排好的 <mark> 元素，searchIndex < 0 表示无当前项。
+  let searchHits = [];
+  let searchIndex = -1;
+  let searchTerm = '';
+  let searchRescanTimer = null;
+  const SEARCH_HIT_CAP = 2000;
   let currentEffort = '';
   // 服务端推送的网关可用模型 / effort 列表，null 表示尚未拿到
   let modelCatalog = null;
@@ -197,6 +203,9 @@
   const abortBtn = $('#abort-btn');
   const cmdMenu = $('#cmd-menu');
   const modeSelect = $('#mode-select');
+  const searchBar = $('#msg-search');
+  const searchInput = $('#msg-search-input');
+  const searchCount = $('#msg-search-count');
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -1312,6 +1321,7 @@
     currentModel = snapshot.model || '';
     currentEffort = snapshot.effort || '';
     if (!preserveStreaming) {
+      closeMsgSearch();   // 整棵消息树被重建，旧的 mark 引用全部失效
       renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
     }
     highlightActiveSession();
@@ -2659,6 +2669,7 @@
         // Compensate scrollTop so visible area stays unchanged
         messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
         updateScrollbar();
+        scheduleSearchRescan();
       }, delay);
     }
   }
@@ -2674,6 +2685,7 @@
     if (!preserveScroll) {
       messagesDiv.insertBefore(frag, messagesDiv.firstChild);
       if (!skipScrollbar) updateScrollbar();
+      scheduleSearchRescan();
       return;
     }
     const prevHeight = messagesDiv.scrollHeight;
@@ -2681,7 +2693,201 @@
     messagesDiv.insertBefore(frag, messagesDiv.firstChild);
     messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
     if (!skipScrollbar) updateScrollbar();
+    scheduleSearchRescan();
   }
+
+  // === 会话内搜索 ===
+  // 浏览器原生 Ctrl+F 搜不到折叠 <details> 里的工具调用和续接摘要，所以自建一套：
+  // 在文本节点上包 <mark>，命中落在折叠区内时自动展开祖先。
+  // 只切分/还原文本节点，绝不碰 innerHTML —— 否则 decorateCodeBlocks 注入的
+  // Copy / Preview 按钮的事件监听会被一起打掉。
+  const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search';
+
+  function collectSearchTextNodes() {
+    const walker = document.createTreeWalker(messagesDiv, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        // 语言标签和 Copy/Preview 按钮是注入的 UI，不是对话内容
+        if (parent.closest(SEARCH_SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const nodes = [];
+    let node;
+    while ((node = walker.nextNode())) nodes.push(node);
+    return nodes;
+  }
+
+  // 把一个文本节点里的全部匹配换成 <mark>，返回新建的 mark（按出现顺序）。
+  // limit 是剩余配额：一条长消息里单个文本节点就可能有上千次匹配，只在节点粒度截断拦不住。
+  function highlightTextNode(node, needle, limit) {
+    const text = node.nodeValue;
+    const lower = text.toLowerCase();
+    let idx = lower.indexOf(needle);
+    if (idx < 0) return [];
+    const marks = [];
+    const frag = document.createDocumentFragment();
+    let from = 0;
+    while (idx >= 0 && marks.length < limit) {
+      if (idx > from) frag.appendChild(document.createTextNode(text.slice(from, idx)));
+      const mark = document.createElement('mark');
+      mark.className = 'search-hit';
+      mark.textContent = text.slice(idx, idx + needle.length);
+      frag.appendChild(mark);
+      marks.push(mark);
+      from = idx + needle.length;
+      idx = lower.indexOf(needle, from);
+    }
+    if (from < text.length) frag.appendChild(document.createTextNode(text.slice(from)));
+    node.parentNode.replaceChild(frag, node);
+    return marks;
+  }
+
+  function clearSearchHighlights() {
+    const parents = new Set();
+    messagesDiv.querySelectorAll('mark.search-hit').forEach((mark) => {
+      const parent = mark.parentNode;
+      if (!parent) return;
+      parent.replaceChild(document.createTextNode(mark.textContent), mark);
+      parents.add(parent);
+    });
+    // 合回单个文本节点，否则反复搜索会把同一段文字切得越来越碎，跨节点的词再也搜不到
+    parents.forEach((parent) => parent.normalize());
+    searchHits = [];
+    searchIndex = -1;
+  }
+
+  function expandSearchAncestors(el) {
+    let node = el.parentElement;
+    while (node && node !== messagesDiv) {
+      if (node.tagName === 'DETAILS' && !node.open) node.open = true;
+      node = node.parentElement;
+    }
+  }
+
+  function updateSearchCount() {
+    if (!searchCount) return;
+    const total = searchHits.length;
+    if (total === 0) {
+      searchCount.textContent = searchTerm.trim() ? '无结果' : '';
+      searchCount.classList.toggle('empty', !!searchTerm.trim());
+      return;
+    }
+    searchCount.classList.remove('empty');
+    searchCount.textContent = `${searchIndex + 1}/${total}${total >= SEARCH_HIT_CAP ? '+' : ''}`;
+  }
+
+  function focusSearchHit(index, options = {}) {
+    if (searchHits.length === 0) return;
+    const total = searchHits.length;
+    const next = ((index % total) + total) % total;   // 首尾循环
+    searchHits.forEach((mark) => mark.classList.remove('current'));
+    searchIndex = next;
+    const mark = searchHits[next];
+    mark.classList.add('current');
+    if (options.scroll !== false) {
+      expandSearchAncestors(mark);                     // 先展开，rect 才有效
+      // 只动消息容器的 scrollTop：scrollIntoView 会连带滚动 window 和侧栏
+      const wrapRect = messagesDiv.getBoundingClientRect();
+      const hitRect = mark.getBoundingClientRect();
+      messagesDiv.scrollTop += (hitRect.top + hitRect.height / 2) - (wrapRect.top + wrapRect.height / 2);
+      updateScrollbar();
+    }
+    updateSearchCount();
+  }
+
+  function stepSearchHit(delta) {
+    if (searchHits.length === 0) return;
+    if (searchIndex < 0) focusSearchHit(delta > 0 ? 0 : searchHits.length - 1);
+    else focusSearchHit(searchIndex + delta);
+  }
+
+  // 重扫前记住当前命中所在的那条消息：历史分块 prepend 后命中序号会整体后移，
+  // 靠元素引用（prepend 不重建已有节点）把用户留在原地，而不是被甩回第一条。
+  function currentHitAnchor() {
+    const mark = searchHits[searchIndex];
+    return mark ? mark.closest('.msg') : null;
+  }
+
+  function runSearch(term, options = {}) {
+    const anchor = options.keepPosition ? currentHitAnchor() : null;
+    clearSearchHighlights();
+    searchTerm = term;
+    const needle = term.trim().toLowerCase();
+    if (!needle) {
+      updateSearchCount();
+      return;
+    }
+    const nodes = collectSearchTextNodes();
+    for (const node of nodes) {
+      const marks = highlightTextNode(node, needle, SEARCH_HIT_CAP - searchHits.length);
+      for (const mark of marks) searchHits.push(mark);
+      if (searchHits.length >= SEARCH_HIT_CAP) break;   // 单字符搜索能命中上万次，截断兜底
+    }
+    if (searchHits.length === 0) {
+      updateSearchCount();
+      return;
+    }
+    const restored = anchor ? searchHits.findIndex((mark) => anchor.contains(mark)) : -1;
+    // 重扫是被动触发的，别抢用户的滚动位置；主动搜索才跳到第一个命中
+    if (restored >= 0) focusSearchHit(restored, { scroll: false });
+    else focusSearchHit(0, { scroll: !options.keepPosition });
+  }
+
+  // 历史分块到达 / 分批渲染补完后，新进 DOM 的消息也要纳入命中
+  function scheduleSearchRescan() {
+    if (!searchBar || searchBar.hidden || !searchTerm.trim()) return;
+    clearTimeout(searchRescanTimer);
+    searchRescanTimer = setTimeout(() => runSearch(searchTerm, { keepPosition: true }), 150);
+  }
+
+  function openMsgSearch() {
+    if (!searchBar) return;
+    searchBar.hidden = false;
+    searchInput.focus();
+    searchInput.select();
+    if (searchInput.value.trim()) runSearch(searchInput.value);
+  }
+
+  function closeMsgSearch() {
+    if (!searchBar || searchBar.hidden) return;
+    clearTimeout(searchRescanTimer);
+    clearSearchHighlights();
+    searchTerm = '';
+    searchBar.hidden = true;
+    updateSearchCount();
+    msgInput.focus();
+  }
+
+  if (searchBar && searchInput) {
+    searchInput.addEventListener('input', () => runSearch(searchInput.value));
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        stepSearchHit(e.shiftKey ? -1 : 1);
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        stepSearchHit(e.key === 'ArrowDown' ? 1 : -1);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();          // 别顺带关掉设置面板 / picker
+        closeMsgSearch();
+      }
+    });
+    $('#msg-search-prev').addEventListener('click', () => stepSearchHit(-1));
+    $('#msg-search-next').addEventListener('click', () => stepSearchHit(1));
+    $('#msg-search-close').addEventListener('click', closeMsgSearch);
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    if (e.key !== 'f' && e.key !== 'F') return;
+    if (!searchBar || !messagesDiv.querySelector('.msg')) return;  // 空会话让给原生查找
+    e.preventDefault();
+    openMsgSearch();
+  });
 
   function normalizeAskUserInput(input) {
     if (input === null || input === undefined) return null;
