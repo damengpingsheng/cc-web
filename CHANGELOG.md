@@ -8,6 +8,27 @@
 
 ---
 
+## 分叉 v1.5.8
+
+### 修复
+
+- 上翻浏览对话历史时，只要最新一轮还在输出，视口就被反复拽回页面底部，没法安静看完一段旧内容。根因是 `scrollToBottom()` 无条件把 `scrollTop` 推到 `scrollHeight`，前端完全没有「用户正在上翻」这个状态；流式期间 `text_delta` → `scheduleRender` → `flushRender` 每 100ms（`RENDER_DEBOUNCE`）就调一次，每个 `tool_start` 再加一次，于是一秒能被拽回十次。
+
+  现在由 `stickToBottom` 一个标志决定要不要跟随，`scrollToBottom(force)` 在未贴底且非强制时直接返回。关键是这个标志只在 `messagesDiv` 的 `scroll` 事件里更新，而不是在滚动前现场测距：`flushRender` 是先写 `innerHTML` 再滚，此时容器已被新增文本撑开，现场测出的距底距离恒大于 0，24px 容差下会在「跟随 / 不跟随」之间抖动。内容增高本身不触发 `scroll` 事件，所以该标志的语义恰好是「用户最后一次把视口放在哪」，上翻期间稳定为 `false`。容差复用跳转按钮的 `JUMP_EDGE_TOLERANCE`，跟右下角「到底」箭头的显隐判定保持一致。
+
+  跟随与否按语义分流：流式文本、工具卡片、轮次开始、系统消息与错误、外部 CLI 历史增量都尊重该标志；切会话、整区重渲染、用户自己发消息、点「到底」按钮这四类必须落底，走 `force` 并把标志置回 `true`。
+
+  顺带删掉 `imported_messages_replaced` 里原有的局部 `wasNearBottom`——它是同一问题的旧补丁，且因为在 DOM 改动**前**测距，在「用户贴着底、内容刚增高」时会误判为未贴底而中断跟随，现在统一交给 `stickToBottom`。
+
+  `stickToBottom` 声明放在文件顶部的全局状态区而不是 `scrollToBottom` 旁边：后者是提升的函数声明，若在 `let` 语句执行前被同步调用会撞上 TDZ 抛 `ReferenceError`。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 全文件确认无把 `scrollToBottom` 当回调传递的裸引用（`.then(scrollToBottom)` 之类会意外收到 truthy 实参当 `force`），三处名字命中都在注释里。
+- 本机无浏览器，真实页面里的滚动手感未做实测；`npm run regression` 因缺 `sqlite3` 仍在建表阶段就跑不起来，且该套件只覆盖服务端行为。
+- 注意生效前提：本笔只改前端静态文件，不必重启服务进程，硬刷新即可（静态资源 `?v=` 已打到 `1.5.1-my.14`）。
+
 ## 分叉 v1.5.7
 
 ### 新增

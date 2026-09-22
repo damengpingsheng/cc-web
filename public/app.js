@@ -169,6 +169,10 @@
   // 区分首次 auth 成功 vs WS 重连后的 auth 成功：
   // 仅首次才触发整区会话加载 + scrollToBottom，避免重连打断用户阅读
   let hasInitialAuthCompleted = false;
+  // 用户是否停在消息区底部，决定流式输出要不要跟随滚动。只在真正发生滚动时更新
+  // （见 messagesDiv 的 scroll 监听）：内容增高本身不触发 scroll 事件，所以上翻
+  // 阅读期间该标志保持 false，新的 delta / tool 卡片不会把视口拽回底部。
+  let stickToBottom = true;
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -1434,7 +1438,7 @@
 
   function finishSessionSwitch(sessionId) {
     if (isBlockingSessionLoad(sessionId)) {
-      scrollToBottom();
+      scrollToBottom(true);
       requestAnimationFrame(() => clearSessionLoading(sessionId));
       return;
     }
@@ -2031,7 +2035,6 @@
             const renderedMessages = Array.from(messagesDiv.children)
               .filter((element) => element.classList.contains('msg'));
             if (validRange && renderedMessages.length === previousTotal) {
-              const wasNearBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight <= 24;
               renderEpoch++;
               for (let i = fromIndex; i < renderedMessages.length; i++) renderedMessages[i].remove();
               const welcome = messagesDiv.querySelector('.welcome-msg');
@@ -2039,7 +2042,7 @@
               const frag = document.createDocumentFragment();
               replacement.forEach((message) => frag.appendChild(buildMsgElement(message)));
               messagesDiv.appendChild(frag);
-              if (wasNearBottom) scrollToBottom();
+              scrollToBottom();
               updateScrollbar();
             } else {
               openSession(msg.sessionId, { forceSync: true, blocking: false });
@@ -2723,7 +2726,7 @@
       const frag = document.createDocumentFragment();
       messages.forEach((message) => frag.appendChild(buildMsgElement(message)));
       messagesDiv.appendChild(frag);
-      scrollToBottom();
+      scrollToBottom(true);
       return;
     }
     // Batch render: last 10 first, then next 20, then the rest
@@ -2744,7 +2747,7 @@
     const frag0 = document.createDocumentFragment();
     for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i]));
     messagesDiv.appendChild(frag0);
-    scrollToBottom();
+    scrollToBottom(true);
 
     // Render remaining batches asynchronously, prepending each
     // Use scrollHeight delta to keep current view position stable after prepend
@@ -3395,7 +3398,13 @@
     scrollToBottom();
   }
 
-  function scrollToBottom() {
+  // force：切会话、整区重渲染、用户自己发消息等必须落到底部的场景
+  function scrollToBottom(force = false) {
+    if (!force && !stickToBottom) {
+      updateScrollbar();
+      return;
+    }
+    stickToBottom = true;
     requestAnimationFrame(() => {
       messagesDiv.scrollTop = messagesDiv.scrollHeight;
       updateScrollbar();
@@ -3432,6 +3441,7 @@
     updateScrollbar();
   });
   jumpBottomEl?.addEventListener('click', () => {
+    stickToBottom = true;
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
     updateScrollbar();
   });
@@ -3453,6 +3463,8 @@
   }
 
   messagesDiv.addEventListener('scroll', () => {
+    const { scrollTop, scrollHeight, clientHeight } = messagesDiv;
+    stickToBottom = scrollHeight - scrollTop - clientHeight <= JUMP_EDGE_TOLERANCE;
     updateScrollbar();
     // 移动端：滚动时短暂显示滑块，停止后淡出
     scrollbarEl.classList.add('scrolling');
@@ -4340,7 +4352,7 @@
         const cmdWelcome = messagesDiv.querySelector('.welcome-msg');
         if (cmdWelcome) cmdWelcome.remove();
         messagesDiv.appendChild(createMsgElement('user', text));
-        scrollToBottom();
+        scrollToBottom(true);
       }
       send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
       msgInput.value = '';
@@ -4353,7 +4365,7 @@
     if (welcome) welcome.remove();
     const attachments = pendingAttachments.map((attachment) => ({ ...attachment }));
     messagesDiv.appendChild(createMsgElement('user', text, attachments));
-    scrollToBottom();
+    scrollToBottom(true);
 
     send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
     msgInput.value = '';
