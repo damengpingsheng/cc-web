@@ -1614,6 +1614,37 @@
   };
   marked.setOptions({ renderer, breaks: true, gfm: true });
 
+  // navigator.clipboard 只在 secure context（https / localhost）下存在。内网 http://IP:PORT
+  // 访问时它是 undefined，直接 .writeText 会抛 TypeError —— 降级到 execCommand('copy')。
+  // 必须留在 click 的同步调用栈里，execCommand 脱离用户手势就会被浏览器拒掉。
+  function fallbackCopy(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    // 不能用 display:none / hidden，那样选不中；移出视口即可
+    ta.style.position = 'fixed';
+    ta.style.top = '-9999px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    let ok = false;
+    try {
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      ok = document.execCommand('copy');
+    } catch {
+      ok = false;
+    }
+    ta.remove();
+    return ok;
+  }
+
+  function copyTextToClipboard(text) {
+    if (navigator.clipboard?.writeText) {
+      return navigator.clipboard.writeText(text).then(() => true, () => fallbackCopy(text));
+    }
+    return Promise.resolve(fallbackCopy(text));
+  }
+
   // 在 sanitize 之后通过 DOM API 装饰代码块：Copy/Preview 按钮 + 预览 iframe。
   // 幂等：每个 pre.ccweb-decorated 跳过，避免流式刷新重复装饰导致 iframe 状态丢失。
   // 闭包捕获当前 code 文本，不再用全局 cid Map（避免流式刷新产生废弃条目）。
@@ -1643,8 +1674,8 @@
       copyBtn.className = 'code-copy-btn';
       copyBtn.textContent = 'Copy';
       copyBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(rawCode).then(() => {
-          copyBtn.textContent = 'Copied!';
+        copyTextToClipboard(rawCode).then((ok) => {
+          copyBtn.textContent = ok ? 'Copied!' : 'Failed';
           setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
         });
       });

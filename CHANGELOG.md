@@ -8,6 +8,20 @@
 
 ---
 
+## 分叉 v1.5.6
+
+### 修复
+
+- 代码块的 Copy 按钮在内网 HTTP 访问下点了没反应。`navigator.clipboard` 只在 secure context（`https` 或 `localhost`）下存在，而本服务是纯 HTTP、通常从内网 IP 访问，该对象是 `undefined`，`writeText` 直接抛 `TypeError`；原来的 `.then()` 没有 `.catch()`，异常只进控制台，按钮文字和剪贴板都没有任何变化。
+
+  现在优先走 `navigator.clipboard`，不可用（或 reject）时降级到临时 `<textarea>` + `document.execCommand('copy')`。降级必须留在 click 的同步调用栈里，`execCommand` 一旦脱离用户手势就会被浏览器拒掉。复制失败时按钮显示 `Failed`，不再静默。
+
+  与代码块语言无关，此前所有语言的 Copy 都是坏的；同一代码块上的 Preview 按钮一直正常，因为它不碰 clipboard。
+
+### 验证
+
+- 浏览器实测：无语言 fence、显式 `plaintext`、`js`、`python`、`html` 五种代码块的 Copy 均恢复，粘贴内容与块内文本一致，`html` 块的 Preview 不受影响。本机缺 `sqlite3`，`npm run regression` 仍跑不起来。
+
 ## 分叉 v1.5.5
 
 ### 新增
