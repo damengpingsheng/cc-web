@@ -2313,7 +2313,9 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
 
-    const msgEl = createMsgElement('assistant', '');
+    // 先按开始时刻打上时间，避免收尾时才插入元素造成气泡宽度跳变；
+    // finishGenerating 再按落盘时刻校准一次
+    const msgEl = createMsgElement('assistant', '', [], Date.now());
     msgEl.id = 'streaming-msg';
     // 流式消息 bubble 拆为 .msg-text 和 .msg-tools 两个子容器
     const bubble = msgEl.querySelector('.msg-bubble');
@@ -2367,6 +2369,10 @@
           }
         }
       }
+      // 服务端是在进程收尾时给这条 assistant 消息打 timestamp 的，
+      // 这里同步校准，刷新页面后气泡上的时间不会往前跳
+      const time = streamEl.querySelector(':scope > .msg-time');
+      if (time) setMsgTimeText(time, new Date());
       streamEl.removeAttribute('id');
     }
 
@@ -2427,7 +2433,26 @@
     }
   }
 
-  function createMsgElement(role, content, attachments = []) {
+  // 气泡外侧底角的分钟级时间戳。只看 HH:MM 在跨天回看时有歧义，完整时间挂 title。
+  function setMsgTimeText(el, date) {
+    const hh = String(date.getHours()).padStart(2, '0');
+    const mm = String(date.getMinutes()).padStart(2, '0');
+    el.textContent = `${hh}:${mm}`;
+    el.title = date.toLocaleString('zh-CN');
+  }
+
+  // 导入的会话可能没有 timestamp，这时不占位，直接不渲染
+  function buildMsgTimeElement(value) {
+    if (!value) return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return null;
+    const el = document.createElement('span');
+    el.className = 'msg-time';
+    setMsgTimeText(el, date);
+    return el;
+  }
+
+  function createMsgElement(role, content, attachments = [], timestamp = null) {
     const div = document.createElement('div');
     div.className = `msg ${role}${role === 'assistant' ? ' agent-' + currentAgent : ''}`;
 
@@ -2473,6 +2498,8 @@
 
     div.appendChild(avatar);
     div.appendChild(bubble);
+    const time = buildMsgTimeElement(timestamp);
+    if (time) div.appendChild(time);
     return div;
   }
 
@@ -2668,7 +2695,7 @@
 	  function buildMsgElement(m) {
 	    if (m.kind === 'local-command' && m.localCommand) return buildLocalCommandElement(m);
 	    if (m.kind === 'compact-summary') return buildCompactSummaryElement(m);
-	    const el = createMsgElement(m.role, m.content, m.attachments || []);
+	    const el = createMsgElement(m.role, m.content, m.attachments || [], m.timestamp || null);
 	    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
 	      const bubble = el.querySelector('.msg-bubble');
 	      const FOLD_AT = 3;
@@ -2797,7 +2824,7 @@
   // 在文本节点上包 <mark>，命中落在折叠区内时自动展开祖先。
   // 只切分/还原文本节点，绝不碰 innerHTML —— 否则 decorateCodeBlocks 注入的
   // Copy / Preview 按钮的事件监听会被一起打掉。
-  const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search';
+  const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search, .msg-time';
 
   function collectSearchTextNodes() {
     const walker = document.createTreeWalker(messagesDiv, NodeFilter.SHOW_TEXT, {
@@ -2805,7 +2832,7 @@
         if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
         const parent = node.parentElement;
         if (!parent) return NodeFilter.FILTER_REJECT;
-        // 语言标签和 Copy/Preview 按钮是注入的 UI，不是对话内容
+        // 语言标签、Copy/Preview 按钮、气泡时间都是注入的 UI，不是对话内容
         if (parent.closest(SEARCH_SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       },
@@ -4351,7 +4378,7 @@
       if (/^\/(?:github|cf|ssh|loop)(?:\s|$)/i.test(text)) {
         const cmdWelcome = messagesDiv.querySelector('.welcome-msg');
         if (cmdWelcome) cmdWelcome.remove();
-        messagesDiv.appendChild(createMsgElement('user', text));
+        messagesDiv.appendChild(createMsgElement('user', text, [], Date.now()));
         scrollToBottom(true);
       }
       send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
@@ -4364,7 +4391,7 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const attachments = pendingAttachments.map((attachment) => ({ ...attachment }));
-    messagesDiv.appendChild(createMsgElement('user', text, attachments));
+    messagesDiv.appendChild(createMsgElement('user', text, attachments, Date.now()));
     scrollToBottom(true);
 
     send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });

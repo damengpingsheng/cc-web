@@ -8,6 +8,25 @@
 
 ---
 
+## 分叉 v1.5.9
+
+### 新增
+
+- 用户与 agent 的气泡旁多一枚 11px 的分钟级时间（钉钉风格）：用户消息在气泡左下角，agent 消息在气泡右下角。鼠标悬停显示带日期的完整时间——只有 `HH:MM` 的话，回看几天前的会话分不清是哪天。
+
+  时间元素是 `.msg` 的第三个 flex 子节点（`align-self: flex-end`），不进 `.msg-bubble`：气泡里是 markdown/工具卡片/附件的渲染结果，塞进去要么被 `p:last-child` 之类的排版规则影响，要么被会话内搜索当成对话内容高亮。左右位置不用写方向判断——`.msg.user` 本身是 `row-reverse`，同一份 DOM 顺序自然得到「用户在左、agent 在右」。同时把 `.msg-time` 加进 `SEARCH_SKIP_SELECTOR`，否则搜数字会命中一堆时间戳。
+
+  数据全部来自已有的 `message.timestamp`（服务端各处 push 消息时早就在写，只是前端没用过），没动服务端也没动会话文件格式。导入的会话里该字段可能是 `null`，此时不渲染，也不占位。
+
+  流式气泡的时间在 `startGenerating` 就打上（用本地时刻），`finishGenerating` 再用 `setMsgTimeText` 原地校准一次。两段都需要：若只在收尾插入元素，气泡会在每轮输出结束时被挤窄一次、正文重排；若只在开始打时间，服务端存的是进程收尾时刻的 `timestamp`，刷新页面后时间会往后跳。`HH:MM` 定宽，校准不改变布局。
+
+### 验证
+
+- 从 `public/app.js` 抽出真实的 `setMsgTimeText` / `buildMsgTimeElement` / `createMsgElement`，在最小 DOM stub 下跑 24 条断言全绿：零填充 `09:05`、title 带日期、时间是 `.msg` 直接子节点且在 bubble 之后、不落进气泡正文、ISO 串与毫秒数都认、`null`/空串/非法值都不渲染、system 消息不带时间、附件路径不受影响、收尾校准只改文本不改节点数；外加调用点与 `SEARCH_SKIP_SELECTOR` 的静态核对。
+- `node --check public/app.js` 通过。
+- 本机无浏览器，真实页面里的视觉位置与各主题下的对比度未做实测；`npm run regression` 因缺 `sqlite3` 仍跑不起来，且该套件只覆盖服务端行为。
+- 生效前提：本笔只改前端静态文件，不必重启服务进程，硬刷新即可（静态资源 `?v=` 已打到 `1.5.1-my.15`）。
+
 ## 分叉 v1.5.8
 
 ### 修复

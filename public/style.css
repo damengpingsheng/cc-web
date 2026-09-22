@@ -1489,6 +1489,18 @@ mark.search-hit.current {
   color: var(--text-primary);
 }
 
+/* 气泡外侧底角的分钟级时间：flex 方向决定 user 在气泡左侧、assistant 在右侧 */
+.msg-time {
+  align-self: flex-end;
+  flex-shrink: 0;
+  padding-bottom: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  white-space: nowrap;
+  user-select: none;
+}
+
 /* 本地命令卡片：不是对话，所以不走左右分栏的气泡样式，整行铺开单独呈现 */
 .msg.local-command {
   align-self: stretch;
