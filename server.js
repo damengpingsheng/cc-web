@@ -1419,6 +1419,18 @@ function safeFilename(name) {
     .slice(0, 120) || 'image';
 }
 
+// 展开开头的 ~ / ~/xxx。在「新建会话」的目录框里手写 ~ 是自然输入，但 spawn 不认
+// 波浪号，而 Node 在 cwd 不存在时抛的同样是 `spawn <command> ENOENT`（path 字段填的
+// 还是 command），前端会翻成「找不到 CLI」，把排查方向带偏。~user/xxx 需要查 passwd，
+// 不在这里处理，交给调用方的存在性校验报错。
+function expandUserPath(p) {
+  const raw = String(p || '').trim();
+  if (raw !== '~' && !raw.startsWith('~/')) return raw;
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (!home) return raw;
+  return raw === '~' ? home : path.join(home, raw.slice(2));
+}
+
 function extFromMime(mime) {
   switch (mime) {
     case 'image/png': return '.png';
@@ -3852,12 +3864,25 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 
 // === Session Handlers ===
 function handleNewSession(ws, msg) {
-  const cwd = (msg && msg.cwd) ? String(msg.cwd) : null;
+  const rawCwd = (msg && msg.cwd) ? String(msg.cwd).trim() : '';
+  const cwd = rawCwd ? expandUserPath(rawCwd) : null;
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
   const taskMode = msg?.taskMode === 'remote' ? 'remote' : 'local';
   const sshHostId = String(msg?.sshHostId || '').trim();
   const remoteCwd = String(msg?.remoteCwd || '').trim();
+
+  // 目录不存在就当场拒绝。否则会话照建，直到发第一条消息才由 spawn 报一句指向 CLI 的
+  // ENOENT —— 那时错误信息里既没有 cwd 也没有线索，实际现场排查过一次，绕了很远。
+  // 远程任务的 cwd 由服务端生成（下面的 hostDir），不走这条校验。
+  if (cwd && taskMode !== 'remote') {
+    let stat = null;
+    try { stat = fs.statSync(cwd); } catch { /* 不存在 / 无权限 */ }
+    if (!stat || !stat.isDirectory()) {
+      const hint = cwd === rawCwd ? '' : `（输入 ${rawCwd} 展开而来）`;
+      return wsSend(ws, { type: 'error', message: `工作目录不存在或不是目录：${cwd}${hint}` });
+    }
+  }
 
   let resolvedCwd = cwd || (agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null);
   let hostInfo = null;

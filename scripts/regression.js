@@ -38,6 +38,7 @@
  *   - XFF 解析纯函数单测（testClientIpResolution）
  *   - 可信代理 + IP 封禁端到端（testIpBanEnforcement）
  *   - spawn 失败（CLI 路径不存在）只报错单个会话，服务不退出（testSpawnFailureIsolation）
+ *   - 新建会话 cwd 展开 ~ 并校验存在性（testSessionCwdValidation）
  *
  * 盲区：无前端 DOM driver；无浏览器运行时 XSS 验证（依赖 DOMPurify 库可信度）；
  *      无并发场景；无断电级持久化测试；无 Windows taskkill 覆盖。
@@ -1169,6 +1170,9 @@ async function main() {
 
   // spawn 失败只影响单个会话，不能打死整个服务（proc.on('error') 缺失回归）
   await testSpawnFailureIsolation();
+
+  // 新建会话的 cwd 展开 ~ 并校验存在性（字面量波浪号会被误报成「找不到 CLI」）
+  await testSessionCwdValidation();
 }
 
 // Pure-function tests for client IP resolution (Goal 3).
@@ -1874,6 +1878,79 @@ async function testSpawnFailureIsolation() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Spawn failure isolation checks passed.');
+}
+
+// 新建会话时的 cwd 必须展开 ~ 并校验存在性。
+// 不展开的话字面量 "~/x" 会一路传到 spawn，而 Node 在 cwd 不存在时抛的是
+// `spawn <command> ENOENT`（path 字段填 command），前端翻成「找不到 CLI」，
+// 把排查方向指向 PATH / CLAUDE_PATH —— 实际现场就是这么绕远的。
+async function testSessionCwdValidation() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-cwd-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  // 工作目录放在 HOME 里，~/space 才有得可展
+  const workDir = path.join(homeDir, 'space');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(d);
+  const notADir = path.join(homeDir, 'a-file');
+  fs.writeFileSync(notADir, 'not a directory');
+  const password = 'CwdCheck!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+
+    // 1) ~/xxx 展开成绝对路径，且展开后的目录真能跑起 CLI
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: '~/space', mode: 'yolo', taskMode: 'local' }));
+    const tilde = await nextMessage(messages, ws, (msg) => msg.type === 'session_info');
+    assert(tilde.cwd === workDir, `~/space must expand to ${workDir} (got ${tilde.cwd})`);
+    ws.send(JSON.stringify({ type: 'message', text: 'hi', sessionId: tilde.sessionId, mode: 'yolo', agent: 'claude' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === tilde.sessionId, 15000);
+    assert(!messages.some((msg) => msg.type === 'error'), 'An expanded cwd must spawn cleanly');
+
+    // 2) 单独一个 ~ 展开成 HOME
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: '~', mode: 'yolo', taskMode: 'local' }));
+    const homeOnly = await nextMessage(messages, ws, (msg) => msg.type === 'session_info');
+    assert(homeOnly.cwd === homeDir, `Bare ~ must expand to HOME (got ${homeOnly.cwd})`);
+
+    // 3) 不存在的目录：当场报错，且不能建出会话
+    const beforeCount = fs.readdirSync(sessionsDir).filter((f) => f.endsWith('.json')).length;
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: '/definitely/no/such/dir', mode: 'yolo', taskMode: 'local' }));
+    const missing = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(/工作目录不存在/.test(missing.message || ''), `Missing cwd must be rejected up front (got ${missing.message})`);
+    assert(/\/definitely\/no\/such\/dir/.test(missing.message || ''), 'The rejection must name the offending directory');
+    await sleep(300);
+    assert(!messages.some((msg) => msg.type === 'session_info'), 'A rejected cwd must not create a session');
+    const afterCount = fs.readdirSync(sessionsDir).filter((f) => f.endsWith('.json')).length;
+    assert(afterCount === beforeCount, 'A rejected cwd must not leave a session file behind');
+
+    // 4) 展开后仍不存在时，错误里要带上原始输入，否则用户看不懂
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: '~/no-such-space', mode: 'yolo', taskMode: 'local' }));
+    const badTilde = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(badTilde.message.includes(path.join(homeDir, 'no-such-space')), 'Expanded path must appear in the error');
+    assert(badTilde.message.includes('~/no-such-space'), 'Raw input must appear in the error too');
+
+    // 5) 指向普通文件同样要拒绝（statSync 成功但不是目录）
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: notADir, mode: 'yolo', taskMode: 'local' }));
+    const fileCwd = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(/不是目录/.test(fileCwd.message || ''), `A regular file must be rejected as cwd (got ${fileCwd.message})`);
+
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Session cwd validation checks passed.');
 }
 
 main().catch((err) => {
