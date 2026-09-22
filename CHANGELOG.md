@@ -8,6 +8,24 @@
 
 ---
 
+## 分叉 v1.5.12
+
+### 新增
+
+- 流式气泡末尾常驻一组跳动的指示点，表示这一轮还没跑完。`v1.5.10` 修好 `tool_end` 之后工具卡片会在 0.1 秒内正确变 done（本会话 108 次调用实测 `tool_use`→`tool_result` p50 0.09s、p90 0.22s，超过 3s 的只有两次 Bash），而模型思考加生成的空档 p50 10.8s、p90 42s、最长 143s，这段时间根本没有工具在跑。以前那些永不熄灭的 running 小点其实被当成了「还在干活」的活动指示，现在它们正确停下，空档期就完全静止了，只能靠底部是「停止」还是「发送」按钮判断。
+
+  指示点挂在 `.msg-bubble` 末尾，而不是放回 `.msg-text` 里：`flushRender` 每 100ms 就把 `.msg-text` 整个重写一遍，放进去会被第一段文本冲掉——这正是原先 `startGenerating` 那个 indicator 的下场，它只在本轮第一个字出现前可见。挂在气泡末尾则天然排在文本和工具卡片之后，`flushRender` 写 `.msg-text`、`appendToolCall` 写 `.msg-tools`，谁都碰不到它。`ensureTypingIndicator` 幂等；收尾时由 `finishGenerating` 用 `querySelectorAll` 全删，原先的 `querySelector` 只摘第一个，被 `goal_feedback` 封口过的气泡里会留下第二串。
+
+  顺带把 `flushRender` 在空文本时的行为改成清空 `.msg-text`，而不是继续走 `renderMarkdown('')`：后者会往里再吐一个 indicator，和气泡末尾那个撞成两串点（`resume_generating` 带空 `text` 时就会踩到）。
+
+### 验证
+
+- 从 `public/app.js` 抽出真实的 `ensureTypingIndicator`，在最小 DOM stub 下跑 9 条断言全绿：气泡子节点顺序为 `.msg-text` / `.msg-tools` / 指示点、重复调用幂等、重写 `.msg-text` 与追加工具卡片都不影响它、指示点不会被 `.tool-call` 选择器误收、收尾后清零、折叠组提前后顺序正确、两个气泡各留一串时 `querySelectorAll` 能全删。
+- 生命周期静态核对：创建点只有 `startGenerating`（`resume_generating` 复用气泡时指示点必然还在，它只可能被 `finishGenerating` 删掉，而那条路径会摘掉 `#streaming-msg` 的 id）；删除点是 `finishGenerating` 与 `goal_feedback` 封口，而 `done` / `error` / `background_done` / WS detach 兜底四条收尾路径都汇入 `finishGenerating`；全文件确认只有建气泡时的 `bubble.innerHTML = ''` 会清掉它，`createMsgElement` 那处 `bubble.innerHTML` 只作用于历史消息。
+- `node --check public/app.js` 通过；`npm run regression` 因缺 `sqlite3` 仍在建表阶段就跑不起来，且该套件不覆盖前端渲染。
+- 本机无浏览器，指示点与文本/工具卡片之间的间距（`.typing-indicator` 自带 `padding: 8px 4px`，现在前面可能紧跟 markdown 段落的下边距）未做实测。
+- 生效前提：本笔只改前端静态文件，不必重启服务进程，硬刷新即可（静态资源 `?v=` 已打到 `1.5.1-my.18`）。
+
 ## 分叉 v1.5.11
 
 ### 修复

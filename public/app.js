@@ -2328,13 +2328,24 @@
     bubble.innerHTML = '';
     const textDiv = document.createElement('div');
     textDiv.className = 'msg-text';
-    textDiv.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
     const toolsDiv = document.createElement('div');
     toolsDiv.className = 'msg-tools';
     bubble.appendChild(textDiv);
     bubble.appendChild(toolsDiv);
+    ensureTypingIndicator(bubble);
     messagesDiv.appendChild(msgEl);
     scrollToBottom();
+  }
+
+  // 「仍在生成」指示。挂在 bubble 末尾而不是 .msg-text 里：flushRender 每次都重写
+  // .msg-text，放进去会被首段文本冲掉，之后模型思考的十几秒（实测 p50 10.8s）里
+  // 页面完全静止，工具卡片也已经全部 done，看不出还在不在跑。
+  function ensureTypingIndicator(bubble) {
+    if (!bubble || bubble.querySelector(':scope > .typing-indicator')) return;
+    const dots = document.createElement('div');
+    dots.className = 'typing-indicator';
+    dots.innerHTML = '<span></span><span></span><span></span>';
+    bubble.appendChild(dots);
   }
 
   function finishGenerating(sessionId) {
@@ -2346,8 +2357,9 @@
 
     if (pendingText) flushRender();
 
-    const typing = document.querySelector('.typing-indicator');
-    if (typing) typing.remove();
+    // 收尾时全删：指示点现在挂在气泡末尾，querySelector 只摘一个的话，
+    // 中途 goal_feedback 封口过的气泡里可能还留着一串。
+    document.querySelectorAll('.typing-indicator').forEach((el) => el.remove());
 
     const streamEl = document.getElementById('streaming-msg');
     if (streamEl) {
@@ -2425,7 +2437,9 @@
     if (!bubble) return;
     let textDiv = bubble.querySelector('.msg-text');
     if (!textDiv) { textDiv = bubble; }
-    textDiv.innerHTML = renderMarkdown(pendingText);
+    // 空文本走 renderMarkdown 会再吐一个 typing-indicator 到 .msg-text 里，
+    // 和气泡末尾那个撞成两串点（resume_generating 带空 text 时就会踩到）。
+    textDiv.innerHTML = pendingText ? renderMarkdown(pendingText) : '';
     decorateCodeBlocks(textDiv);
     scrollToBottom();
   }
