@@ -45,6 +45,7 @@ if (fs.existsSync(envPath)) {
 }
 
 const PORT = parseInt(process.env.PORT) || 8002;
+const HOST = process.env.HOST || '127.0.0.1';
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
@@ -4562,13 +4563,13 @@ function killPortOccupant(port) {
 
 function handleServerListenError(err) {
   if (err && err.code === 'EADDRINUSE') {
-    plog('WARN', 'server_port_in_use_retry', { port: PORT, host: '127.0.0.1' });
+    plog('WARN', 'server_port_in_use_retry', { port: PORT, host: HOST });
     if (killPortOccupant(PORT)) {
-      try { server.listen(PORT, '127.0.0.1'); } catch {}
+      try { server.listen(PORT, HOST); } catch {}
       return;
     }
     plog('ERROR', 'server_port_in_use', { port: PORT, error: err.message });
-    console.error(`CC-Web server failed: 127.0.0.1:${PORT} is already in use.`);
+    console.error(`CC-Web server failed: ${HOST}:${PORT} is already in use.`);
     process.exit(98);
     return;
   }
@@ -4591,7 +4592,7 @@ process.on('unhandledRejection', (reason) => {
   plog('ERROR', 'unhandled_rejection', { error: reason?.stack || reason?.message || String(reason) });
 });
 
-server.listen(PORT, '127.0.0.1', () => {
+server.listen(PORT, HOST, () => {
   ensureAuthLoaded();
-  console.log(`CC-Web server listening on 127.0.0.1:${PORT}`);
+  console.log(`CC-Web server listening on ${HOST}:${PORT}`);
 });
