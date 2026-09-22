@@ -108,7 +108,9 @@ async function waitForFile(filePath, timeoutMs = 10000) {
 async function withServer(env, fn) {
   const child = spawn('/usr/bin/node', [SERVER_PATH], {
     cwd: REPO_DIR,
-    env: { ...process.env, ...env },
+    // 与跑测者的 shell 环境解耦：withContextSuffix 会读 CLAUDE_CODE_DISABLE_1M_CONTEXT，
+    // 外部设成 1 会让 [1m] 后缀相关断言随环境时好时坏。放在 ...env 之前，单个用例仍可覆盖。
+    env: { ...process.env, CLAUDE_CODE_DISABLE_1M_CONTEXT: '', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -459,7 +461,8 @@ async function main() {
   const claudeUsageFixtureCwd = path.join(tempRoot, 'project-usage');
   mkdirp(claudeFixtureCwd);
   mkdirp(claudeUsageFixtureCwd);
-  createFakeClaudeHistory(homeDir, { cwd: claudeFixtureCwd });
+  // 接住返回值：下面的原生历史实时同步用例要往这个 fixture 文件追加内容
+  const claudeFixture = createFakeClaudeHistory(homeDir, { cwd: claudeFixtureCwd });
   // P2 预防压缩 fixture：assistant 行带高水位 usage（150k input + 40k cache_read + 10k
   // cache_creation = 200k tokens ≥ 默认 200k 窗口的 80%），导入后发消息应先 /compact 再重放
   createFakeClaudeHistory(homeDir, {
@@ -476,6 +479,7 @@ async function main() {
   const password = 'Regression!234';
 
   await withServer({
+    HOST: '127.0.0.1',
     PORT: String(port),
     CC_WEB_PASSWORD: password,
     CC_WEB_CONFIG_DIR: configDir,
@@ -630,6 +634,7 @@ async function main() {
     assert(runtimeToml.includes('model = "gpt-5.4"'), 'Codex custom profile should write isolated runtime model');
 
     // 保存模型配置触发全量模型重映射时，会话 updated 不得被刷新（时间戳批量污染回归）
+    // 模型名用 claude- 前缀：withContextSuffix 只给原生 Claude 模型补 [1m]
     const remapSessionId = 'regression-remap-claude-session';
     const remapSessionPath = path.join(sessionsDir, `${remapSessionId}.json`);
     const remapUpdatedBefore = '2026-01-01T00:00:00.000Z';
@@ -643,11 +648,11 @@ async function main() {
           name: 'Regression Template',
           apiKey: 'sk-regression-model',
           apiBase: 'https://example.org/v1',
-          opusModel: 'regression-opus-v1',
+          opusModel: 'claude-regression-opus-v1',
         }],
       },
     }));
-    await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.templates?.[0]?.opusModel === 'regression-opus-v1');
+    await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.templates?.[0]?.opusModel === 'claude-regression-opus-v1');
     // 写入旧模板模型名的会话
     fs.writeFileSync(remapSessionPath, JSON.stringify({
       id: remapSessionId,
@@ -655,7 +660,7 @@ async function main() {
       created: remapUpdatedBefore,
       updated: remapUpdatedBefore,
       agent: 'claude',
-      model: 'regression-opus-v1[1m]',
+      model: 'claude-regression-opus-v1[1m]',
       messages: [],
     }, null, 2));
     // 第二步：模板模型名改为 v2，触发全量模型重映射（旧名 v1 与新名 v2 都在查找表中）
@@ -668,14 +673,14 @@ async function main() {
           name: 'Regression Template',
           apiKey: 'sk-regression-model',
           apiBase: 'https://example.org/v1',
-          opusModel: 'regression-opus-v2',
+          opusModel: 'claude-regression-opus-v2',
         }],
       },
     }));
-    await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.templates?.[0]?.opusModel === 'regression-opus-v2');
+    await nextMessage(messages, ws, (msg) => msg.type === 'model_config' && msg.config?.templates?.[0]?.opusModel === 'claude-regression-opus-v2');
     await waitForFile(remapSessionPath, 15000);
     const remapStored = JSON.parse(fs.readFileSync(remapSessionPath, 'utf8'));
-    assert(remapStored.model === 'regression-opus-v2[1m]', '保存模型配置后旧模型名会话应被重映射为新模板模型名');
+    assert(remapStored.model === 'claude-regression-opus-v2[1m]', '保存模型配置后旧模型名会话应被重映射为新模板模型名');
     assert(remapStored.updated === remapUpdatedBefore, '模型重映射不得刷新会话 updated 时间戳（时间戳批量污染回归）');
     // 恢复 local 模式，避免影响后续测试的模型配置状态
     ws.send(JSON.stringify({
@@ -858,6 +863,25 @@ async function main() {
     const importedClaude = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.title === 'Claude import prompt');
     assert(importedClaude.messages?.[0]?.content === 'Claude import prompt', 'Claude import parsed wrong first message');
 
+    // Importing a session must start native-history sync immediately.
+    fs.appendFileSync(claudeFixture.filePath, [
+      JSON.stringify({
+        type: 'user',
+        cwd: claudeFixtureCwd,
+        timestamp: '2026-03-12T00:00:04.000Z',
+        message: { content: 'Claude live prompt' },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-03-12T00:00:05.000Z',
+        message: { content: [{ type: 'text', text: 'Claude live answer' }] },
+      }),
+    ].join('\n') + '\n');
+    const claudeLiveUpdate = await nextMessage(messages, ws, (msg) => (
+      msg.type === 'imported_messages_appended' && msg.sessionId === importedClaude.sessionId
+    ));
+    assert(claudeLiveUpdate.messages?.map((item) => item.content).join('|') === 'Claude live prompt|Claude live answer', 'Claude imported session did not sync appended messages');
+
     // P2 行为级：预防性水位压缩。导入一个 transcript 带高水位 usage（200k tokens ≥ 200k
     // 窗口 × 80%）的会话，再发消息：期望 通知 → /compact 运行（含 P1 boundary 透传）→
     // 原消息重放，共 2 次 spawn；原消息仅经重放记录一次。
@@ -897,6 +921,158 @@ async function main() {
     const importedCodex = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'Codex import prompt');
     assert(importedCodex.messages?.[0]?.content === 'Codex import prompt', 'Codex import kept wrapper instructions');
     assert(importedCodex.totalUsage?.inputTokens === 20, 'Codex import usage parse failed');
+
+    fs.appendFileSync(codexFixture.rolloutPath, [
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:04.000Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'Codex live prompt' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:05.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Codex live answer' }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:06.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: { total_token_usage: { input_tokens: 35, cached_input_tokens: 7, output_tokens: 14 } },
+        },
+      }),
+    ].join('\n') + '\n');
+    const codexLiveAppend = await nextMessage(messages, ws, (msg) => (
+      msg.type === 'imported_messages_appended' && msg.sessionId === importedCodex.sessionId
+    ));
+    assert(codexLiveAppend.messages?.map((item) => item.content).join('|') === 'Codex live prompt|Codex live answer', 'Codex imported session did not sync appended messages');
+    assert(codexLiveAppend.totalUsage?.inputTokens === 35, 'Codex appended sync did not update usage');
+
+    // Codex adds tool details to the existing assistant turn without growing message count.
+    fs.appendFileSync(codexFixture.rolloutPath, [
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:07.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'shell_command',
+          call_id: 'call-live',
+          arguments: JSON.stringify({ command: 'printf live' }),
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:08.000Z',
+        type: 'response_item',
+        payload: { type: 'function_call_output', call_id: 'call-live', output: 'live' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:09.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: { total_token_usage: { input_tokens: 50, cached_input_tokens: 10, output_tokens: 20 } },
+        },
+      }),
+    ].join('\n') + '\n');
+    const codexTailReplace = await nextMessage(messages, ws, (msg) => (
+      msg.type === 'imported_messages_replaced' && msg.sessionId === importedCodex.sessionId
+    ));
+    assert(codexTailReplace.previousTotal === 4 && codexTailReplace.fromIndex === 3, 'Codex tail replacement reported the wrong range');
+    assert(codexTailReplace.messages?.[0]?.toolCalls?.[0]?.done === true, 'Codex tool result did not replace the existing assistant turn');
+    assert(codexTailReplace.totalUsage?.inputTokens === 50, 'Codex tail replacement did not update usage');
+
+    const syncedCodexSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${importedCodex.sessionId}.json`), 'utf8'));
+    assert(syncedCodexSession.messages?.length === 4, 'Codex synchronized snapshot has the wrong message count');
+    assert(syncedCodexSession.totalUsage?.outputTokens === 20, 'Codex synchronized snapshot did not persist usage');
+
+    // Codex custom tool calls are persisted with custom_tool_call records.
+    fs.appendFileSync(codexFixture.rolloutPath, [
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:10.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          name: 'exec',
+          call_id: 'custom-live',
+          input: 'printf custom',
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:11.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call_output',
+          call_id: 'custom-live',
+          output: [{ type: 'input_text', text: 'custom output' }],
+        },
+      }),
+    ].join('\n') + '\n');
+    const codexCustomTool = await nextMessage(messages, ws, (msg) => (
+      (msg.type === 'imported_messages_appended' || msg.type === 'imported_messages_replaced') &&
+      msg.sessionId === importedCodex.sessionId
+    ));
+    const customToolMessage = codexCustomTool.messages?.find((item) => item?.toolCalls?.some((tool) => tool.name === 'exec'));
+    const customTool = customToolMessage?.toolCalls?.find((tool) => tool.name === 'exec');
+    assert(customTool, 'Codex custom tool call was not parsed');
+    assert(customTool.done === true, 'Codex custom tool output was not parsed');
+    assert(customTool.result === 'custom output', 'Codex custom tool output text was not preserved');
+
+    // A rollout may be atomically replaced while the CLI is running.
+    const replacedRolloutPath = `${codexFixture.rolloutPath}.replacement`;
+    fs.copyFileSync(codexFixture.rolloutPath, replacedRolloutPath);
+    fs.appendFileSync(replacedRolloutPath, [
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:12.000Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'Codex replaced prompt' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:13.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Codex replaced answer' }],
+        },
+      }),
+    ].join('\n') + '\n');
+    fs.renameSync(replacedRolloutPath, codexFixture.rolloutPath);
+    const codexReplacedRollout = await nextMessage(messages, ws, (msg) => (
+      msg.type === 'imported_messages_appended' && msg.sessionId === importedCodex.sessionId
+    ));
+    assert(codexReplacedRollout.messages?.map((item) => item.content).join('|') === 'Codex replaced prompt|Codex replaced answer', 'Codex atomic rollout replacement was not synchronized');
+
+    // Guard (bugfix): a stale / shorter native rollout must NOT truncate turns that
+    // cc-web already persisted — e.g. browser-issued turns that ran under an isolated
+    // CODEX_HOME and never fell back into the native rollout. Regression for the Codex
+    // "browser-issued turn disappears after reopen" bug.
+    const staleGuardPath = path.join(sessionsDir, `${importedCodex.sessionId}.json`);
+    const staleGuardBefore = JSON.parse(fs.readFileSync(staleGuardPath, 'utf8'));
+    const staleBaseLen = staleGuardBefore.messages.length;
+    staleGuardBefore.messages.push(
+      { role: 'user', content: 'browser-only prompt', timestamp: '2026-03-12T00:00:20.000Z' },
+      { role: 'assistant', content: 'browser-only answer', toolCalls: [], timestamp: '2026-03-12T00:00:21.000Z' },
+    );
+    fs.writeFileSync(staleGuardPath, JSON.stringify(staleGuardBefore, null, 2));
+    // Poke the native rollout with a usage-only record: it fires a sync while the parsed
+    // native history stays shorter than the just-persisted snapshot.
+    fs.appendFileSync(codexFixture.rolloutPath, JSON.stringify({
+      timestamp: '2026-03-12T00:00:22.000Z',
+      type: 'event_msg',
+      payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 77, cached_input_tokens: 15, output_tokens: 30 } } },
+    }) + '\n');
+    await nextMessage(messages, ws, (msg) => (
+      msg.type === 'imported_messages_replaced' &&
+      msg.sessionId === importedCodex.sessionId &&
+      msg.totalUsage?.inputTokens === 77
+    ), 15000);
+    const staleGuardAfter = JSON.parse(fs.readFileSync(staleGuardPath, 'utf8'));
+    assert(staleGuardAfter.messages.length === staleBaseLen + 2, 'Stale shorter native rollout must not truncate cc-web-persisted turns');
+    assert(staleGuardAfter.messages.some((m) => m.content === 'browser-only prompt'), 'Browser-issued turn must survive a stale native sync');
 
     const importedSessionId = importedCodex.sessionId;
     ws.send(JSON.stringify({ type: 'delete_session', sessionId: importedSessionId }));

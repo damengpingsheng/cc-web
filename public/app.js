@@ -139,6 +139,7 @@
   const sessionGoalState = new Map(); // sessionId -> { active, turns, lastFeedback }
   const SESSION_GOAL_STATE_CAP = 100;
   let pendingGoalForNewSession = null;
+  let currentEffort = '';
   // 输入框历史回溯（↑/↓）。promptHistoryIndex < 0 表示不在回溯态，此时 ↑ 只在输入框为空时接管。
   let promptHistory = [];
   let promptHistoryIndex = -1;
@@ -149,7 +150,6 @@
   let searchTerm = '';
   let searchRescanTimer = null;
   const SEARCH_HIT_CAP = 2000;
-  let currentEffort = '';
   // 服务端推送的网关可用模型 / effort 列表，null 表示尚未拿到
   let modelCatalog = null;
   let currentAgent = AGENT_LABELS[localStorage.getItem('cc-web-agent')] ? localStorage.getItem('cc-web-agent') : DEFAULT_AGENT;
@@ -2491,6 +2491,24 @@
     return section;
   }
 
+  // 把工具参数对象按字段拆成分区：每个 key 一段，长文本各自进 <pre>。
+  // 整个对象丢给 JSON.stringify 的话，字符串值里的换行会被转义成字面量 \n，
+  // Write/Edit 的文件内容就糊成一整段——按字段拆开换行才回得来。
+  // 不是普通对象（字符串、数组、null）返回 null，交回调用方按原样渲染。
+  function buildToolFieldSections(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const entries = Object.entries(value).filter(([, v]) => v !== undefined && v !== null && v !== '');
+    if (entries.length === 0) return null;
+    const stack = document.createElement('div');
+    stack.className = 'tool-call-structured';
+    for (const [key, v] of entries) {
+      const body = typeof v === 'string' ? v : stringifyToolValue(v);
+      // 分区标题是 uppercase 的，file_path 这种下划线换成空格才好读
+      stack.appendChild(buildStructuredToolSection(key.replace(/_/g, ' '), body));
+    }
+    return stack;
+  }
+
   // 导入的 Claude 会话里，! 前缀的 shell 命令和 / 斜杠命令是用户在终端里敲的，
   // 既不是对话也不是工具调用。复用 .tool-call 的外观折成一张可展开的卡片，
   // 免得一条条裸 <bash-input> 标签混在对话里。
@@ -3041,24 +3059,6 @@
 
     return wrapper;
   }
-  // 把工具参数对象按字段拆成分区：每个 key 一段，长文本各自进 <pre>。
-  // 整个对象丢给 JSON.stringify 的话，字符串值里的换行会被转义成字面量 \n，
-  // Write/Edit 的文件内容就糊成一整段——按字段拆开换行才回得来。
-  // 不是普通对象（字符串、数组、null）返回 null，交回调用方按原样渲染。
-  function buildToolFieldSections(value) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    const entries = Object.entries(value).filter(([, v]) => v !== undefined && v !== null && v !== '');
-    if (entries.length === 0) return null;
-    const stack = document.createElement('div');
-    stack.className = 'tool-call-structured';
-    for (const [key, v] of entries) {
-      const body = typeof v === 'string' ? v : stringifyToolValue(v);
-      // 分区标题是 uppercase 的，file_path 这种下划线换成空格才好读
-      stack.appendChild(buildStructuredToolSection(key.replace(/_/g, ' '), body));
-    }
-    return stack;
-  }
-
 
   function buildToolContentElement(name, input) {
     const tool = typeof name === 'object' && name !== null ? name : { name, input };

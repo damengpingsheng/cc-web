@@ -5046,6 +5046,7 @@ function handleImportNativeSession(ws, msg) {
     remoteCwd: session.remoteCwd || '',
   });
   sendSessionList(ws);
+  startImportedSync(ws, id);
 }
 
 function handleListCodexSessions(ws) {
@@ -5138,6 +5139,7 @@ function handleImportCodexSession(ws, msg) {
     title: session.title,
     mode: session.permissionMode,
     model: sessionModelLabel(session),
+    effort: session.effort || '',
     agent: getSessionAgent(session),
     cwd: session.cwd,
     totalCost: session.totalCost || 0,

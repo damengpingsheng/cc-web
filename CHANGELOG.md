@@ -1,5 +1,156 @@
 # 更新记录
 
+> **本仓库是 [ZgDaniel/cc-web](https://github.com/ZgDaniel/cc-web) 的个人分叉。**
+> 分叉基线是上游 `v1.3.1`，此后两边独立演进，`v1.4.0` / `v1.5.0` / `v1.5.1`
+> 三个号段被双方各自用过且内容不同。为免混淆，分叉侧的条目一律加「分叉」前缀，
+> 上游章节保持原样；`v1.3.1` 及更早是两边共同的历史。
+> 当前版本 `1.5.1+my.1` = 上游 `v1.5.1` + 下列全部分叉改动。
+
+---
+
+## 分叉 v1.5.4
+
+### 修复
+
+- Codex `local` 会话不再被隔离到独立的 `CODEX_HOME`。此前浏览器下发的轮次会落入隔离目录下的 rollout，一旦重开浏览器，因原生 `~/.codex` 里没有该轮次而丢失。现取消 `local` 会话的 `CODEX_HOME` 隔离，浏览器下发的轮次直接写入原生 rollout，与 Claude Code 的行为对称。
+
+### 加固
+
+- 导入会话同步新增“更短不覆盖”保护：仅当重新解析得到的消息数不小于既有总数时才替换，避免在 rollout 被截断或原子替换的瞬间读到更短内容、覆盖掉已渲染的消息。
+
+### 验证
+
+- 回归新增护栏用例覆盖上述“更短不覆盖”场景，`npm run regression` 全绿。
+
+## 分叉 v1.5.3
+
+### 修复
+
+- Codex 导入会话现在可以识别真实 rollout 中的 `custom_tool_call` 与 `custom_tool_call_output`，终端通过 MCP/自定义工具产生的调用、完成状态和输出会同步到浏览器。
+- 文件监听器现在可以检测 rollout 文件被原子替换、truncate 或 inode 变化，自动从新文件重新读取，避免长时间运行时漏掉后续 CLI 输出。
+
+### 验证
+
+- 回归覆盖 Claude 追加同步、Codex 追加同步、Codex 同长度工具结果更新、`custom_tool_call` 输出、rollout 原子替换、token usage 持久化及本地 rollout/SQLite 删除清理。
+
+## 分叉 v1.5.2
+
+### 修复
+
+- Codex 导入会话现在会与终端 CLI 实时同步
+
+  v1.5.0 的实时同步链路只识别 `claudeSessionId`，监听目标也固定为
+  `~/.claude/projects/.../*.jsonl`；Codex 导入会话保存的是 `codexThreadId` 与
+  `importedRolloutPath`，因此虽然可以导入快照，却从未启动 rollout watcher。
+
+  现在会按 Agent 选择原生历史源：Claude 继续监听 project JSONL，Codex 监听
+  `~/.codex/sessions/.../rollout-*.jsonl`。打开会话时先补齐遗漏内容，打开期间的
+  新用户消息、助手回复、工具调用结果和 token usage 会在 400ms 防抖后同步到浏览器。
+
+  Codex rollout 可能在消息条数不增加时补写当前助手消息或工具结果，因此新增了
+  “变化后缀替换”协议；纯追加仍沿用原事件以保持兼容。前端只重绘变化位置之后的
+  消息，DOM 状态不一致时自动做一次非阻塞重载，避免重复或漏消息。
+
+- 首次导入 Claude/Codex 会话后立即启动 watcher，无需切走再重新打开；切换会话、
+  detach、断开连接或删除会话时同步释放订阅。
+
+### 验证
+
+- 隔离回归覆盖 Claude 追加同步、Codex 追加同步、Codex 同长度工具结果更新、
+  token usage 持久化及本地 rollout/SQLite 删除清理。
+
+## 分叉 v1.5.1
+
+### 新增
+
+- 模型与思考强度（effort）可切换，候选列表从网关动态获取
+
+  此前 `/model` 只认写死的三个别名（opus / sonnet / haiku），网关上实际可用的
+  几十个模型选不到；claude 的 `--effort` 参数则完全没接，思考强度无法调整。
+
+  现在候选列表改为向网关的 `/v1/models` 端点动态获取（5 分钟缓存），过滤掉
+  embedding / reranker / OCR 这类无法用于对话的模型，Claude 原生模型排在前面。
+  网关不可达时回落到内置别名，选择器始终有内容可用，不阻塞切换。
+
+  `/model` 改为两级联动：先选模型、再选 effort，一次点完；也支持
+  `/model <模型> <effort>` 一条命令同时设定。新增 `/effort` 用于只调强度。
+  两者的合法值取自 `claude --help` 的权威列表（low / medium / high / xhigh /
+  max），另有 `default` 哨兵值用于清除设置、交回 CLI 默认。
+
+  别名仍然可用且优先解析，因此 `/model opus` 的行为不变。未指定 effort 时保留
+  会话原有设置，不会被静默重置。`session.effort` 随会话持久化，并跟随
+  `session_info` 快照下发，切换会话时前端状态不会残留。
+
+## 分叉 v1.5.0
+
+### 新增
+
+- 导入会话实时同步：终端 CLI 侧产生的消息会实时同步到浏览器端
+
+  从终端 CLI 导入的会话（带 `importedFrom` 与 `claudeSessionId`），正文由
+  claude CLI 写入 `~/.claude/projects/<projectDir>/<claudeSessionId>.jsonl`。
+  在终端里继续同一个 CLI 会话时，新消息只进 JSONL 不进 cc-web 的会话文件，
+  浏览器端因此看不到进度，也无法判断会话是否已完成。现在做两件事：
+
+  - 打开会话时重新解析 JSONL，补齐此前遗漏的消息
+  - 会话打开期间监听 JSONL 变更，新增消息实时推送并追加渲染
+
+  实现上复用已有的 `FileTailer`（`fs.watch` + 500ms 轮询兜底），变更后 400ms
+  防抖再解析，避免 CLI 高频写入时反复全量解析。同一会话的多个客户端共享一个
+  监听器，按订阅计数启停，最后一个订阅者断开时释放。会话正在 cc-web 侧运行时
+  跳过同步，正文仍由流式事件推送，不会重复。
+
+  JSONL 是超集：cc-web 侧发出的消息同样会被 CLI 落盘，因此整体重解析可以安全
+  覆盖，不会丢失经由 cc-web 产生的内容。合并时按位置回填 `attachments` 等
+  cc-web 独有字段。
+
+- 长会话跳转：消息区右下角提供「到最前 / 到最后」圆钮
+
+  长会话里逐屏翻找很费劲。现在只显示可去的方向：处于中间时两枚都在，滚到
+  最前只留「到最后」，滚到最后只留「到最前」；内容不足两屏时整组不出现，
+  短对话里不干扰。距边缘 24px 内视作已到顶/到底，避免像素级抖动导致闪烁。
+
+  状态计算并入既有的 `updateScrollbar()`，不新增滚动监听。服务端打开会话时
+  一次性推完全部历史块，DOM 内即全量消息，跳转只需设 `scrollTop`，不触发额外
+  加载。跳转采用瞬时定位而非平滑动画：数百条消息的长距离 smooth 滚动耗时数秒
+  且中途难以打断。
+
+### 修复
+
+- 任务完成结果在浏览器端可能完全收不到
+
+  `handleProcessComplete` 判断客户端在线只用了 `!!entry.ws`，没有检查
+  `readyState`。socket 已进入 CLOSING/CLOSED 但 `close` 事件尚未触发
+  `handleDisconnect` 时（进程退出回调或 2 秒 PID 巡检抢在同一 tick 之前），
+  会走进「在线」分支，而 `wsSend` 对非 OPEN 状态是静默丢弃，于是 `done`、
+  错误信息、系统消息全部丢失，`background_done` 兜底分支也永不触发。改为
+  `!!entry.ws && entry.ws.readyState === 1`，与同一函数内 `shouldAutoCompact`
+  等处既有的判活写法保持一致。该值同时用于日志，此前会出现 socket 已失效却
+  记为 `wsConnected: true` 的误导。
+
+- 任务完成只通知发起的标签页，其他标签页与设备无感知
+
+  完成结果仅推给 `entry.ws`。现在抽出 `broadcastBackgroundDone()`，在线分支
+  推完 `done` 后广播给其余客户端并排除自己，离线分支复用同一实现。前端收到
+  `background_done` 时：正在查看该会话则重载，否则刷新会话列表。
+
+## 分叉 v1.4.0
+
+### 新增
+
+- 钉钉机器人通知通道：支持自定义关键词安全设置，可选发送时 @所有人
+- `HOST` 配置项：可指定服务监听地址，默认 `127.0.0.1`，设为局域网 IP 即可供内网访问
+
+### 修复
+
+- 修复自建网关/第三方中转场景下会话报 `Not logged in · Please run /login`：
+  子进程环境过滤原会删除全部 `ANTHROPIC_*` 变量，导致 CLI 丢失凭据，
+  现改为白名单保留 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` /
+  `ANTHROPIC_API_KEY` / `ANTHROPIC_CUSTOM_HEADERS`
+- 修正登录封禁提示文案：实际封禁时长为 7 天，原文案误写为「永久封禁」
+
+---
+
 ## v1.5.1
 
 ### 新功能
