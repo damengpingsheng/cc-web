@@ -1187,6 +1187,60 @@ body.session-loading-active {
     right: 2px;
   }
 }
+/* === 长会话跳转（到最前 / 到最后） === */
+/* 只显示「能去的方向」：到顶只剩向下，到底只剩向上，中间两枚都在 */
+.scroll-jump {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 5;
+}
+.scroll-jump-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  background: rgba(255, 252, 248, 0.9);
+  backdrop-filter: blur(6px);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, transform 0.15s, box-shadow 0.15s;
+}
+.scroll-jump-btn.visible { display: flex; }
+.scroll-jump-btn svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.scroll-jump-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+.scroll-jump-btn:active { transform: translateY(0); }
+.scroll-jump-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* 触摸设备：放大到 40px 满足最小点击区域，并让开加宽后的滚动条轨道 */
+@media (pointer: coarse) {
+  .scroll-jump { right: 22px; }
+  .scroll-jump-btn { width: 40px; height: 40px; }
+  .scroll-jump-btn svg { width: 18px; height: 18px; }
+}
+
 .welcome-msg {
   text-align: center;
   margin: auto;

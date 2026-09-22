@@ -3100,7 +3100,38 @@
   const scrollbarEl = document.getElementById('custom-scrollbar');
   const thumbEl = document.getElementById('custom-scrollbar-thumb');
 
+  // --- 长会话跳转按钮 ---
+  const jumpWrapEl = document.getElementById('scroll-jump');
+  const jumpTopEl = document.getElementById('scroll-jump-top');
+  const jumpBottomEl = document.getElementById('scroll-jump-bottom');
+  const JUMP_EDGE_TOLERANCE = 24; // 距边缘多少像素内视作已到顶/到底
+
+  // 会话内容不足两屏时不出现，避免短对话里干扰
+  function updateJumpButtons() {
+    if (!jumpWrapEl || !jumpTopEl || !jumpBottomEl) return;
+    const { scrollTop, scrollHeight, clientHeight } = messagesDiv;
+    if (scrollHeight <= clientHeight * 2) {
+      jumpWrapEl.hidden = true;
+      return;
+    }
+    jumpWrapEl.hidden = false;
+    const atTop = scrollTop <= JUMP_EDGE_TOLERANCE;
+    const atBottom = scrollTop + clientHeight >= scrollHeight - JUMP_EDGE_TOLERANCE;
+    jumpTopEl.classList.toggle('visible', !atTop);
+    jumpBottomEl.classList.toggle('visible', !atBottom);
+  }
+
+  jumpTopEl?.addEventListener('click', () => {
+    messagesDiv.scrollTop = 0;
+    updateScrollbar();
+  });
+  jumpBottomEl?.addEventListener('click', () => {
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    updateScrollbar();
+  });
+
   function updateScrollbar() {
+    updateJumpButtons();
     if (!scrollbarEl || !thumbEl) return;
     const { scrollTop, scrollHeight, clientHeight } = messagesDiv;
     if (scrollHeight <= clientHeight) {
