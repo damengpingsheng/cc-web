@@ -3895,6 +3895,7 @@
     { value: 'telegram', label: 'Telegram' },
     { value: 'serverchan', label: 'Server酱' },
     { value: 'feishu', label: '飞书机器人' },
+    { value: 'dingtalk', label: '钉钉机器人' },
     { value: 'qqbot', label: 'QQ（Qmsg）' },
   ];
 
@@ -3935,6 +3936,18 @@
         </div>
       `;
     }
+    if (provider === 'dingtalk') {
+      return `
+        <div class="settings-field">
+          <label>Webhook 地址</label>
+          <input type="text" id="notify-dingtalk-webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=xxx" value="${escapeHtml(config?.dingtalk?.webhook || '')}">
+        </div>
+        <div class="settings-field" style="flex-direction:row;align-items:center;gap:10px">
+          <label style="margin:0;flex:1">发送时 @所有人</label>
+          <input type="checkbox" id="notify-dingtalk-atall" ${config?.dingtalk?.atAll ? 'checked' : ''} style="width:auto;margin:0">
+        </div>
+      `;
+    }
     if (provider === 'qqbot') {
       return `
         <div class="settings-field">
@@ -3967,6 +3980,8 @@
     const tgChat = panel.querySelector('#notify-tg-chatid');
     const sc = panel.querySelector('#notify-sc-sendkey');
     const feishuWh = panel.querySelector('#notify-feishu-webhook');
+    const dingWh = panel.querySelector('#notify-dingtalk-webhook');
+    const dingAtAll = panel.querySelector('#notify-dingtalk-atall');
     const qmsgKey = panel.querySelector('#notify-qmsg-key');
     // Summary config
     const summaryEnabled = panel.querySelector('#notify-summary-enabled');
@@ -3985,6 +4000,10 @@
       },
       serverchan: { sendKey: sc ? sc.value.trim() : (currentConfig?.serverchan?.sendKey || '') },
       feishu: { webhook: feishuWh ? feishuWh.value.trim() : (currentConfig?.feishu?.webhook || '') },
+      dingtalk: {
+        webhook: dingWh ? dingWh.value.trim() : (currentConfig?.dingtalk?.webhook || ''),
+        atAll: dingAtAll ? dingAtAll.checked : !!currentConfig?.dingtalk?.atAll,
+      },
       qqbot: { qmsgKey: qmsgKey ? qmsgKey.value.trim() : (currentConfig?.qqbot?.qmsgKey || '') },
       summary: {
         enabled: summaryEnabled ? summaryEnabled.checked : !!cs.enabled,

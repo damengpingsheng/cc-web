@@ -135,6 +135,7 @@ function loadNotifyConfig() {
     telegram: { botToken: '', chatId: '' },
     serverchan: { sendKey: '' },
     feishu: { webhook: '' },
+    dingtalk: { webhook: '' },
     qqbot: { qmsgKey: '' },
     summary: { ...DEFAULT_SUMMARY_CONFIG },
   };
@@ -161,6 +162,7 @@ function getNotifyConfigMasked() {
     telegram: { botToken: maskToken(config.telegram?.botToken), chatId: config.telegram?.chatId || '' },
     serverchan: { sendKey: maskToken(config.serverchan?.sendKey) },
     feishu: { webhook: maskToken(config.feishu?.webhook) },
+    dingtalk: { webhook: maskToken(config.dingtalk?.webhook) },
     qqbot: { qmsgKey: maskToken(config.qqbot?.qmsgKey) },
     summary: {
       enabled: !!s.enabled,
@@ -182,6 +184,7 @@ const NOTIFY_CONTENT_LIMITS = {
   serverchan: 30000,
   pushplus: 18000,
   feishu: 18000,
+  dingtalk: 5000,
 };
 
 function truncateForChannel(text, provider) {
@@ -378,6 +381,19 @@ function sendNotification(title, content) {
         data = JSON.stringify({ msg_type: 'text', content: { text: `${title}\n\n${truncated}` } });
         break;
       }
+      case 'dingtalk': {
+        if (!config.dingtalk?.webhook) return resolve({ ok: false, error: '钉钉 Webhook 未配置' });
+        url = config.dingtalk.webhook;
+        let dingText = `${title}\n\n${truncated}`;
+        // 钉钉自定义机器人安全设置为「自定义关键词」时，正文必须含该关键词
+        if (!dingText.includes('通知')) dingText = `【通知】${dingText}`;
+        data = JSON.stringify({
+          msgtype: 'text',
+          text: { content: dingText },
+          at: { isAtAll: !!config.dingtalk?.atAll },
+        });
+        break;
+      }
       case 'qqbot': {
         if (!config.qqbot?.qmsgKey) return resolve({ ok: false, error: 'Qmsg Key 未配置' });
         url = `https://qmsg.zendee.cn/send/${config.qqbot.qmsgKey}`;
@@ -400,7 +416,21 @@ function sendNotification(title, content) {
       res.on('data', (c) => body += c);
       res.on('end', () => {
         plog('INFO', 'notify_response', { provider: config.provider, status: res.statusCode, body: body.slice(0, 200) });
-        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, body: body.slice(0, 200) });
+        let ok = res.statusCode >= 200 && res.statusCode < 300;
+        let error;
+        // 钉钉失败时仍返回 HTTP 200，需按 errcode 判定
+        if (ok && config.provider === 'dingtalk') {
+          try {
+            const j = JSON.parse(body);
+            if (j.errcode !== 0) {
+              ok = false;
+              error = j.errcode === 450103
+                ? '钉钉机器人无 @所有人 权限（需群主放开限制）'
+                : `钉钉返回 errcode=${j.errcode}: ${j.errmsg || ''}`;
+            }
+          } catch { ok = false; error = '钉钉响应解析失败'; }
+        }
+        resolve({ ok, status: res.statusCode, error, body: body.slice(0, 200) });
       });
     });
     req.on('error', (e) => {
@@ -2617,6 +2647,11 @@ function handleSaveNotifyConfig(ws, newConfig) {
   merged.serverchan = { sendKey: (newConfig.serverchan?.sendKey && !newConfig.serverchan.sendKey.includes('****')) ? newConfig.serverchan.sendKey : current.serverchan?.sendKey || '' };
   // feishu
   merged.feishu = { webhook: (newConfig.feishu?.webhook && !newConfig.feishu.webhook.includes('****')) ? newConfig.feishu.webhook : current.feishu?.webhook || '' };
+  // dingtalk
+  merged.dingtalk = {
+    webhook: (newConfig.dingtalk?.webhook && !newConfig.dingtalk.webhook.includes('****')) ? newConfig.dingtalk.webhook : current.dingtalk?.webhook || '',
+    atAll: newConfig.dingtalk?.atAll !== undefined ? !!newConfig.dingtalk.atAll : !!current.dingtalk?.atAll,
+  };
   // qqbot
   merged.qqbot = { qmsgKey: (newConfig.qqbot?.qmsgKey && !newConfig.qqbot.qmsgKey.includes('****')) ? newConfig.qqbot.qmsgKey : current.qqbot?.qmsgKey || '' };
   // summary
