@@ -4502,6 +4502,25 @@ function handleMessage(ws, msg, options = {}) {
     args: spawnSpec.args.join(' '),
   });
 
+  // spawn 失败（命令不存在、无执行权限）由 error 事件异步投递，上面的 try/catch 拦不到。
+  // 不监听会冒泡成 uncaughtException，把整个服务连同其他会话一起打死。
+  // 此时 proc.pid 为 undefined 且不会再触发 exit，收尾只能走这里。
+  proc.on('error', (err) => {
+    plog('ERROR', 'process_spawn_fail', {
+      sessionId: currentSessionId.slice(0, 8),
+      command: spawnSpec.command,
+      error: err.message,
+    });
+    const failed = activeProcesses.get(currentSessionId);
+    if (!failed) {
+      cleanRunDir(currentSessionId);
+      wsSend(ws, { type: 'error', message: formatRuntimeError(getSessionAgent(session), err.message, { exitCode: null, signal: null }) });
+      return;
+    }
+    failed.lastError = err.message;
+    handleProcessComplete(currentSessionId, null, null);
+  });
+
   // Fast exit detection (while Node.js is running)
   proc.on('exit', (code, signal) => {
     plog('INFO', 'process_exit_event', {

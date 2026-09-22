@@ -37,6 +37,7 @@
  *   - atomicWriteJson + kill 进程组 + HTTP 旧 token 拒绝（testRobustnessHardening）
  *   - XFF 解析纯函数单测（testClientIpResolution）
  *   - 可信代理 + IP 封禁端到端（testIpBanEnforcement）
+ *   - spawn 失败（CLI 路径不存在）只报错单个会话，服务不退出（testSpawnFailureIsolation）
  *
  * 盲区：无前端 DOM driver；无浏览器运行时 XSS 验证（依赖 DOMPurify 库可信度）；
  *      无并发场景；无断电级持久化测试；无 Windows taskkill 覆盖。
@@ -1163,6 +1164,9 @@ async function main() {
 
   // 会话分组协议（group_create/rename/delete + session_move）
   await testSessionGroups();
+
+  // spawn 失败只影响单个会话，不能打死整个服务（proc.on('error') 缺失回归）
+  await testSpawnFailureIsolation();
 }
 
 // Pure-function tests for client IP resolution (Goal 3).
@@ -1794,6 +1798,83 @@ async function testSessionGroups() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Session group checks passed.');
+}
+
+// spawn 失败（CLI 路径不存在）必须只让本会话报错，不能打死整个服务。
+// Node 把 spawn ENOENT 作为 error 事件异步投递，同步 try/catch 拦不到；
+// 少了 proc.on('error') 就会冒泡成 uncaughtException，所有会话一起陪葬。
+async function testSpawnFailureIsolation() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-spawnfail-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'space');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(d);
+  const password = 'SpawnFail!234';
+  const port = await getFreePort();
+  const missingClaude = path.join(tempRoot, 'no-such-claude-binary');
+
+  await withServer({
+    // 显式绑回环：仓库 .env 里的 HOST 会被 server.js 读走，
+    // 不覆盖的话服务会听在对外网卡上，下面的 127.0.0.1 连接直接 ECONNREFUSED。
+    HOST: '127.0.0.1',
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: missingClaude,
+    CODEX_PATH: path.join(tempRoot, 'no-such-codex-binary'),
+  }, async ({ child }) => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+
+    // 1) Claude 侧 spawn ENOENT：报错给前端，而不是静默或退出
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo' }));
+    const claudeSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude');
+    ws.send(JSON.stringify({ type: 'message', text: 'hello', sessionId: claudeSession.sessionId, mode: 'yolo', agent: 'claude' }));
+    const claudeError = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(/找不到 Claude CLI/.test(claudeError.message || ''), `spawn ENOENT should surface the Claude CLI hint (got ${claudeError.message})`);
+
+    // 进程必须还活着——这是本用例的核心断言
+    await sleep(500);
+    assert(child.exitCode === null && child.signalCode === null, 'Server process must survive a failed spawn');
+    assert(ws.readyState === 1, 'WebSocket must stay open after a failed spawn');
+
+    // 2) done 必须到达，否则前端永远卡在"运行中"
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeSession.sessionId);
+    assert(!fs.existsSync(path.join(sessionsDir, `${claudeSession.sessionId}-run`)), 'Failed spawn must clean up the run dir');
+
+    // 3) 服务不退化：同一连接再失败一次仍然只影响该会话
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo' }));
+    const secondSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.sessionId !== claudeSession.sessionId);
+    ws.send(JSON.stringify({ type: 'message', text: 'again', sessionId: secondSession.sessionId, mode: 'yolo', agent: 'claude' }));
+    const secondError = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(/找不到 Claude CLI/.test(secondError.message || ''), 'Second failed spawn must still report the error');
+
+    // 4) Codex 走同一条 spawn 路径，错误文案不能串到 Claude 版
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    const codexSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex');
+    ws.send(JSON.stringify({ type: 'message', text: 'hi', sessionId: codexSession.sessionId, mode: 'yolo', agent: 'codex' }));
+    const codexError = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(/找不到 Codex CLI/.test(codexError.message || ''), `Codex spawn failure must use the Codex hint (got ${codexError.message})`);
+
+    await sleep(500);
+    assert(child.exitCode === null && child.signalCode === null, 'Server must survive repeated failed spawns');
+
+    // 5) 日志留痕：process_spawn_fail 带上找不到的命令，且没有 uncaught_exception
+    const processLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
+    assert(processLog.includes('process_spawn_fail'), 'process.log should record process_spawn_fail');
+    assert(processLog.includes(missingClaude), 'process_spawn_fail should log which command was not found');
+    assert(!processLog.includes('uncaught_exception'), 'A failed spawn must not produce an uncaught exception');
+
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Spawn failure isolation checks passed.');
 }
 
 main().catch((err) => {
