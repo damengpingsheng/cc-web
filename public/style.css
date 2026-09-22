@@ -636,6 +636,10 @@ body.session-loading-active {
 .session-item {
   display: flex;
   align-items: center;
+  /* 换行是给标题下那行 Claude 会话 id 留的第二行：第一行的标题/时间/操作按钮都不会超宽，
+     所以只有 flex-basis:100% 的 id 会被挤下去 */
+  flex-wrap: wrap;
+  row-gap: 2px;
   padding: 10px 12px;
   border-radius: 10px;
   cursor: pointer;
@@ -661,6 +665,59 @@ body.session-loading-active {
   color: var(--text-primary);
 }
 .session-item.active .session-item-title { color: var(--accent); font-weight: 500; }
+/* CLI 侧的 session id（~/.claude/projects 下 jsonl 的文件名），整行独占标题下方一行。
+   放在 .session-item 层而不是 .session-item-main 里：那样宽度还要跟时间/操作按钮分，
+   36 字符的 UUID 会被挤断，hover 露出按钮时还会重折。截断就失去意义，所以宽度不够时
+   整体折行而不是省略号。id 文本不吃点击（点它照样切会话），复制只走右端那枚 hover
+   才露出的按钮 —— 这一行紧贴标题，做成整行可复制的话切会话极易误触。 */
+.session-item-claude-id {
+  flex-basis: 100%;
+  position: relative;
+  /* 向右借 8px 卡片内边距。11px 下 36 字符的 UUID 约 238px，而内容宽只有 240px
+     (280 侧栏 - 16 列表 padding - 24 项 padding)，不同等宽字体之间的差值就能把余量吃光，
+     一旦溢出 word-break 会折出只剩一两个字符的第二行。借完 248px，余量约 10px。
+     左边不借，id 与标题保持左对齐。 */
+  margin-right: -8px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+.session-item-claude-id-value {
+  display: block;
+  word-break: break-all;
+}
+.session-item-claude-id-copy {
+  /* 绝对定位到会话项的右侧 padding 区，不占流内宽度：11px 下 36 字符的 UUID 已经吃满
+     整个内容宽（280 侧栏 - 16 列表 padding - 24 项 padding = 240px），按钮但凡占一点
+     宽度就会把 id 挤成两行。放在 padding 区里既不挤宽度，也不压住 id 尾部的字符。
+     仍用 visibility 而不是 display 收起，与上面那排操作按钮的写法保持一致。 */
+  position: absolute;
+  right: -12px;
+  top: 1px;
+  visibility: hidden;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  line-height: 0;
+  cursor: pointer;
+}
+.session-item:hover .session-item-claude-id-copy { visibility: visible; }
+.session-item-claude-id-copy:hover { color: var(--accent); }
+.session-item-claude-id-copy svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  /* 点击落到 button 上而不是 svg 子元素，委托里的 classList 判定才认得出来 */
+  pointer-events: none;
+}
 .session-item-status {
   display: inline-flex;
   align-items: center;
@@ -2237,6 +2294,8 @@ mark.search-hit.current {
   .input-area { padding: 8px 10px; padding-bottom: max(10px, var(--safe-bottom)); }
   .messages { padding: 12px 8px; gap: 10px; }
   .session-item-actions { display: flex; }
+  /* 触屏没有 hover，复制按钮跟上面那排操作按钮一样常显 */
+  .session-item-claude-id-copy { visibility: visible; }
   .cmd-menu { left: 10px; right: 10px; transform: none; min-width: auto; bottom: 72px; }
   .option-picker { left: 10px; right: 10px; transform: none; min-width: auto; bottom: 72px; }
   .chat-title {

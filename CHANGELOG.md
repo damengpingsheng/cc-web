@@ -8,6 +8,27 @@
 
 ---
 
+## 分叉 v1.5.7
+
+### 新增
+
+- 左侧会话列表里，每个 Claude 会话的标题下方多一行小字（11px 等宽），显示该会话在 Claude CLI 侧的 session id —— 也就是 `~/.claude/projects/<项目>/<id>.jsonl` 的文件名，不是 cc-web 自己的会话 id。
+
+  数据源是 `session_list` 新增的 `claudeSessionId` 字段，而不是 `session_info`：列表本来就在每轮任务 `done`、导入、重命名、归组后被服务端重推，`--resume` 换了 id 也能跟上，不必新增推送通道，也不动会话快照缓存。
+
+  id 行挂在 `.session-item` 上（`flex-wrap` 换行），而不是塞进 `.session-item-main`：后者的宽度还要跟时间戳和操作按钮分，36 字符的 UUID 会被挤断，hover 露出按钮时还会重新折行。宽度不够时整体折行而不是省略号——截断了就没法拿去对 jsonl 文件名。
+
+  id 文本本身不吃点击，点它跟点标题一样是切会话；复制交给行尾一枚 hover 才露出的小按钮（`pointer-events: none` 落在其 svg 上，保证委托判定认得出按钮本身），复制走已有的 `copyTextToClipboard`，在内网 HTTP（非 secure context）下自动降级到 `execCommand`。按钮绝对定位到卡片右侧的内边距区、不占流内宽度：11px 字号下 36 字符的 UUID 约 238px，已经吃满 240px 的内容宽（280 侧栏 − 16 列表 padding − 24 项 padding），按钮但凡占一点宽度就会把 id 挤成两行；id 行本身再向右借 8px 内边距，给字体度量差留出余量。触屏没有 hover，所以移动端跟 ✎/⧉/× 那排一样常显。
+
+  新建会话在首轮跑完前服务端还拿不到 id，此时不渲染这一行；Codex 会话同样不渲染（它是另一套 `codexThreadId`）。
+
+### 验证
+
+- 隔离目录起服务实测 `session_list`：Claude 会话的 `claudeSessionId` 原样透传且不等于 cc-web 侧会话 id，Codex 会话该字段为空串（前端据此不渲染 id 行）。
+- 从 `public/app.js` 抽出真实的 `buildSessionItem`，在最小 DOM stub 下跑九例：导入的 Claude 会话出现 id 行且内容是 CLI id 而非 cc-web id、行内同时有 id 文本与复制按钮、运行中会话的「运行中」徽标与 id 行共存、无 id 的新会话与 Codex 会话都不出现该行、id 行位于操作按钮之后（即换行到第二行）、标题仍被转义；点击委托两例——点复制按钮只复制且不 `openSession`，点 id 文本只 `openSession` 且不复制。
+- `node --check server.js` / `node --check public/app.js` 通过。本机无浏览器，真实页面里的视觉效果与剪贴板落值未做实测；`npm run regression` 因缺 `sqlite3` 仍跑不起来。
+- 注意生效前提：`server.js` 有改动，必须重启服务进程；只刷新浏览器不够（静态资源 `?v=` 已打到 `1.5.1-my.13`）。
+
 ## 分叉 v1.5.6
 
 ### 修复

@@ -1751,6 +1751,9 @@ function sendSessionList(ws) {
           agent: getSessionAgent(s),
           isRunning: activeProcesses.has(s.id),
           group: s.group || '',
+          // CLI 侧的真实 session id（侧栏每个会话项的标题下方展示）。每轮任务 done 后
+          // 本函数都会重推，所以 resume 换了 id 前端也能跟上。
+          claudeSessionId: s.claudeSessionId || '',
         });
       } catch {}
     }
