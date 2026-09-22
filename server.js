@@ -2353,6 +2353,25 @@ function isContextLimitError(agent, raw) {
   return /context\s+(window|length)|maximum context length|context limit|token limit|too many tokens|input.*too long|prompt.*too long|request too large|please use\s*\/compact|use\s*\/compact|reduce (the )?(input|prompt|message)|exceed(?:ed|s).*(token|context)/i.test(text);
 }
 
+// 任务完成后把结果广播给其他已连接的客户端（多标签页 / 多设备）。
+// 前端收到 background_done 时：当前正看该会话则 forceSync 重载，否则刷新会话列表。
+function broadcastBackgroundDone(sessionId, entry, exceptWs = null) {
+  const sess = loadSession(sessionId);
+  const title = sess?.title || 'Untitled';
+  for (const client of wss.clients) {
+    if (client === exceptWs) continue;
+    if (client.readyState !== 1) continue;
+    wsSend(client, {
+      type: 'background_done',
+      sessionId,
+      title,
+      costUsd: entry.lastCost || null,
+      responseLen: (entry.fullText || '').length,
+    });
+  }
+  return sess;
+}
+
 /**
  * 子进程退出后的统一处理（约 193 行，server.js 最复杂的函数）。
  *
@@ -2374,7 +2393,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   if (!entry) return;
 
   const completeTime = new Date().toISOString();
-  const wsConnected = !!entry.ws;
+  const wsConnected = !!entry.ws && entry.ws.readyState === 1;
   const disconnectGap = entry.wsDisconnectTime
     ? ((new Date(completeTime) - new Date(entry.wsDisconnectTime)) / 1000).toFixed(1) + 's'
     : null;
@@ -2477,7 +2496,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   pendingSlashCommands.delete(sessionId);
 
   // Notify client
-  if (entry.ws) {
+  if (wsConnected) {
     if (pendingSlash?.kind === 'compact') {
       const retry = pendingCompactRetries.get(sessionId);
       const autoRetryRequested = !!(retry?.text && retry?.reason === 'auto');
@@ -2508,6 +2527,8 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
     wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null });
     sendSessionList(entry.ws);
+    // 同步给其他客户端，避免只有发起的那个标签页知道任务完成
+    broadcastBackgroundDone(sessionId, entry, entry.ws);
     // Push notification when trigger='always' (user online but still wants notification)
     (() => {
       const notifyCfg = loadNotifyConfig();
@@ -2520,19 +2541,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     })();
   } else {
     // Process completed while browser was disconnected — notify all connected clients
-    const sess = loadSession(sessionId);
-    const title = sess?.title || 'Untitled';
-    for (const client of wss.clients) {
-      if (client.readyState === 1) {
-        wsSend(client, {
-          type: 'background_done',
-          sessionId,
-          title,
-          costUsd: entry.lastCost || null,
-          responseLen: (entry.fullText || '').length,
-        });
-      }
-    }
+    const sess = broadcastBackgroundDone(sessionId, entry);
     // Push notification (background task)
     buildNotifyContent(entry, sess, completionError, contextLimitExceeded).then(({ title: ntitle, content }) => {
       sendNotification(ntitle, content);
