@@ -4678,6 +4678,92 @@ function resolveClaudeSessionLocalMeta(claudeSessionId) {
   return null;
 }
 
+// Claude CLI 把若干系统注入和本地命令记录也写成 type=user 条目：
+// <local-command-caveat>(带 isMeta)、斜杠命令的 <command-name>/<local-command-stdout>、
+// subagent 完成时的 <task-notification>、! 前缀的 <bash-input>/<bash-stdout>。
+// 它们不是用户说的话，取标题时必须跳过，否则标题会变成 "Caveat: The messages below were…"。
+const INJECTED_USER_TAGS = new Set([
+  'local-command-caveat',
+  'command-name',
+  'command-message',
+  'command-args',
+  'local-command-stdout',
+  'local-command-stderr',
+  'task-notification',
+  'bash-input',
+  'bash-stdout',
+  'bash-stderr',
+  'system-reminder',
+]);
+
+function extractClaudeUserText(raw) {
+  if (typeof raw === 'string') return raw;
+  if (!Array.isArray(raw)) return '';
+  return raw.filter((b) => b.type === 'text').map((b) => b.text || '').join('');
+}
+
+function isInjectedClaudeUserEntry(entry, text) {
+  if (entry?.isMeta === true) return true;
+  const match = String(text || '').trimStart().match(/^<([a-z-]+)>/);
+  return match ? INJECTED_USER_TAGS.has(match[1]) : false;
+}
+
+// /model 这类斜杠命令的回显里带 \x1b[1m 之类的样式码，是给终端看的，
+// 直接渲染会变成乱码字符。
+function stripAnsiCodes(text) {
+  return String(text || '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+}
+
+// 标签不存在返回 null，存在但内容为空返回 ''——两者要区分开，
+// <bash-stdout></bash-stdout> 是"命令没输出"，不是"这条不是输出"。
+function extractClaudeTagBody(text, tag) {
+  const m = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(text);
+  return m ? m[1] : null;
+}
+
+const LOCAL_COMMAND_OUTPUT_LIMIT = 4000;
+
+function trimLocalCommandOutput(text) {
+  const out = stripAnsiCodes(text).trim();
+  return out.length > LOCAL_COMMAND_OUTPUT_LIMIT
+    ? `${out.slice(0, LOCAL_COMMAND_OUTPUT_LIMIT)}\n…(输出已截断)`
+    : out;
+}
+
+// 本地命令在 jsonl 里是相邻两条 type=user：一条输入、一条输出。
+// ! 前缀的 shell 命令用 <bash-input> / <bash-stdout>+<bash-stderr>（同一条里两个标签都在，
+// 任一可为空），斜杠命令用 <command-name>+<command-args> / <local-command-stdout>。
+function parseClaudeLocalCommand(text) {
+  const s = String(text || '').trimStart();
+
+  const bashInput = extractClaudeTagBody(s, 'bash-input');
+  if (bashInput !== null) {
+    return { part: 'input', type: 'bash', command: bashInput.trim() };
+  }
+
+  const cmdName = extractClaudeTagBody(s, 'command-name');
+  if (cmdName !== null) {
+    const args = (extractClaudeTagBody(s, 'command-args') || '').trim();
+    return {
+      part: 'input',
+      type: 'slash',
+      command: [cmdName.trim(), args].filter(Boolean).join(' '),
+    };
+  }
+
+  const stdout = extractClaudeTagBody(s, 'bash-stdout') ?? extractClaudeTagBody(s, 'local-command-stdout');
+  const stderr = extractClaudeTagBody(s, 'bash-stderr') ?? extractClaudeTagBody(s, 'local-command-stderr');
+  if (stdout !== null || stderr !== null) {
+    return {
+      part: 'output',
+      stdout: trimLocalCommandOutput(stdout),
+      stderr: trimLocalCommandOutput(stderr),
+    };
+  }
+
+  return null;
+}
+
 function parseJsonlToMessages(lines) {
   const messages = [];
   for (const line of lines) {
@@ -4698,6 +4784,38 @@ function parseJsonlToMessages(lines) {
           .join('');
       }
       if (content.trim()) {
+        // 上下文压缩后 CLI 自动注入的续接摘要(isCompactSummary)不是用户手打的，
+        // 但它承接了压缩点之后的对话，有阅读价值——标成系统消息而非用户发言，
+        // 否则会顶着 user 身份和真正的提问挤在一起。
+        if (entry.isCompactSummary === true) {
+          messages.push({ role: 'system', kind: 'compact-summary', content, timestamp: entry.timestamp || null });
+          continue;
+        }
+        // 本地命令原样显示就是一堆裸 XML 标签。折成一条 local-command 消息，
+        // 紧跟的那条输出并进同一条里，前端按"命令 + 输出"的卡片渲染。
+        const local = parseClaudeLocalCommand(content);
+        if (local?.part === 'input') {
+          messages.push({
+            role: 'user',
+            kind: 'local-command',
+            content: '',
+            localCommand: { type: local.type, command: local.command, stdout: '', stderr: '' },
+            timestamp: entry.timestamp || null,
+          });
+          continue;
+        }
+        if (local?.part === 'output') {
+          // 找不到配对的输入（历史被截断）就整条丢掉，不回退成裸 XML
+          const prev = messages[messages.length - 1];
+          if (prev?.kind === 'local-command') {
+            prev.localCommand.stdout = local.stdout;
+            prev.localCommand.stderr = local.stderr;
+          }
+          continue;
+        }
+        // caveat、系统提醒、subagent 完成通知等纯注入内容不是用户说的话，没有阅读价值
+        if (isInjectedClaudeUserEntry(entry, content)) continue;
+
         messages.push({ role: 'user', content, timestamp: entry.timestamp || null });
       }
     } else if (entry.type === 'assistant') {
@@ -4766,7 +4884,9 @@ function handleListNativeSessions(ws) {
             const content = fs.readFileSync(filePath, 'utf8');
             const lines = content.split('\n');
             // Find first user message for title
-            let title = sessionId.slice(0, 20);
+            // 兜底时在 UUID 前缀后标注"(无用户对话)"，这类会话没有任何真实用户输入
+            let title = `${sessionId.slice(0, 20)}(无用户对话)`;
+            let titleFound = false;
             let cwd = null;
             let updatedAt = null;
             let lastTs = null;
@@ -4776,13 +4896,15 @@ function handleListNativeSessions(ws) {
               try {
                 const e = JSON.parse(t);
                 if (e.timestamp) lastTs = e.timestamp;
-                if (e.type === 'user' && !cwd) {
-                  cwd = e.cwd || null;
-                  const raw = e.message?.content;
-                  let text = '';
-                  if (typeof raw === 'string') text = raw;
-                  else if (Array.isArray(raw)) text = raw.filter(b => b.type === 'text').map(b => b.text || '').join('');
-                  if (text.trim()) title = text.trim().slice(0, 80).replace(/\n/g, ' ');
+                if (e.type === 'user') {
+                  if (!cwd) cwd = e.cwd || null;
+                  if (!titleFound) {
+                    const text = extractClaudeUserText(e.message?.content);
+                    if (text.trim() && !isInjectedClaudeUserEntry(e, text)) {
+                      title = text.trim().slice(0, 80).replace(/\n/g, ' ');
+                      titleFound = true;
+                    }
+                  }
                 }
               } catch {}
             }
@@ -4832,7 +4954,8 @@ function handleImportNativeSession(ws, msg) {
   } catch {}
 
   // Determine title and cwd from messages/raw
-  let title = sessionId.slice(0, 20);
+  // 与列表同口径：兜底标题带"(无用户对话)"标注，扫描不到真实用户消息时保留
+  let title = `${sessionId.slice(0, 20)}(无用户对话)`;
   let cwd = null;
   for (const line of lines) {
     const t = line.trim();
@@ -4841,11 +4964,13 @@ function handleImportNativeSession(ws, msg) {
       const e = JSON.parse(t);
       if (e.type === 'user') {
         if (!cwd) cwd = e.cwd || null;
-        const raw = e.message?.content;
-        let text = '';
-        if (typeof raw === 'string') text = raw;
-        else if (Array.isArray(raw)) text = raw.filter(b => b.type === 'text').map(b => b.text || '').join('');
-        if (text.trim()) { title = text.trim().slice(0, 60).replace(/\n/g, ' '); break; }
+        const text = extractClaudeUserText(e.message?.content);
+        // 与列表同一口径：跳过 caveat/本地命令这类注入条目，否则标题会变成
+        // "<local-command-caveat>Caveat: The messages below were…"
+        if (text.trim() && !isInjectedClaudeUserEntry(e, text)) {
+          title = text.trim().slice(0, 60).replace(/\n/g, ' ');
+          break;
+        }
       }
     } catch {}
   }
@@ -4868,6 +4993,7 @@ function handleImportNativeSession(ws, msg) {
     cwd: cwd || existingSession?.cwd || null,
   };
   saveSession(session);
+  stopImportedSync(ws);
   wsSessionMap.set(ws, id);
   wsSend(ws, {
     type: 'session_info',
@@ -4876,6 +5002,7 @@ function handleImportNativeSession(ws, msg) {
     title: session.title,
     mode: session.permissionMode,
     model: sessionModelLabel(session),
+    effort: session.effort || '',
     agent: getSessionAgent(session),
     cwd: session.cwd,
     totalCost: session.totalCost || 0,

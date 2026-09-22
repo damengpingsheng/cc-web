@@ -2474,7 +2474,92 @@
     return section;
   }
 
+  // 导入的 Claude 会话里，! 前缀的 shell 命令和 / 斜杠命令是用户在终端里敲的，
+  // 既不是对话也不是工具调用。复用 .tool-call 的外观折成一张可展开的卡片，
+  // 免得一条条裸 <bash-input> 标签混在对话里。
+  function buildLocalCommandElement(m) {
+    const lc = m.localCommand || {};
+    const isSlash = lc.type === 'slash';
+    const command = lc.command || '';
+
+    const div = document.createElement('div');
+    div.className = 'msg local-command';
+
+    const details = document.createElement('details');
+    details.className = 'tool-call';
+
+    const summary = document.createElement('summary');
+    const icon = document.createElement('span');
+    icon.className = `tool-call-icon ${lc.stderr ? 'error' : 'done'}`;
+    const main = document.createElement('span');
+    main.className = 'tool-call-summary-main';
+    const label = document.createElement('span');
+    label.className = 'tool-call-label';
+    // 命令可能有多行（&& 串起来的长命令），摘要里只占一行，展开后看全的
+    label.textContent = `${isSlash ? '' : '$ '}${command.split('\n')[0]}`;
+    main.appendChild(label);
+
+    const preview = (lc.stdout || lc.stderr || '').split('\n').find((l) => l.trim());
+    if (preview) {
+      const subtitle = document.createElement('span');
+      subtitle.className = 'tool-call-subtitle';
+      subtitle.textContent = preview;
+      main.appendChild(subtitle);
+    }
+
+    const state = document.createElement('span');
+    state.className = `tool-call-state ${lc.stderr ? 'error' : 'done'}`;
+    state.textContent = isSlash ? 'Slash' : 'Bash';
+
+    summary.appendChild(icon);
+    summary.appendChild(main);
+    summary.appendChild(state);
+    details.appendChild(summary);
+
+    const content = document.createElement('div');
+    content.className = 'tool-call-content command';
+    const stack = document.createElement('div');
+    stack.className = 'tool-call-structured';
+    if (command) stack.appendChild(buildStructuredToolSection('Command', command));
+    if (lc.stdout) stack.appendChild(buildStructuredToolSection('Output', lc.stdout));
+    if (lc.stderr) stack.appendChild(buildStructuredToolSection('Stderr', lc.stderr));
+    if (!lc.stdout && !lc.stderr) {
+      const empty = document.createElement('div');
+      empty.className = 'tool-call-empty';
+      empty.textContent = '无输出';
+      stack.appendChild(empty);
+    }
+    content.appendChild(stack);
+    details.appendChild(content);
+
+    div.appendChild(details);
+    return div;
+  }
+
+  // 上下文压缩的续接摘要：是系统注入不是用户发言，但内容很长且有阅读价值，
+  // 做成居中虚线的可折叠块——既有 system 消息的视觉语义，又不占满版面。
+  function buildCompactSummaryElement(m) {
+    const div = document.createElement('div');
+    div.className = 'msg system compact-summary';
+
+    const details = document.createElement('details');
+    details.className = 'compact-summary-box';
+    const summary = document.createElement('summary');
+    summary.textContent = '上下文续接摘要（上一段对话超长被压缩）';
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.className = 'compact-summary-body';
+    body.innerHTML = renderMarkdown(m.content || '');
+    details.appendChild(body);
+
+    div.appendChild(details);
+    return div;
+  }
+
 	  function buildMsgElement(m) {
+	    if (m.kind === 'local-command' && m.localCommand) return buildLocalCommandElement(m);
+	    if (m.kind === 'compact-summary') return buildCompactSummaryElement(m);
 	    const el = createMsgElement(m.role, m.content, m.attachments || []);
 	    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
 	      const bubble = el.querySelector('.msg-bubble');
