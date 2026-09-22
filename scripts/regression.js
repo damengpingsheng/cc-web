@@ -109,9 +109,12 @@ async function waitForFile(filePath, timeoutMs = 10000) {
 async function withServer(env, fn) {
   const child = spawn('/usr/bin/node', [SERVER_PATH], {
     cwd: REPO_DIR,
-    // 与跑测者的 shell 环境解耦：withContextSuffix 会读 CLAUDE_CODE_DISABLE_1M_CONTEXT，
-    // 外部设成 1 会让 [1m] 后缀相关断言随环境时好时坏。放在 ...env 之前，单个用例仍可覆盖。
-    env: { ...process.env, CLAUDE_CODE_DISABLE_1M_CONTEXT: '', ...env },
+    // 与跑测者的 shell 环境解耦，都放在 ...env 之前，单个用例仍可覆盖：
+    //   CLAUDE_CODE_DISABLE_1M_CONTEXT —— withContextSuffix 会读它，外部设成 1
+    //     会让 [1m] 后缀相关断言随环境时好时坏。
+    //   HOST —— 仓库 .env 里的 HOST 会被 server.js 读走，绑到对外网卡后下面所有
+    //     127.0.0.1 的连接都是 ECONNREFUSED；waitForPort 只看端口不看地址，抓不到。
+    env: { ...process.env, CLAUDE_CODE_DISABLE_1M_CONTEXT: '', HOST: '127.0.0.1', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -480,7 +483,6 @@ async function main() {
   const password = 'Regression!234';
 
   await withServer({
-    HOST: '127.0.0.1',
     PORT: String(port),
     CC_WEB_PASSWORD: password,
     CC_WEB_CONFIG_DIR: configDir,
@@ -1816,9 +1818,6 @@ async function testSpawnFailureIsolation() {
   const missingClaude = path.join(tempRoot, 'no-such-claude-binary');
 
   await withServer({
-    // 显式绑回环：仓库 .env 里的 HOST 会被 server.js 读走，
-    // 不覆盖的话服务会听在对外网卡上，下面的 127.0.0.1 连接直接 ECONNREFUSED。
-    HOST: '127.0.0.1',
     PORT: String(port),
     CC_WEB_PASSWORD: password,
     CC_WEB_CONFIG_DIR: configDir,
