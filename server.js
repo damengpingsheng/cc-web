@@ -4058,21 +4058,38 @@ function deleteClaudeLocalSession(claudeSessionId) {
 
 function deleteCodexLocalSession(session) {
   const threadId = session?.codexThreadId;
-  if (!threadId) return { removedFiles: 0, removedDbRows: false };
+  if (!threadId) return { removedFiles: 0, removedDbRows: false, childThreadIds: [] };
 
-  const rolloutPaths = new Set();
-  if (session.importedRolloutPath) rolloutPaths.add(path.resolve(session.importedRolloutPath));
+  // 按 session_meta 的真实归属甄别，不靠文件名子串猜：一是 importedRolloutPath 可能
+  // 是脏的(曾因 subagent 双 session_meta 绑到过别的线程)，无条件信任会删错文件；
+  // 二是子线程文件名里是它自己的 id，只匹配父 id 会把派生的 rollout 全留成孤儿。
+  const targets = [];
+  const childThreadIds = [];
   try {
     for (const filePath of getCodexRolloutFiles()) {
-      if (filePath.includes(threadId)) rolloutPaths.add(path.resolve(filePath));
+      const owner = readCodexRolloutOwner(filePath);
+      if (!owner) continue;
+      if (owner.threadId === threadId) {
+        targets.push({ filePath: path.resolve(filePath), kind: 'self' });
+      } else if (owner.parentThreadId === threadId) {
+        targets.push({ filePath: path.resolve(filePath), kind: 'subagent' });
+        if (owner.threadId) childThreadIds.push(owner.threadId);
+      }
     }
   } catch {}
 
+  // 删除前留痕：事后可从日志核对删了哪些文件。
+  plog('INFO', 'codex_local_delete_plan', {
+    threadId,
+    total: targets.length,
+    files: targets.map((t) => `${t.kind}:${path.basename(t.filePath)}`),
+  });
+
   let removedFiles = 0;
-  for (const filePath of rolloutPaths) {
+  for (const target of targets) {
     try {
-      if (filePath.startsWith(CODEX_SESSIONS_DIR) && fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
+      if (target.filePath.startsWith(CODEX_SESSIONS_DIR) && fs.existsSync(target.filePath)) {
+        fs.unlinkSync(target.filePath);
         removedFiles++;
       }
     } catch {}
@@ -4082,24 +4099,26 @@ function deleteCodexLocalSession(session) {
   try {
     const sqlitePath = spawnSync('sqlite3', ['-version'], { stdio: 'ignore' });
     if (sqlitePath.status === 0) {
-      const quotedThreadId = sqlQuote(threadId);
+      // 子线程在库里是独立的 thread 行，只删父 id 同样会留残行
+      const allThreadIds = [threadId, ...childThreadIds];
+      const quotedList = allThreadIds.map((id) => sqlQuote(id)).join(', ');
       const stateSql = [
         'PRAGMA foreign_keys = ON;',
-        `DELETE FROM thread_dynamic_tools WHERE thread_id = ${quotedThreadId};`,
-        `DELETE FROM stage1_outputs WHERE thread_id = ${quotedThreadId};`,
-        `DELETE FROM logs WHERE thread_id = ${quotedThreadId};`,
-        `DELETE FROM threads WHERE id = ${quotedThreadId};`,
+        `DELETE FROM thread_dynamic_tools WHERE thread_id IN (${quotedList});`,
+        `DELETE FROM stage1_outputs WHERE thread_id IN (${quotedList});`,
+        `DELETE FROM logs WHERE thread_id IN (${quotedList});`,
+        `DELETE FROM threads WHERE id IN (${quotedList});`,
       ].join(' ');
       const stateResult = spawnSync('sqlite3', [CODEX_STATE_DB_PATH, stateSql], { stdio: 'ignore' });
       if (stateResult.status === 0) removedDbRows = true;
 
       if (fs.existsSync(CODEX_LOG_DB_PATH)) {
-        spawnSync('sqlite3', [CODEX_LOG_DB_PATH, `DELETE FROM logs WHERE thread_id = ${quotedThreadId};`], { stdio: 'ignore' });
+        spawnSync('sqlite3', [CODEX_LOG_DB_PATH, `DELETE FROM logs WHERE thread_id IN (${quotedList});`], { stdio: 'ignore' });
       }
     }
   } catch {}
 
-  return { removedFiles, removedDbRows };
+  return { removedFiles, removedDbRows, childThreadIds };
 }
 
 // 单会话删除的完整清理逻辑（handleDeleteSession 与 group_delete 共用，语义必须保持一致）：
@@ -4130,6 +4149,7 @@ function deleteSessionCleanup(sessionId) {
       threadId: session?.codexThreadId || null,
       removedFiles: result.removedFiles,
       removedDbRows: result.removedDbRows,
+      childThreads: result.childThreadIds.length,
     });
   } else {
     deleteClaudeLocalSession(session?.claudeSessionId || null);
@@ -4854,6 +4874,7 @@ const {
   getCodexRolloutFiles,
   getImportedCodexThreadIds,
   parseCodexRolloutFile,
+  readCodexRolloutOwner,
 } = createCodexRolloutStore({
   codexSessionsDir: CODEX_SESSIONS_DIR,
   sessionsDir: SESSIONS_DIR,
