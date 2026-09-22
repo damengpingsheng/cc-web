@@ -8,6 +8,28 @@
 
 ---
 
+## 分叉 v1.5.5
+
+### 新增
+
+- 输入框左侧新增模型徽标，常驻显示当前会话的模型与思考强度（`模型 · 强度`），未显式设过强度时显示「默认」。Claude 侧取 `/model` 与 `/effort` 的当前值，Codex 侧从模型名的 `(level)` 后缀里拆出强度；点击徽标等同于 `/model`，可直接改模型和强度。
+
+  服务端下发的 Claude 模型名是 `opus` / `sonnet` / `haiku` 槽位别名，徽标上再用
+  `model_options` 带来的 `aliasModels` 还原成真实模型名（已剥 `[1m]` 后缀，与终端
+  `/model` 的显示口径一致），槽位名退到 tooltip 里。`aliasModels` 需要等网关响应，
+  通常晚于 `session_info` 到达，因此目录到手后会补刷一次徽标。
+
+  导入会话的 `model` 可能为空（终端侧没写模型字段），此时徽标显示「默认模型」，
+  只有在欢迎页（没有会话）才整个隐藏。
+
+### 修复
+
+- 会话快照解析漏掉了服务端下发的 `effort` 字段，导致切换会话后前端记录的思考强度被清空（`/effort` 再查才恢复）。
+
+### 验证
+
+- 端到端覆盖 `session_info` 携带 `effort`、`/model <模型> <effort>` 同时回带两项、`/effort` 单独切换、重新 `load_session` 后强度保留，以及 `model_options.aliasModels` 能把槽位名还原成剥掉 `[1m]` 的真实模型名。本机缺 `sqlite3`，`npm run regression` 仍跑不起来。
+
 ## 分叉 v1.5.4
 
 ### 修复

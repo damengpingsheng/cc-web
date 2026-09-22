@@ -196,6 +196,7 @@
   const chatAgentMenu = $('#chat-agent-menu');
   const chatRuntimeState = $('#chat-runtime-state');
   const chatCwd = $('#chat-cwd');
+  const chatModelState = $('#chat-model-state');
   const costDisplay = $('#cost-display');
   const attachmentTray = $('#attachment-tray');
   const imageUploadInput = $('#image-upload-input');
@@ -849,6 +850,7 @@
       title: payload.title || '新会话',
       mode: payload.mode || 'yolo',
       model: payload.model || '',
+      effort: payload.effort || '',
       agent: normalizeAgent(payload.agent),
       hasUnread: !!payload.hasUnread,
       cwd: payload.cwd || null,
@@ -1226,6 +1228,35 @@
     chatCwd.hidden = !currentCwd || (currentSessionRunning && shouldOverlayRuntimeBadge());
   }
 
+  // 输入框左侧的模型徽标。Claude 的思考强度是独立的 currentEffort；
+  // Codex 则把强度写进模型名的 (level) 后缀，这里拆出来统一渲染成「模型 · 强度」。
+  function updateModelBadge() {
+    if (!chatModelState) return;
+    // 没有会话时（欢迎页）不显示；有会话就一定显示，哪怕模型和强度都没显式设过
+    if (!currentSessionId) {
+      chatModelState.hidden = true;
+      chatModelState.textContent = '';
+      chatModelState.title = '';
+      return;
+    }
+    const raw = String(currentModel || '').trim();
+    const { base, level } = currentAgent === 'codex'
+      ? _splitCodexThinkingModel(raw)
+      : { base: raw, level: String(currentEffort || '').trim() };
+    // 服务端下发的 Claude 模型名是 opus/sonnet/haiku 槽位别名，这里用 model_options 带来的
+    // aliasModels 还原成真实模型名（服务端已剥掉 [1m]，与终端 /model 的显示口径一致）。
+    // 目录还没到、或本来就填的是完整模型名时，aliasModels 查不到，按原样显示。
+    const aliasModels = currentAgent === 'codex' ? {} : (modelCatalog?.aliasModels || {});
+    // session.model 为空说明从没跑过 /model，会话用的是 CLI 自己的默认模型，服务端也不知道具体是哪个
+    const modelLabel = aliasModels[base] || base || '默认模型';
+    // 没显式设过强度时也把这一段占住，徽标始终是「模型 · 强度」两段，不用悬停才知道
+    const levelLabel = level || '默认';
+    chatModelState.textContent = `${modelLabel} · ${levelLabel}`;
+    const slotNote = (!base || modelLabel === base) ? '' : `（${base} 槽位）`;
+    chatModelState.title = `模型: ${modelLabel}${slotNote}\n思考强度: ${levelLabel}\n点击切换`;
+    chatModelState.hidden = false;
+  }
+
   function setCurrentSessionRunningState(isRunning) {
     const running = !!isRunning;
     currentSessionRunning = running;
@@ -1251,6 +1282,7 @@
     if (importSessionBtn) {
       importSessionBtn.textContent = currentAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
     }
+    updateModelBadge();
   }
 
   function setCurrentAgent(agent) {
@@ -1292,6 +1324,7 @@
     abortBtn.hidden = true;
     chatTitle.textContent = '新会话';
     updateCwdBadge();
+    updateModelBadge();
     messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
     setStatsDisplay(null);
     renderPendingAttachments();
@@ -1324,6 +1357,7 @@
     }
     currentModel = snapshot.model || '';
     currentEffort = snapshot.effort || '';
+    updateModelBadge();
     if (!preserveStreaming) {
       closeMsgSearch();   // 整棵消息树被重建，旧的 mark 引用全部失效
       renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
@@ -2079,6 +2113,7 @@
               if (msg.effort !== undefined) snapshot.effort = msg.effort || '';
             });
           }
+          updateModelBadge();
         }
         break;
 
@@ -2087,10 +2122,14 @@
         if (currentSessionId) {
           updateCachedSession(currentSessionId, (snapshot) => { snapshot.effort = currentEffort; });
         }
+        updateModelBadge();
         break;
 
       case 'model_options':
         modelCatalog = msg;
+        // 目录里的 aliasModels 决定徽标显示真实模型名还是槽位名，
+        // 而它通常晚于 session_info 到达（服务端要 await 网关），到手后补刷一次
+        updateModelBadge();
         break;
 
       case 'resume_generating':
@@ -4435,6 +4474,14 @@
       e.preventDefault();
       inputWrapper.classList.remove('drag-active');
       handleSelectedImageFiles(e.dataTransfer?.files);
+    });
+  }
+
+  // 模型徽标：点开的选择器与 /model 命令同一个
+  if (chatModelState) {
+    chatModelState.addEventListener('click', (e) => {
+      e.stopPropagation();
+      showModelPicker();
     });
   }
 
