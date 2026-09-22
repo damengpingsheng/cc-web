@@ -129,6 +129,8 @@
   let reconnectTimer = null;
   let pendingText = '';
   let renderTimer = null;
+  let renderPendingHidden = false;  // 标签隐藏期间被跳过的流式渲染，转回前台补一次
+  let scrollBottomRaf = 0;          // scrollToBottom 的 rAF 去重句柄
   let activeToolCalls = new Map();
   let toolGroupCount = 0;   // 当前 .msg-tools 直接子节点数（含已有父目录）
   let hasGrouped = false;  // 本次输出是否已触发过折叠
@@ -2402,6 +2404,12 @@
 
   // --- Rendering ---
   function scheduleRender() {
+    // 隐藏标签里 rAF 被浏览器暂停、setTimeout 仍在跑：每次 flushRender 都是整段
+    // pendingText 的全量重解析，还会堆一个永不执行的 scrollToBottom 回调。后台只
+    // 累积文本，转回前台时由 visibilitychange 补渲染一次。
+    // 收尾路径（finishGenerating / resume_generating / goal_feedback）直接调
+    // flushRender，不经过这里，所以最终文本不会因后台而丢失。
+    if (document.hidden) { renderPendingHidden = true; return; }
     if (renderTimer) return;
     renderTimer = setTimeout(() => {
       renderTimer = null;
@@ -3449,7 +3457,11 @@
       return;
     }
     stickToBottom = true;
-    requestAnimationFrame(() => {
+    // 去重守卫：隐藏标签里 rAF 完全暂停，无守卫时回调会一路堆积，切回标签的
+    // 第一帧集中执行，每个都做两次强制同步布局，长会话直接冻结数秒。
+    if (scrollBottomRaf) return;
+    scrollBottomRaf = requestAnimationFrame(() => {
+      scrollBottomRaf = 0;
       messagesDiv.scrollTop = messagesDiv.scrollHeight;
       updateScrollbar();
     });
@@ -6526,13 +6538,22 @@
   // Visibility change: re-sync state when user returns to tab (critical for mobile)
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
+    // 后台期间 scheduleRender 只累积了 pendingText，这里把流式气泡补渲染一次，
+    // 不依赖服务端往返（运行中会话随后的 resume_generating 会再覆盖一次，结果一致）
+    if (renderPendingHidden) {
+      renderPendingHidden = false;
+      flushRender();
+    }
     if (!ws || ws.readyState > 1) {
       // WS is dead, force reconnect
       connect();
     } else if (ws.readyState === 1 && currentSessionId) {
-      // 仅在有流式状态时才主动 load_session 重新 attach；
-      // 无任务时只刷新会话列表，避免触发 applySessionSnapshot → scrollToBottom 打断阅读
-      if (isGenerating || currentSessionRunning || document.getElementById('streaming-msg')) {
+      // 标签切后台不发 detach_view，WS 全程 OPEN：流式 delta 持续到达（pendingText 照常
+      // 累积，tool_start/tool_end 直接改 DOM），历史消息树也从未被动过 —— 再来一次
+      // load_session 等于把整棵树推倒重建，长会话要为此付 N 块 chunk 的重排代价。
+      // 断线由 auth_result 的重连兜底负责重新 attach 并补齐 fullText，这里不必重复。
+      // 仅当本地确实缺流式气泡（状态不一致）才回退到全量重载。
+      if ((isGenerating || currentSessionRunning) && !document.getElementById('streaming-msg')) {
         send({ type: 'load_session', sessionId: currentSessionId });
       } else {
         send({ type: 'list_sessions' });

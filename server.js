@@ -1736,26 +1736,47 @@ function cleanRunDir(sessionId) {
   } catch {}
 }
 
+// 侧栏列表只用到下面这几个字段，但整个会话文件里 messages 占了体积的 99%，
+// 每次 list_sessions 都全量 JSON.parse 一遍在长会话下是几十毫秒的同步阻塞。
+// 按 mtime+size 缓存静态字段，文件没变就复用解析结果。
+// isRunning 只存在于内存（activeProcesses），不进缓存，每次实时计算。
+const sessionSummaryCache = new Map(); // filename -> { mtimeMs, size, summary }
+
 function sendSessionList(ws) {
   try {
     const files = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'));
     const sessions = [];
+    const present = new Set();
     for (const f of files) {
+      present.add(f);
       try {
-        const s = normalizeSession(JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8')));
-        sessions.push({
-          id: s.id,
-          title: s.title || 'Untitled',
-          updated: s.updated,
-          hasUnread: !!s.hasUnread,
-          agent: getSessionAgent(s),
-          isRunning: activeProcesses.has(s.id),
-          group: s.group || '',
-          // CLI 侧的真实 session id（侧栏每个会话项的标题下方展示）。每轮任务 done 后
-          // 本函数都会重推，所以 resume 换了 id 前端也能跟上。
-          claudeSessionId: s.claudeSessionId || '',
-        });
+        const filePath = path.join(SESSIONS_DIR, f);
+        const stat = fs.statSync(filePath);
+        const cached = sessionSummaryCache.get(f);
+        let summary;
+        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+          summary = cached.summary;
+        } else {
+          const s = normalizeSession(JSON.parse(fs.readFileSync(filePath, 'utf8')));
+          summary = {
+            id: s.id,
+            title: s.title || 'Untitled',
+            updated: s.updated,
+            hasUnread: !!s.hasUnread,
+            agent: getSessionAgent(s),
+            group: s.group || '',
+            // CLI 侧的真实 session id（侧栏每个会话项的标题下方展示）。每轮任务 done 后
+            // 本函数都会重推，所以 resume 换了 id 前端也能跟上。
+            claudeSessionId: s.claudeSessionId || '',
+          };
+          sessionSummaryCache.set(f, { mtimeMs: stat.mtimeMs, size: stat.size, summary });
+        }
+        sessions.push({ ...summary, isRunning: activeProcesses.has(summary.id) });
       } catch {}
+    }
+    // 会话删除后同步丢掉缓存条目，避免 Map 随删除次数无限增长
+    for (const key of sessionSummaryCache.keys()) {
+      if (!present.has(key)) sessionSummaryCache.delete(key);
     }
     sessions.sort((a, b) => new Date(b.updated) - new Date(a.updated));
     wsSend(ws, { type: 'session_list', sessions });

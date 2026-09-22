@@ -8,6 +8,30 @@
 
 ---
 
+## 分叉 v1.5.11
+
+### 修复
+
+- 多个浏览器标签各开一个会话时，切到或切离「运行中的长会话」那个标签会卡顿数秒，越在后台待得久越明显，其它标签不受影响。三条独立成因：
+
+  1. `visibilitychange` 原先只要 `isGenerating || currentSessionRunning || 有流式气泡` 就重发 `load_session`。但标签切后台并不发 `detach_view`，WS 全程 OPEN，流式 delta 一直在到达，历史消息树也从未被动过 —— 这次重载等于把整棵树推倒重建：`renderMessages` 开头 `messagesDiv.innerHTML = ''`，然后 12 条近期消息 + N 块 chunk 逐块经 `prependHistoryMessages` 重排，每块 3 次强制同步布局。实测一个 2197 条消息 / 1479 张工具卡片 / 782K markdown 字符 / 183 个代码块的会话要重建 92 块 chunk、约 276 次强制布局。现在只在本地确实缺流式气泡（状态不一致）时才回退到全量重载；断线恢复本来就由 `auth_result` 的重连兜底负责重新 attach 并补齐 `fullText`，这里不必重复。
+
+  2. `scrollToBottom` 里的 `requestAnimationFrame` 没有去重守卫。隐藏标签里 rAF 被浏览器完全暂停，而 `setTimeout` 仍在跑（节流到 ≥1s，且活跃的 WS 流量会压制 intensive throttling），回调一路堆积，切回标签的第一帧集中执行，每个都要读 `scrollHeight` 再读 `updateScrollbar` 里的尺寸，两次强制同步布局。加 `scrollBottomRaf` 句柄守卫，同一帧内只留一个。
+
+  3. 隐藏标签里 `scheduleRender` 照常每 100ms 触发 `flushRender`，而 `flushRender` 是整段 `pendingText` 的全量重解析（`marked.parse` → `DOMPurify.sanitize` → `decorateCodeBlocks`），后台白烧 CPU，还顺带堆出上面那些 rAF 回调。现在 `document.hidden` 时只累积文本、置一个 `renderPendingHidden` 标志，转回前台由 `visibilitychange` 补渲染一次。守卫只能加在 `scheduleRender`，不能加在 `flushRender`：收尾路径（`finishGenerating` / `resume_generating` / `goal_feedback`）直接调 `flushRender` 且随后就清 `pendingText`，加在那里会让后台完成的任务永久丢掉最终文本。
+
+### 优化
+
+- `sendSessionList` 按 mtime+size 缓存每个会话的侧栏字段。侧栏只用到 id / title / updated / hasUnread / agent / group / claudeSessionId，但会话文件里 `messages` 占体积的 99%，每次 `list_sessions` 都要全量 `JSON.parse` 一遍 —— 本机 40 个会话实测 47.20ms 的同步阻塞，而这个函数在每轮任务 `done`、导入、重命名、归组、以及每次标签转回前台时都会被调。缓存后 0.10ms。`isRunning` 只存在于内存（`activeProcesses`），不进缓存、每次实时计算；会话文件被删时同步剔除缓存条目，避免 Map 无限增长。
+
+### 验证
+
+- 逐条核对了改动的安全性：标签切后台不发 `detach_view`，`entry.ws` 始终有效，`pendingText += msg.text` 在 `scheduleRender` 守卫之前执行，`tool_start` / `tool_end` 本来就直接改 DOM 不走 `scheduleRender`。
+- `sendSessionList` 缓存在独立副本上验过三种边界：`hasUnread` 经 `atomicWriteJson` 翻转后立即失效 ✓、等长标题改名（size 不变）靠 `mtimeMs` 的亚毫秒精度识别 ✓、删除会话后缓存条目被剔除 ✓。
+- `node --check` 两个改动文件通过；`npm run regression` 因缺 `sqlite3` 仍跑不起来，且该套件不覆盖前端渲染与会话列表。
+- 本机无浏览器，切标签的实际卡顿改善程度未做实测，上述规模数字来自对真实会话文件的静态统计。
+- 生效前提：本笔改了服务端（`server.js`），必须重启服务进程；前端另需硬刷新（静态资源 `?v=` 已打到 `1.5.1-my.17`）。
+
 ## 分叉 v1.5.10
 
 ### 修复
