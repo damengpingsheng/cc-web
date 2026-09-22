@@ -8,6 +8,26 @@
 
 ---
 
+## 分叉 v1.5.10
+
+### 修复
+
+- 上下文压缩正好发生在一轮对话开头时，压缩摘要会顶着灰底、全文平铺在这一轮的**最后**，刷新页面后才变成折叠卡片并回到这一轮**之前**。根因在 `lib/agent-runtime.js` 的 `case 'user'`：CLI 把摘要作为 `type:'user'` 事件吐出来，而 stdout 上的 `isSynthetic` 是 `isMeta || isVisibleInTranscriptOnly || isCompactSummary` 合并后的结果，不透传具体来源，于是摘要被当成 hook 反馈发了 `kind:'hook_feedback'`，前端 `appendSystemMessage` 把它追加到消息列表末尾。刷新走的是另一条通道——`parseJsonlToMessages` 认 jsonl 里的 `isCompactSummary`、给出 `kind:'compact-summary'`，由 `buildCompactSummaryElement` 渲成折叠块，所以同一条内容两次看到的位置和样式都不一样。
+
+  现在实时通道按内容分流：命中 `COMPACT_SUMMARY_PREFIX`（`This session is being continued from a previous conversation`）的发新的 `kind:'compact_summary'`，前端复用同一个 `buildCompactSummaryElement`；命中 `isInjectedClaudeUserEntry` 的 caveat / `<system-reminder>` / local-command 回显直接丢弃——此前它们同样会变成一个灰色系统气泡，只是不如摘要那么显眼；剩下的才当 `hook_feedback` / `goal_feedback`。`claudeUserEventText` 同时接受裸字符串和 text block 数组两种 content 形态，同一字段在不同 CLI 版本里两种都出现过。
+
+- 最后一次工具调用停在「灰点闪烁未完成」的状态，且卡片挂在 agent 气泡下方，刷新后才变成完成态并跑到气泡上方。根因同样在 `case 'user'`：`tool_result` 只出现在 `type:'user'` 事件里（该事件另带 `tool_use_result` 字段），而原代码在 `case 'assistant'` 的 content 里找它，`case 'user'` 又因为 `!isSynthetic` 提前 break——`tool_end` 从来没发出去过。平时看不出来是因为 `FOLD_AT=3` 的折叠组把卡片藏了起来，只有本轮工具少、没凑够一组时才裸露出那个闪烁的小点。顺带 `entry.toolCalls[].result` 也一直是空的，翻历史时展开工具卡片看不到 Output；修好后这部分开始落盘，`sessions/*.json` 会相应变大（单条上限仍是 2000 字符）。
+
+  `tool_result` → `tool_end` 抽成 `emitClaudeToolEnd`，`user` 与 `assistant`（旧版 CLI 形态）两处共用。位置差异另修：流式侧收尾时若已折叠成组，把 `.msg-tools` 提到 `.msg-text` 前面，与历史重建的 `bubble.insertBefore(group, bubble.firstChild)` 对齐；没折叠时两边都留在文本下方，仍然一致。系统消息也不再无条件 append——`insertBeforeStreaming` 在存在 `#streaming-msg` 时插到流式气泡之前，这才是刷新后历史里的位置。
+
+### 验证
+
+- 用真实 `sessions/*-run/output.jsonl` 全量重放 `processClaudeEvent`：44 个 `tool_use` / 43 个 `tool_result`（全部在 user 事件里，assistant 事件里 0 个）的会话发出 44 个 `tool_start` + 43 个 `tool_end`，`toolCalls` 里 43 条 `done` 且 `result` 非空——缺的那个是重放时仍在跑的工具；另一个 31/31 的会话完全对齐。前一个会话恰好含一次压缩，其唯一的 synthetic user 事件产出 1 个 `compact_summary`、0 个 `hook_feedback`。
+- 针对 `case 'user'` 的 7 组形态断言全绿：tool_result 置 `done`/`result` 并发 `tool_end`、字符串与 block 数组两种摘要都识别、`<system-reminder>` 与 `isMeta` caveat 丢弃、`Stop hook feedback:` 仍走 `goal_feedback`、普通 hook 文本走 `hook_feedback`、非 synthetic 文本不产生任何输出。
+- `node --check` 三个改动文件通过；`npm run regression` 因缺 `sqlite3` 仍在建表阶段就跑不起来，且该套件不覆盖事件归一化。
+- 本机无浏览器，折叠组提到文本上方之后的视觉效果未做实测。
+- 生效前提：本笔改了服务端（`lib/agent-runtime.js`、`server.js`），必须重启服务进程；前端另需硬刷新（静态资源 `?v=` 已打到 `1.5.1-my.16`）。
+
 ## 分叉 v1.5.9
 
 ### 新增

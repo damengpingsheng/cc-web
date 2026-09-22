@@ -2120,6 +2120,10 @@
             gs.optimistic = false; // server-confirmed, no longer at risk of premature clear
             updateGoalBar();
           }
+        } else if (msg.kind === 'compact_summary') {
+          // 摘要是上一段对话的收尾，实时通道也要渲成折叠卡片并排在本轮气泡之前，
+          // 否则刷新前后的位置和样式都不一样（刷新走 kind:'compact-summary' 的历史路径）。
+          insertBeforeStreaming(buildCompactSummaryElement({ content: msg.message }));
         } else {
           appendSystemMessage(msg.message);
         }
@@ -2367,6 +2371,11 @@
             loose.forEach(c => inner.appendChild(c));
             _refreshGroupSummary(group);
           }
+          // 折叠成组后把工具容器提到文本前面：历史重建（buildMsgElement）走的是
+          // bubble.insertBefore(group, bubble.firstChild)，这里不对齐的话刷新一次
+          // 工具组就会从气泡下方跳到上方。
+          const bubble = toolsDiv.parentNode;
+          if (bubble && bubble.firstChild !== toolsDiv) bubble.insertBefore(toolsDiv, bubble.firstChild);
         }
       }
       // 服务端是在进程收尾时给这条 assistant 消息打 timestamp 的，
@@ -3410,11 +3419,19 @@
     }
   }
 
-  function appendSystemMessage(message) {
+  // 流式气泡（#streaming-msg）在本轮结束前一直挂在消息列表末尾，系统消息若直接
+  // append 就会排到 agent 回复之后，和刷新后按历史重建的顺序不一致——插到它前面。
+  function insertBeforeStreaming(el) {
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
-    messagesDiv.appendChild(createMsgElement('system', message));
+    const streamEl = document.getElementById('streaming-msg');
+    if (streamEl && streamEl.parentNode === messagesDiv) messagesDiv.insertBefore(el, streamEl);
+    else messagesDiv.appendChild(el);
     scrollToBottom();
+  }
+
+  function appendSystemMessage(message) {
+    insertBeforeStreaming(createMsgElement('system', message));
   }
 
   function appendError(message) {

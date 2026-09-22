@@ -4649,6 +4649,7 @@ const {
   wsSend,
   truncateObj,
   sanitizeToolInput,
+  isInjectedClaudeUserEntry,
   loadSession,
   saveSession,
   setRuntimeSessionId,
