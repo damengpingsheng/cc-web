@@ -10,6 +10,7 @@
   --bg-secondary: #f2ebe2;         /* 亜麻 flax */
   --bg-tertiary: #e9e0d4;          /* 砂 sand */
   --bg-bubble-user: #c0553a;       /* 朱色 vermillion */
+  --bg-bubble-user-soft: #d8e6f4;  /* 淡蓝 pale blue — 用户气泡底色 */
   --bg-bubble-assistant: #fff9f2;  /* 練色 warm white */
   --text-primary: #2d1f14;         /* 黒茶 dark brown */
   --text-secondary: #6b5a4d;       /* 栗色 chestnut */
@@ -1416,19 +1417,79 @@ mark.search-hit.current {
   line-height: 1.35;
 }
 .msg.user .msg-bubble {
-  background: var(--bg-bubble-user);
-  color: #fff;
+  background: var(--bg-bubble-user-soft);
+  color: var(--text-primary);
   border-bottom-right-radius: 4px;
 }
 .msg.user .msg-attachment-label {
-  background: rgba(255, 255, 255, 0.16);
-  color: rgba(255, 255, 255, 0.92);
+  background: rgba(45, 31, 20, 0.08);
+  color: var(--text-secondary);
 }
 .msg.assistant .msg-bubble {
   background: var(--bg-bubble-assistant);
   border: 1px solid var(--border-color);
   border-bottom-left-radius: 4px;
   color: var(--text-primary);
+}
+
+/* 本地命令卡片：不是对话，所以不走左右分栏的气泡样式，整行铺开单独呈现 */
+.msg.local-command {
+  align-self: stretch;
+  max-width: 100%;
+  flex-direction: column;
+}
+.msg.local-command .tool-call {
+  margin: 0;
+  background: var(--bg-primary);
+}
+.msg.local-command .tool-call-label {
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-weight: 600;
+}
+
+/* 上下文续接摘要：用原用户气泡的实色底让它跳出对话流，摘要动辄几千字，默认收起 */
+.msg.compact-summary {
+  align-self: center;
+  max-width: 92%;
+  flex-direction: column;
+}
+.compact-summary-box {
+  border: 1px solid var(--bg-bubble-user);
+  border-radius: 12px;
+  background: var(--bg-bubble-user);
+  overflow: hidden;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.07);
+}
+.compact-summary-box > summary {
+  padding: 14px 20px;
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #fff;
+  user-select: none;
+  list-style: none;
+  text-align: center;
+  letter-spacing: 0.02em;
+}
+.compact-summary-box > summary:hover { background: rgba(255, 255, 255, 0.1); }
+.compact-summary-box > summary::-webkit-details-marker { display: none; }
+.compact-summary-box > summary::before {
+  content: '▸ ';
+  font-size: 11px;
+}
+.compact-summary-box[open] > summary {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.3);
+}
+.compact-summary-box[open] > summary::before { content: '▾ '; }
+.compact-summary-body {
+  padding: 16px 20px;
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  text-align: left;
+  max-height: 560px;
+  overflow-y: auto;
 }
 
 /* System messages */
@@ -1491,8 +1552,8 @@ mark.search-hit.current {
   color: var(--accent);
 }
 .msg.user .msg-bubble code:not(pre code) {
-  background: rgba(255,255,255,0.2);
-  color: #fff;
+  background: rgba(45, 31, 20, 0.08);
+  color: var(--text-primary);
 }
 
 /* Code blocks */

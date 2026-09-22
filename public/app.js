@@ -1760,7 +1760,7 @@
           loginOverlay.hidden = false;
           app.hidden = true;
           if (msg.banned) {
-            loginError.textContent = '该 IP 已被永久封禁';
+            loginError.textContent = '该 IP 已被封禁，7 天后自动解除';
             loginError.hidden = false;
             loginPassword.disabled = true;
             loginForm.querySelector('button[type="submit"]').disabled = true;
