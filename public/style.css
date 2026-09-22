@@ -2898,6 +2898,17 @@ html[data-theme='coolvibe'] .settings-back:hover {
 }
 
 /* === Import Session List === */
+.import-search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.import-search-count {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
 .import-group {
   margin-bottom: 20px;
 }

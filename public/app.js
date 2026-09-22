@@ -6069,50 +6069,97 @@
         return;
       }
       body.innerHTML = buildAgentContextCard('claude', '从 Claude 原生历史导入', '读取 ~/.claude/projects/ 下的会话文件，恢复对话文本与工具调用，并保留 Claude 侧续接上下文。');
-      for (const group of groups) {
-        const groupEl = document.createElement('div');
-        groupEl.className = 'import-group';
-        // Convert slug dir to readable path
-        let readablePath = group.dir.replace(/-/g, '/');
-        if (!readablePath.startsWith('/')) readablePath = '/' + readablePath;
-        readablePath = readablePath.replace(/\/+/g, '/');
-        const groupTitle = document.createElement('div');
-        groupTitle.className = 'import-group-title';
-        groupTitle.textContent = readablePath;
-        groupEl.appendChild(groupTitle);
-        for (const sess of group.sessions) {
-          const item = document.createElement('div');
-          item.className = 'import-item';
-          const info = document.createElement('div');
-          info.className = 'import-item-info';
-          const titleEl = document.createElement('div');
-          titleEl.className = 'import-item-title';
-          titleEl.textContent = sess.title;
-          const meta = document.createElement('div');
-          meta.className = 'import-item-meta';
-          const cwdText = sess.cwd ? sess.cwd : '';
-          const timeText = sess.updatedAt ? timeAgo(sess.updatedAt) : '';
-          meta.textContent = [cwdText, timeText].filter(Boolean).join(' · ');
-          info.appendChild(titleEl);
-          info.appendChild(meta);
-          const btn = document.createElement('button');
-          btn.className = 'import-item-btn';
-          btn.textContent = sess.alreadyImported ? '重新导入' : '导入';
-          btn.addEventListener('click', () => {
-            if (sess.alreadyImported) {
-              if (!confirm('已导入过此会话，重新导入将覆盖已有内容。确认继续？')) return;
-            } else {
-              if (!confirm('由于 cc-web 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
-            }
-            close();
-            send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir });
+
+      // 与 Codex 导入面板一致：关键词过滤，命中为空的分组整组隐藏
+      const searchRow = document.createElement('div');
+      searchRow.className = 'import-search-row';
+      const search = document.createElement('input');
+      search.type = 'text';
+      search.className = 'modal-text-input';
+      search.placeholder = '搜索标题或项目目录…';
+      const count = document.createElement('span');
+      count.className = 'import-search-count';
+      searchRow.appendChild(search);
+      searchRow.appendChild(count);
+      body.appendChild(searchRow);
+
+      const listEl = document.createElement('div');
+      body.appendChild(listEl);
+
+      const totalSessions = groups.reduce((n, g) => n + g.sessions.length, 0);
+
+      const renderList = (keyword) => {
+        const terms = String(keyword || '').toLowerCase().split(/\s+/).filter(Boolean);
+        listEl.innerHTML = '';
+        let shown = 0;
+
+        for (const group of groups) {
+          // Convert slug dir to readable path
+          let readablePath = group.dir.replace(/-/g, '/');
+          if (!readablePath.startsWith('/')) readablePath = '/' + readablePath;
+          readablePath = readablePath.replace(/\/+/g, '/');
+
+          const matched = group.sessions.filter((sess) => {
+            if (terms.length === 0) return true;
+            const haystack = [sess.title, sess.cwd, readablePath, sess.sessionId]
+              .filter(Boolean).join(' ').toLowerCase();
+            return terms.every((t) => haystack.includes(t));
           });
-          item.appendChild(info);
-          item.appendChild(btn);
-          groupEl.appendChild(item);
+          if (matched.length === 0) continue;
+          shown += matched.length;
+
+          const groupEl = document.createElement('div');
+          groupEl.className = 'import-group';
+          const groupTitle = document.createElement('div');
+          groupTitle.className = 'import-group-title';
+          groupTitle.textContent = readablePath;
+          groupEl.appendChild(groupTitle);
+          for (const sess of matched) {
+            const item = document.createElement('div');
+            item.className = 'import-item';
+            const info = document.createElement('div');
+            info.className = 'import-item-info';
+            const titleEl = document.createElement('div');
+            titleEl.className = 'import-item-title';
+            titleEl.textContent = sess.title;
+            const meta = document.createElement('div');
+            meta.className = 'import-item-meta';
+            const cwdText = sess.cwd ? sess.cwd : '';
+            const timeText = sess.updatedAt ? timeAgo(sess.updatedAt) : '';
+            meta.textContent = [cwdText, timeText].filter(Boolean).join(' · ');
+            info.appendChild(titleEl);
+            info.appendChild(meta);
+            const btn = document.createElement('button');
+            btn.className = 'import-item-btn';
+            btn.textContent = sess.alreadyImported ? '重新导入' : '导入';
+            btn.addEventListener('click', () => {
+              if (sess.alreadyImported) {
+                if (!confirm('已导入过此会话，重新导入将覆盖已有内容。确认继续？')) return;
+              } else {
+                if (!confirm('由于 cc-web 与本地 CLI 的逻辑不同，导入会话需要解析后方可展示，导入后将覆盖已有内容。确认继续？')) return;
+              }
+              close();
+              send({ type: 'import_native_session', sessionId: sess.sessionId, projectDir: group.dir });
+            });
+            item.appendChild(info);
+            item.appendChild(btn);
+            groupEl.appendChild(item);
+          }
+          listEl.appendChild(groupEl);
         }
-        body.appendChild(groupEl);
-      }
+
+        count.textContent = terms.length > 0 ? `${shown} / ${totalSessions}` : `共 ${totalSessions} 个会话`;
+        if (shown === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'modal-empty';
+          empty.textContent = '没有匹配的会话';
+          listEl.appendChild(empty);
+        }
+      };
+
+      search.addEventListener('input', () => renderList(search.value));
+      renderList('');
+      search.focus();
     };
 
     send({ type: 'list_native_sessions' });
@@ -6156,60 +6203,105 @@
       }
 
       body.innerHTML = buildAgentContextCard('codex', '从 Codex rollout 历史导入', '读取 ~/.codex/sessions/ 下的 rollout 文件，恢复用户消息、助手输出、函数调用和 token 统计。');
-      items.forEach((sess) => {
-        const item = document.createElement('div');
-        item.className = 'import-item';
 
-        const info = document.createElement('div');
-        info.className = 'import-item-info';
+      // 会话多达上百条，标题/路径都可能很长，加个搜索框按关键词过滤
+      const searchRow = document.createElement('div');
+      searchRow.className = 'import-search-row';
+      const search = document.createElement('input');
+      search.type = 'text';
+      search.className = 'modal-text-input';
+      search.placeholder = '搜索标题、目录或 thread id…';
+      const count = document.createElement('span');
+      count.className = 'import-search-count';
+      searchRow.appendChild(search);
+      searchRow.appendChild(count);
+      body.appendChild(searchRow);
 
-        const titleEl = document.createElement('div');
-        titleEl.className = 'import-item-title';
-        titleEl.textContent = sess.title || sess.threadId;
+      const listEl = document.createElement('div');
+      body.appendChild(listEl);
 
-        const meta = document.createElement('div');
-        meta.className = 'import-item-meta';
-        meta.textContent = [
-          sess.cwd || '',
-          sess.source ? `source:${sess.source}` : '',
-          sess.updatedAt ? timeAgo(sess.updatedAt) : '',
-        ].filter(Boolean).join(' · ');
-
-        const tags = document.createElement('div');
-        tags.className = 'import-item-tags';
-        if (sess.cliVersion) {
-          const ver = document.createElement('span');
-          ver.className = 'import-item-tag';
-          ver.textContent = `CLI ${sess.cliVersion}`;
-          tags.appendChild(ver);
-        }
-        if (sess.source) {
-          const source = document.createElement('span');
-          source.className = 'import-item-tag';
-          source.textContent = sess.source;
-          tags.appendChild(source);
-        }
-
-        info.appendChild(titleEl);
-        info.appendChild(meta);
-        if (tags.children.length > 0) info.appendChild(tags);
-
-        const btn = document.createElement('button');
-        btn.className = 'import-item-btn';
-        btn.textContent = sess.alreadyImported ? '重新导入' : '导入';
-        btn.addEventListener('click', () => {
-          const confirmed = sess.alreadyImported
-            ? confirm('已导入过此 Codex 会话，重新导入将覆盖已有内容。确认继续？')
-            : confirm('将解析本地 Codex rollout 历史并导入当前 Web 视图。确认继续？');
-          if (!confirmed) return;
-          close();
-          send({ type: 'import_codex_session', threadId: sess.threadId, rolloutPath: sess.rolloutPath });
+      const renderList = (keyword) => {
+        // 空格分隔的多个关键词按 AND 匹配，顺序无关
+        const terms = String(keyword || '').toLowerCase().split(/\s+/).filter(Boolean);
+        const matched = items.filter((sess) => {
+          if (terms.length === 0) return true;
+          const haystack = [sess.title, sess.cwd, sess.threadId, sess.source, sess.cliVersion]
+            .filter(Boolean).join(' ').toLowerCase();
+          return terms.every((t) => haystack.includes(t));
         });
 
-        item.appendChild(info);
-        item.appendChild(btn);
-        body.appendChild(item);
-      });
+        count.textContent = terms.length > 0
+          ? `${matched.length} / ${items.length}`
+          : `共 ${items.length} 个会话`;
+
+        listEl.innerHTML = '';
+        if (matched.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'modal-empty';
+          empty.textContent = '没有匹配的会话';
+          listEl.appendChild(empty);
+          return;
+        }
+
+        matched.forEach((sess) => {
+          const item = document.createElement('div');
+          item.className = 'import-item';
+
+          const info = document.createElement('div');
+          info.className = 'import-item-info';
+
+          const titleEl = document.createElement('div');
+          titleEl.className = 'import-item-title';
+          titleEl.textContent = sess.title || sess.threadId;
+
+          const meta = document.createElement('div');
+          meta.className = 'import-item-meta';
+          meta.textContent = [
+            sess.cwd || '',
+            sess.source ? `source:${sess.source}` : '',
+            sess.updatedAt ? timeAgo(sess.updatedAt) : '',
+          ].filter(Boolean).join(' · ');
+
+          const tags = document.createElement('div');
+          tags.className = 'import-item-tags';
+          if (sess.cliVersion) {
+            const ver = document.createElement('span');
+            ver.className = 'import-item-tag';
+            ver.textContent = `CLI ${sess.cliVersion}`;
+            tags.appendChild(ver);
+          }
+          if (sess.source) {
+            const source = document.createElement('span');
+            source.className = 'import-item-tag';
+            source.textContent = sess.source;
+            tags.appendChild(source);
+          }
+
+          info.appendChild(titleEl);
+          info.appendChild(meta);
+          if (tags.children.length > 0) info.appendChild(tags);
+
+          const btn = document.createElement('button');
+          btn.className = 'import-item-btn';
+          btn.textContent = sess.alreadyImported ? '重新导入' : '导入';
+          btn.addEventListener('click', () => {
+            const confirmed = sess.alreadyImported
+              ? confirm('已导入过此 Codex 会话，重新导入将覆盖已有内容。确认继续？')
+              : confirm('将解析本地 Codex rollout 历史并导入当前 Web 视图。确认继续？');
+            if (!confirmed) return;
+            close();
+            send({ type: 'import_codex_session', threadId: sess.threadId, rolloutPath: sess.rolloutPath });
+          });
+
+          item.appendChild(info);
+          item.appendChild(btn);
+          listEl.appendChild(item);
+        });
+      };
+
+      search.addEventListener('input', () => renderList(search.value));
+      renderList('');
+      search.focus();
     };
 
     send({ type: 'list_codex_sessions' });
