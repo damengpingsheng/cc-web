@@ -3041,6 +3041,24 @@
 
     return wrapper;
   }
+  // 把工具参数对象按字段拆成分区：每个 key 一段，长文本各自进 <pre>。
+  // 整个对象丢给 JSON.stringify 的话，字符串值里的换行会被转义成字面量 \n，
+  // Write/Edit 的文件内容就糊成一整段——按字段拆开换行才回得来。
+  // 不是普通对象（字符串、数组、null）返回 null，交回调用方按原样渲染。
+  function buildToolFieldSections(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const entries = Object.entries(value).filter(([, v]) => v !== undefined && v !== null && v !== '');
+    if (entries.length === 0) return null;
+    const stack = document.createElement('div');
+    stack.className = 'tool-call-structured';
+    for (const [key, v] of entries) {
+      const body = typeof v === 'string' ? v : stringifyToolValue(v);
+      // 分区标题是 uppercase 的，file_path 这种下划线换成空格才好读
+      stack.appendChild(buildStructuredToolSection(key.replace(/_/g, ' '), body));
+    }
+    return stack;
+  }
+
 
   function buildToolContentElement(name, input) {
     const tool = typeof name === 'object' && name !== null ? name : { name, input };
@@ -3099,10 +3117,17 @@
       return wrapper;
     }
 
-    const inputStr = stringifyToolValue(effectiveResult || effectiveInput);
+    const payload = effectiveResult || effectiveInput;
     const content = document.createElement('div');
     content.className = 'tool-call-content';
-    content.textContent = inputStr;
+    // 没带 kind 的工具（Claude 侧一律如此）以前是把整个 input 对象 JSON.stringify 塞进来，
+    // 多行字段全被转义成一整行。能拆成字段就拆，拆不动（结果是纯字符串等）再按原样显示。
+    const fields = buildToolFieldSections(payload);
+    if (fields) {
+      content.appendChild(fields);
+    } else {
+      content.textContent = stringifyToolValue(payload);
+    }
     return content;
   }
 
