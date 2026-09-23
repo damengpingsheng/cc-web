@@ -20,7 +20,8 @@ npm start            # 依赖已随包提供，无需 npm install
 
 ## 一、本分支自研
 
-日期为提交日期。这批提交是按功能重新拆分整理的结果，不一定等于最初编码那天。
+日期为功能落地日期。09-21 及以前的改动原本是一次性落盘的，09-22 才按功能重新拆成
+线性提交，所以这部分的提交日期晚于实际编码日期。
 
 ### 2026-09-23
 
@@ -56,6 +57,15 @@ npm start            # 依赖已随包提供，无需 npm install
 - 代码块的 Copy 按钮在内网 HTTP（非安全上下文）下降级到 `execCommand`，不再点了没反应
 - 上翻浏览历史时，流式输出不再把视口反复拽回底部
 
+### 2026-09-17
+
+**修复**
+
+- `/model` 列表与终端 `claude` CLI 对不上：改为读 `settings.json` 里的 `modelPicker.options` 与 `ANTHROPIC_CUSTOM_MODEL_OPTION`
+- Codex 在 local 模式下 `/model` 候选为空：回落到 `~/.codex/config.toml` 的当前模型与网关 gpt 系列，思考强度补齐 `low` / `max` / `ultra`
+- Codex 会话只能导入一部分、且列表里标题全都一样：适配新版 rollout 的 `item_completed` / `UserMessage` 结构
+- 导入的 Codex 会话进度落后于终端：subagent 的第二份 `session_meta` 不再冒充父会话
+
 ## 二、随本地 1.5.4 基线继承
 
 以下功能来自一个第三方的本地 1.5.4 包，2026-09-21 把本地改动整体落盘时一并带入，
@@ -64,12 +74,15 @@ npm start            # 依赖已随包提供，无需 npm install
 - 通知渠道新增钉钉机器人，支持自定义关键词安全设置，可选 @所有人
 - `HOST` 可配置监听地址，设为局域网 IP 即可供内网其他设备访问
 - 支持自建网关与第三方中转（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`）
-- `/model` 与 `/effort` 两级联动，模型候选列表从网关动态获取
-- 从终端导入的 Claude / Codex CLI 会话与 CLI 实时同步
+- `/model` 与 `/effort` 两级联动，候选可从网关 `/v1/models` 拉取
+- 从终端导入的 Claude / Codex CLI 会话与 CLI 实时同步（文件 watcher 加轮询双保险、inode 变化时原子替换）
 - Codex rollout 识别 `custom_tool_call` / `custom_tool_call_output`
 - 导入同步的「更短不覆盖」保护，避免读到截断内容覆盖已渲染消息
 - 长会话增加「到最前 / 到最后」跳转圆钮
 - 后台任务完成后广播给其他标签页与设备
+
+其中 `/model` / `/effort` 与导入实时同步两项，只有上面括注的机制是继承来的，
+本分支 2026-09-17 在其之上做过修正与扩展，见第一节。
 
 ## 来源与许可
 
