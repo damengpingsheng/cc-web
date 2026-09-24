@@ -2320,7 +2320,7 @@ function formatRuntimeError(agent, raw, context = {}) {
     if (/authentication|unauthorized|forbidden|login|api key|credential/i.test(condensed)) {
       return 'Codex 鉴权失败。请确认本机 Codex CLI 已完成登录，且当前凭据仍然有效。';
     }
-    if (/rate limit|quota|billing|credits/i.test(condensed)) {
+    if (/rate limit|too many requests|retry limit|\b429\b|quota|billing|credits/i.test(condensed)) {
       return 'Codex 请求被额度或速率限制拦截。请检查账号配额、计费状态或稍后重试。';
     }
     if (/network|timed out|timeout|ECONNRESET|ENOTFOUND|TLS|certificate|fetch failed/i.test(condensed)) {
