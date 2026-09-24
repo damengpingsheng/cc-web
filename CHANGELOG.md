@@ -8,6 +8,35 @@
 
 ---
 
+## 分叉 v1.5.13
+
+### 修复
+
+- 一轮里正文和工具调用交替出现时，正文会被拼成连续的一大段，工具卡片全部堆到对话末尾；本轮结束后也不会归位，必须手动刷新页面才按真实顺序穿插回正文之间。
+
+  Claude 原生 jsonl 把**每个 text block 和每个 tool_use 各写成一条独立的 assistant 条目**（实测某会话 95 条工具条目全是 1 个 `tool_use`，text 与 tool_use 混在同一条目的 0 条；14 轮里 9 轮出现 `文本→工具→文本` 交替，最长交替段 24 段）。历史通道 `parseJsonlToMessages` 一条目一条消息、`buildMsgElement` 一条消息一个气泡且相邻 assistant 不合并，所以刷新后看到的才是真实顺序。
+
+  而实时通道结构上就放不下穿插：`startGenerating` 把气泡固定切成 `.msg-text` + `.msg-tools` 两个容器，`flushRender` 每次把整段 `pendingText` 全量重渲染进前者，`appendToolCall` 一律 append 到后者。落盘同样丢了顺序——`handleProcessComplete` 把一轮存成单条 `{ content: fullText, toolCalls: [...] }`，扁平文本加扁平数组，没有任何位置信息。
+
+  真正让它「结束了也不自动归位」的是第三层：原生历史监听的 `onChange` 开头有 `if (activeProcesses.has(sessionId)) return`，运行期间的文件变动全被丢弃；而进程收尾（`activeProcesses.delete`）之后没有任何地方补一次同步——全仓 `syncImportedSession` 只有监听器和 `handleLoadSession` 两个调用点，后者正是手动刷新/切会话走的路。现在收尾时补一次 `resyncNativeHistoryAfterRun`，复用现成的 `imported_messages_replaced` 通道把本轮气泡重排成原生顺序。
+
+  两个必须踩准的点。其一，claude 那条 append-only 捷径（`fromIndex = previousTotal`）在这条路径上不成立：`handleProcessComplete` 刚 push 过一条合并版 assistant 消息，已落盘快照不再是原生历史的前缀，按 `previousTotal` 取增量会错位。给 `syncImportedSession` 加了 `diffChanged` 开关，收尾路径改走 `firstChangedMessageIndex` 按内容 diff，默认路径行为完全不变。其二，重排必须排在 `done` 之后——前端要先 `finishGenerating` 把流式气泡封口成普通 `.msg`，DOM 里的条数才对得上 `previousTotal`；紧接着还要再起一轮的（codex 重试 / compact 重放 / goal 续跑）跳过，等那一轮自己收尾时再重排。
+
+  `next.length >= previousTotal` 的保护沿用：jsonl 还没写完时保持 `fromIndex = -1` 直接跳过，绝不用更短的历史覆盖掉已落盘的轮次，最坏情况只是退回原来的「手刷才归位」。
+
+### 已知行为
+
+- 本轮出现过上下文压缩摘要或任何 `system_message` 时，DOM 里会多出不在 `session.messages` 里的 `.msg` 元素，条数对不上 `previousTotal`，前端落到 `openSession({ forceSync: true })` 兜底整段重载。结果一样正确（等同自动刷新一次），只是开销比精确替换大。
+- 只发给发起这一轮的那个标签页。其它标签页本来就没跟着流式更新，属于既有行为，不在本次范围内。
+
+### 验证
+
+- 从 `server.js` 抽出真实的 `parseJsonlToMessages` 与 `firstChangedMessageIndex`，用真实 jsonl（168 条消息）重放收尾那一刻的输入，9 条断言全绿：稳态下 `fromIndex` 精确落在本轮 user 上、替换段等于本轮全部 22 条消息且 `文本→工具→文本` 交替顺序完整还原、走 replaced 而非 appended 分支、替换前确实只有 1 条合并版 assistant；jsonl 落后时跳过同步、无变化时不发消息；默认 append-only 路径两条断言确认未受影响。
+- 交替形态的统计口径见上，脚本对同一份 jsonl 逐轮打印压缩后的 `T→U→T` 序列。
+- `node --check server.js` / `node --check public/app.js` 通过；`npm run regression` 因本机缺 `sqlite3` 仍在建表阶段跑不起来。
+- 未实测：本机无浏览器，重排瞬间的滚动位置跳变、以及工具卡片展开状态在重建后丢失的观感没有验证。
+- **生效前提：本笔改的是 `server.js`，必须重启常驻服务进程才生效**，光硬刷新页面没用。
+
 ## 分叉 v1.5.12
 
 ### 新增

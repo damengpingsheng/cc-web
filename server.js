@@ -2111,7 +2111,7 @@ function firstChangedMessageIndex(previous, next) {
   return previous.length === next.length ? -1 : commonLength;
 }
 
-function syncImportedSession(sessionId) {
+function syncImportedSession(sessionId, { diffChanged = false } = {}) {
   const session = loadSession(sessionId);
   const source = resolveImportedSessionSource(session);
   if (!source) return { session, change: null };
@@ -2131,11 +2131,12 @@ function syncImportedSession(sessionId) {
   }
 
   let fromIndex = -1;
-  if (source.agent === 'claude') {
+  if (source.agent === 'claude' && !diffChanged) {
     // Claude history is append-only in the existing sync contract.
     if (next.length > previousTotal) fromIndex = previousTotal;
   } else if (next.length >= previousTotal) {
-    // Codex 会在不增加条数的情况下更新当前 assistant/工具消息，故同长度也需 diff。
+    // Codex 会在不增加条数的情况下更新当前 assistant/工具消息，故同长度也需 diff；
+    // claude 带 diffChanged 时（刚落盘过合并版轮次，快照已不是原生历史的前缀）同理。
     // 但当解析出的原生历史比已落盘的更短时（例如浏览器下发的轮次经隔离 CODEX_HOME
     // 运行、尚未回落到原生 rollout），绝不能用更短历史覆盖，否则会截断掉 cc-web 已通过
     // handleProcessComplete 持久化的轮次；此时保持 fromIndex = -1，跳过覆盖。
@@ -2202,6 +2203,19 @@ function sendImportedSessionChange(client, sessionId, synced, change) {
     fromIndex: change.fromIndex,
     previousTotal: change.previousTotal,
   });
+}
+
+// 一轮跑完后把气泡重排回原生历史里的真实顺序。
+// 流式通道的气泡只有 .msg-text / .msg-tools 两个固定容器，整轮文本必然拼成一段、
+// 工具卡片必然堆在末尾；而 Claude 原生 jsonl 把每个 text / tool_use 各写成一条独立
+// assistant 条目，交替顺序只有过一遍 parseJsonlToMessages 才还原得出来。运行期间
+// startImportedSync 的 onChange 被 activeProcesses 挡掉，收尾后又没人补一次，
+// 于是这个顺序只能靠手动刷新页面才回得来。
+function resyncNativeHistoryAfterRun(sessionId, ws) {
+  if (!ws || ws.readyState !== 1 || wsSessionMap.get(ws) !== sessionId) return;
+  const { session: synced, change } = syncImportedSession(sessionId, { diffChanged: true });
+  if (!synced || !change) return;
+  sendImportedSessionChange(ws, sessionId, synced, change);
 }
 
 // Subscribe one WebSocket to a native history file. Subscribers share one tailer.
@@ -2565,6 +2579,12 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     sendSessionList(entry.ws);
     // 同步给其他客户端，避免只有发起的那个标签页知道任务完成
     broadcastBackgroundDone(sessionId, entry, entry.ws);
+    // 必须排在 done 之后：前端要先 finishGenerating 把流式气泡封口成普通 .msg，
+    // DOM 里的条数才对得上 previousTotal。紧接着还要再起一轮的（codex 重试 /
+    // compact 重放 / goal 续跑）跳过，等那一轮自己收尾时再重排。
+    if (!retryCodexWithoutResume && !shouldReturnForFollowup && !shouldAutoCompact) {
+      resyncNativeHistoryAfterRun(sessionId, entry.ws);
+    }
     // Push notification when trigger='always' (user online but still wants notification)
     (() => {
       const notifyCfg = loadNotifyConfig();
