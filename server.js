@@ -754,6 +754,7 @@ const DEFAULT_CODEX_CONFIG = {
   mode: 'local',
   activeProfile: '',
   profiles: [],
+  gateway: 'apirouter',  // local 模式下 codex 请求走向：apirouter（公司默认）| localproxy（本机 Responses→Chat 适配代理）
   enableSearch: false,
   supportsSearch: false,
   localSnapshot: {},  // saved snapshot of local ~/.codex config (archive-only, no restore)
@@ -900,6 +901,7 @@ function loadCodexConfig() {
       return {
         mode: raw.mode === 'custom' ? 'custom' : 'local',
         activeProfile: raw.activeProfile || '',
+        gateway: raw.gateway === 'localproxy' ? 'localproxy' : 'apirouter',
         profiles: Array.isArray(raw.profiles) ? raw.profiles.map((profile) => ({
           name: String(profile?.name || '').trim(),
           apiKey: String(profile?.apiKey || ''),
@@ -921,6 +923,7 @@ function saveCodexConfig(config) {
   atomicWriteJson(CODEX_CONFIG_PATH, JSON.stringify({
     mode: config.mode === 'custom' ? 'custom' : 'local',
     activeProfile: config.activeProfile || '',
+    gateway: config.gateway === 'localproxy' ? 'localproxy' : 'apirouter',
     profiles: Array.isArray(config.profiles) ? config.profiles.map((profile) => ({
       name: String(profile?.name || '').trim(),
       apiKey: String(profile?.apiKey || ''),
@@ -937,6 +940,7 @@ function getCodexConfigMasked() {
   return {
     mode: config.mode === 'custom' ? 'custom' : 'local',
     activeProfile: config.activeProfile || '',
+    gateway: config.gateway === 'localproxy' ? 'localproxy' : 'apirouter',
     profiles: (config.profiles || []).map((profile) => ({
       name: profile.name,
       apiKey: maskSecret(profile.apiKey),
@@ -3285,6 +3289,7 @@ function handleSaveCodexConfig(ws, newConfig) {
   const merged = {
     mode: newConfig.mode === 'custom' ? 'custom' : 'local',
     activeProfile: String(newConfig.activeProfile || '').trim(),
+    gateway: newConfig.gateway === 'localproxy' ? 'localproxy' : 'apirouter',
     profiles: mergedProfiles,
     enableSearch: false,
     supportsSearch: false,
@@ -3314,6 +3319,7 @@ function handleSaveCodexConfig(ws, newConfig) {
   plog('INFO', 'codex_config_saved', {
     mode: merged.mode,
     activeProfile: merged.activeProfile || null,
+    gateway: merged.gateway,
     profileCount: merged.profiles.length,
     defaultModel: nextDefaultModel || null,
     enableSearchRequested: requestedSearch,
@@ -3912,6 +3918,8 @@ function handleNewSession(ws, msg) {
   const cwd = rawCwd ? expandUserPath(rawCwd) : null;
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
+  // 会话级 Codex 网关（新建会话弹窗选择）；空值/旧会话回落到全局配置的 gateway
+  const codexGateway = msg?.codexGateway === 'localproxy' ? 'localproxy' : 'apirouter';
   const taskMode = msg?.taskMode === 'remote' ? 'remote' : 'local';
   const sshHostId = String(msg?.sshHostId || '').trim();
   const remoteCwd = String(msg?.remoteCwd || '').trim();
@@ -3952,6 +3960,7 @@ function handleNewSession(ws, msg) {
     claudeSessionId: null,
     codexThreadId: null,
     model: agent === 'codex' ? resolveDefaultCodexModel() : MODEL_MAP.opus,
+    codexGateway: agent === 'codex' ? codexGateway : '',
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },

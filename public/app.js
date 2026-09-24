@@ -5597,6 +5597,7 @@
     let currentCodexConfig = null;
     let codexEditingProfiles = [];
     let codexActiveProfile = '';
+    let codexGateway = 'apirouter';
 
     function showCodexStatus(msg, type) {
       codexStatus.textContent = msg;
@@ -5623,8 +5624,16 @@
               <button class="btn-test" id="codex-read-local-btn" style="padding:4px 10px">读取当前配置</button>
             </div>
           </div>
+          <div class="settings-field">
+            <label>网关</label>
+            <select class="settings-select" id="codex-gateway-select" style="width:100%">
+              <option value="apirouter"${codexGateway === 'apirouter' ? ' selected' : ''}>公司 apirouter（默认）</option>
+              <option value="localproxy"${codexGateway === 'localproxy' ? ' selected' : ''}>本地代理 (127.0.0.1:8787)</option>
+            </select>
+          </div>
           <div class="settings-inline-note">
             直接复用本机 <code>codex</code> 的登录态与 <code>~/.codex/config.toml</code>。
+            ${codexGateway === 'localproxy' ? '选本地代理时需先启动 <code>~/Tools/codex-api-proxy/codex_api_proxy.py</code>（监听 127.0.0.1:8787）。' : ''}
           </div>
         `;
         panel.querySelector('#codex-profile-select').addEventListener('change', (e) => {
@@ -5640,6 +5649,10 @@
         });
         panel.querySelector('#codex-info-btn').addEventListener('click', showClaudeLocalInfoModal);
         panel.querySelector('#codex-read-local-btn').addEventListener('click', () => send({ type: 'read_codex_local_config' }));
+        panel.querySelector('#codex-gateway-select').addEventListener('change', (e) => {
+          codexGateway = e.target.value === 'localproxy' ? 'localproxy' : 'apirouter';
+          renderCodexConfigArea();
+        });
         return;
       }
 
@@ -5843,6 +5856,7 @@
     _onCodexConfig = (config) => {
       currentCodexConfig = config || {};
       codexEditingProfiles = (currentCodexConfig.profiles || []).map((profile) => normalizeCodexProfile(profile));
+      codexGateway = currentCodexConfig.gateway === 'localproxy' ? 'localproxy' : 'apirouter';
       if (currentCodexConfig.mode === 'local') {
         codexActiveProfile = '';
       } else {
@@ -5860,6 +5874,7 @@
       const config = {
         mode: isLocal ? 'local' : 'custom',
         activeProfile: isLocal ? '' : codexActiveProfile,
+        gateway: codexGateway,
         profiles: codexEditingProfiles,
         enableSearch: false,
         localSnapshot: currentCodexConfig?.localSnapshot || {},
@@ -6164,6 +6179,14 @@
           <div class="agent-context-card" style="margin-bottom:12px">
             <div class="agent-context-kicker" id="ns-task-label">${escapeHtml(targetLabel)} · 本地任务</div>
           </div>
+          ${targetAgent === 'codex' ? `
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+            <span style="opacity:0.75;white-space:nowrap;font-size:0.92em">网关</span>
+            <select class="settings-select" id="ns-gateway-select" style="flex:1" title="选择 Codex 请求走向；本地代理需先启动 ~/Tools/codex-api-proxy/codex_api_proxy.py（监听 127.0.0.1:8787）">
+              <option value="apirouter"${codexConfigCache?.gateway === 'localproxy' ? '' : ' selected'}>公司 apirouter（默认）</option>
+              <option value="localproxy"${codexConfigCache?.gateway === 'localproxy' ? ' selected' : ''}>本地代理 (127.0.0.1:8787)</option>
+            </select>
+          </div>` : ''}
           <div style="display:flex;gap:8px;margin-bottom:12px">
             <button class="btn-test ns-task-tab active" id="ns-tab-local" style="flex:1;padding:6px 12px">本地任务</button>
             <button class="btn-test ns-task-tab" id="ns-tab-remote" style="flex:1;padding:6px 12px">远程任务</button>
@@ -6364,7 +6387,7 @@
         }
         close();
         saveRecentCwd(cwd);
-        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local' });
+        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local', codexGateway: overlay.querySelector('#ns-gateway-select')?.value || 'apirouter' });
       } else {
         // Remote task
         if (!selectedHostId) {
@@ -6373,7 +6396,7 @@
         }
         const remoteCwd = remoteView.querySelector('#ns-remote-cwd')?.value?.trim() || '';
         close();
-        send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd });
+        send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd, codexGateway: overlay.querySelector('#ns-gateway-select')?.value || 'apirouter' });
       }
     });
   }
