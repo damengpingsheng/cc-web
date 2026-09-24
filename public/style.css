@@ -2241,6 +2241,8 @@ mark.search-hit.current {
   padding: 16px;
   min-width: 280px;
   max-width: 380px;
+  max-height: min(70vh, calc(100dvh - var(--header-height) - 96px));
+  overflow-y: auto;
   z-index: 50;
   animation: fadeIn 0.2s ease;
 }
@@ -2309,7 +2311,14 @@ mark.search-hit.current {
   /* 触屏没有 hover，复制按钮跟上面那排操作按钮一样常显 */
   .session-item-claude-id-copy { visibility: visible; }
   .cmd-menu { left: 10px; right: 10px; transform: none; min-width: auto; bottom: 72px; }
-  .option-picker { left: 10px; right: 10px; transform: none; min-width: auto; bottom: 72px; }
+  .option-picker {
+    left: 10px;
+    right: 10px;
+    transform: none;
+    min-width: auto;
+    bottom: 72px;
+    max-height: calc(100dvh - var(--header-height) - 92px);
+  }
   .chat-title {
     font-size: 13px;
   }
