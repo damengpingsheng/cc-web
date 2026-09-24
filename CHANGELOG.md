@@ -8,6 +8,33 @@
 
 ---
 
+## 分叉 v1.5.14
+
+### 新增
+
+- 消息区右侧常显一条提问导航条，每轮用户提问对应一根小横条：悬停看提问原文，点击跳到那一轮，落点带一次短暂描边。长会话里不必再靠滚动条盲拖找「刚才那个问题问在哪」。
+
+  提问集合直接取 `.msg.user`。`local-command` 卡片是 `msg local-command`、上下文续接摘要是 `msg system compact-summary`，两者都不带 `user` 类，那些从 jsonl 带进来的注入条目天然进不了导航条，不需要额外过滤。
+
+  横条按「内容占比」落位（`offsetTop / scrollHeight`），与滚动条 thumb 的「滚动进度」（`scrollTop / (scrollHeight - clientHeight)`）是两套坐标，没有强行对齐：横条回答的是「这轮提问在整个会话的哪个位置」，属 minimap 语义。高亮则始终恰好一条——取最后一条起点已被划过的提问，像目录的当前项。
+
+  轨道占右起 `[0,16)`，与 `.scroll-jump` 的 `[16,48)` 正好不重叠；与 `.custom-scrollbar` 的 `[2,8)` 是有意重叠的，DOM 上导航条排在滚动条之前，thumb 因此压在上层、拖动优先。代价是 thumb 当前覆盖的那一小段横条点不到，而那正是当前视口所在位置，本来也不需要跳转。
+
+  重建靠 `MutationObserver` 且只观察 `messagesDiv` 的直接子节点：流式输出改的是气泡内部（subtree），不会触发；只有消息增删才触发，再经 rAF 节流 + 节点逐一比对，条数没变时只重排不重建 DOM。
+
+  跳转沿用会话内搜索 `focusSearchHit` 已经踩过的坑——只改 `messagesDiv.scrollTop`，不用 `scrollIntoView`（会连带滚动 window 和侧栏）。跳转后同步把 `stickToBottom` 置 false：`scroll` 事件要到下一帧才重算，这中间若有新消息到达，`scrollToBottom` 会读到旧值把人拉回底部。
+
+  `layoutMsgNav` 里先批量读 `offsetTop` 再批量写 `style.top`。初版读写交替，每根横条各触发一次强制重排，而流式生成时 `scrollHeight` 每帧都在变，长会话足以卡住；拆成两趟后一帧只剩一次 layout flush。滚动时的高亮判断用布局时缓存的 `top`，完全不读 DOM。
+
+  触摸设备整条隐藏：没有 hover，且 `@media (pointer: coarse)` 下加宽到 18px 的滚动条会把轨道完全盖住。
+
+### 验证
+
+- `node --check public/app.js` 通过，`public/style.css` 花括号配平通过，三个文件的类名 / ID 引用对应齐全。
+- 右侧几何按像素区间核对过，结论见上（导航条 / 跳转按钮不重叠，导航条 / 滚动条有意重叠）。
+- 未实测：本机无浏览器，横条在真实长会话里的疏密观感、tooltip 与跳转按钮重叠时的视觉、以及点击跳转的落点位置都没有看过。`npm run regression` 因本机缺 `sqlite3` 仍跑不起来，且该套件不覆盖前端渲染。
+- **生效前提：本笔是纯前端改动，不需要重启服务进程**，刷新页面即可（`?v=` 已打到 `1.5.1-my.20`）。
+
 ## 分叉 v1.5.13
 
 ### 修复

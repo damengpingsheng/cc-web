@@ -15,7 +15,7 @@
       document.documentElement.dataset.theme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="style.css?v=1.5.1-my.19">
+  <link rel="stylesheet" href="style.css?v=1.5.1-my.20">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
 </head>
 <body>
@@ -106,6 +106,9 @@
             <p>开始与 Claude 对话</p>
           </div>
         </div>
+        <!-- 提问导航条：放在滚动条之前，让 thumb 拖动优先于横条点击 -->
+        <div class="msg-nav" id="msg-nav" aria-hidden="true"></div>
+        <div class="msg-nav-tip" id="msg-nav-tip" hidden></div>
         <div class="custom-scrollbar" id="custom-scrollbar">
           <div class="custom-scrollbar-thumb" id="custom-scrollbar-thumb"></div>
         </div>
@@ -162,6 +165,6 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.11/purify.min.js"></script>
-  <script src="app.js?v=1.5.1-my.19"></script>
+  <script src="app.js?v=1.5.1-my.20"></script>
 </body>
 </html>

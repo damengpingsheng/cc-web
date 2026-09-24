@@ -1248,6 +1248,81 @@ body.session-loading-active {
     right: 2px;
   }
 }
+/* === 提问导航条（右侧常显小横条，一条对应一轮用户提问） === */
+/* 轨道贴最右 16px，与 right:16px 起步的跳转按钮不重叠；
+   容器不吃指针事件，滚动条 thumb 压在上层仍可正常拖动。 */
+.msg-nav {
+  position: absolute;
+  right: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 16px;
+  pointer-events: none;
+}
+.msg-nav-tick {
+  position: absolute;
+  right: 2px;
+  width: 12px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  pointer-events: auto;
+}
+/* 命中区是透明的整块，真正的横线画在伪元素上，保证细线也好点 */
+.msg-nav-tick::after {
+  content: '';
+  display: block;
+  width: 100%;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--scrollbar-thumb);
+  opacity: 0.7;
+  transition: background 0.15s, opacity 0.15s, transform 0.15s;
+}
+.msg-nav-tick.active::after {
+  background: var(--accent);
+  opacity: 0.85;
+}
+.msg-nav-tick:hover::after {
+  background: var(--accent);
+  opacity: 1;
+  transform: scaleY(2);
+}
+.msg-nav-tip {
+  position: absolute;
+  right: 22px;
+  z-index: 8;
+  max-width: 260px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--surface-strong);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+.msg-nav-tip[hidden] { display: none; }
+.msg-nav-tip-idx {
+  color: var(--text-muted);
+  margin-right: 6px;
+}
+/* 跳转落点的短暂描边，告诉用户停在了哪一条 */
+.msg.nav-flash .msg-bubble { animation: nav-flash 0.9s ease-out; }
+@keyframes nav-flash {
+  0%, 35% { outline: 2px solid var(--accent); outline-offset: 2px; }
+  100% { outline: 2px solid transparent; outline-offset: 2px; }
+}
+/* 触摸设备没有 hover，且加宽后的滚动条会完全盖住轨道 */
+@media (pointer: coarse) {
+  .msg-nav, .msg-nav-tip { display: none; }
+}
 /* === 长会话跳转（到最前 / 到最后） === */
 /* 只显示「能去的方向」：到顶只剩向下，到底只剩向上，中间两枚都在 */
 .scroll-jump {

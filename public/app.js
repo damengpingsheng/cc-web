@@ -3518,6 +3518,7 @@
 
   function updateScrollbar() {
     updateJumpButtons();
+    updateMsgNav();
     if (!scrollbarEl || !thumbEl) return;
     const { scrollTop, scrollHeight, clientHeight } = messagesDiv;
     if (scrollHeight <= clientHeight) {
@@ -3583,6 +3584,146 @@
   document.addEventListener('mouseup', onDragEnd);
   document.addEventListener('touchend', onDragEnd);
 
+  // --- 提问导航条 ---
+  // 右侧常显小横条，一条对应一轮用户提问：悬停看提问原文，点击跳到那一轮。
+  // 横条按「内容占比」落位（minimap 语义），与 thumb 的「滚动进度」是两套坐标，不强行对齐。
+  const navEl = document.getElementById('msg-nav');
+  const navTipEl = document.getElementById('msg-nav-tip');
+  const NAV_TICK_MIN_H = 4;
+  const NAV_TICK_MAX_H = 10;
+  let navTicks = [];          // [{ el, msg, top }]，top 是缓存的 offsetTop
+  let navScrollHeight = -1;   // 上次布局时的内容高度与轨道高度，任一变化才重排
+  let navTrackHeight = -1;
+  let navRebuildTimer = 0;
+
+  // local-command 卡片和续接摘要不带 .user 类，天然不会混进提问列表
+  function msgNavLabel(msg) {
+    const text = msg.querySelector('.msg-text')?.textContent?.trim();
+    if (text) return text;
+    const attachment = msg.querySelector('.msg-attachment-label')?.textContent?.trim();
+    return attachment || '（无文本）';
+  }
+
+  function layoutMsgNav() {
+    if (!navEl || navTicks.length === 0) return;
+    const scrollH = messagesDiv.scrollHeight;
+    const trackH = navEl.clientHeight;
+    if (scrollH <= 0 || trackH <= 0) return;
+    // 提问密集时收窄命中区，避免相邻横条互相压住 hover
+    const tickH = Math.max(NAV_TICK_MIN_H, Math.min(NAV_TICK_MAX_H, trackH / navTicks.length));
+    // 先批量读 offsetTop 再批量写 style：读写交替会让每条横条各触发一次强制重排，
+    // 流式生成时 scrollHeight 每帧都在变，长会话足以卡住。
+    for (const t of navTicks) t.top = t.msg.offsetTop;
+    for (const t of navTicks) {
+      const y = (t.top / scrollH) * trackH - tickH / 2;
+      t.el.style.top = Math.max(0, Math.min(trackH - tickH, y)) + 'px';
+      t.el.style.height = tickH + 'px';
+    }
+    navScrollHeight = scrollH;
+    navTrackHeight = trackH;
+  }
+
+  // 当前视口落在哪一轮：取最后一条起点已被划过的提问，始终恰好高亮一条。
+  // 用布局时缓存的 top，避免每次滚动都读 offsetTop 触发强制重排。
+  function updateMsgNavActive() {
+    if (navTicks.length === 0) return;
+    const probe = messagesDiv.scrollTop + 4;
+    let cur = -1;
+    for (let i = 0; i < navTicks.length; i++) {
+      if (navTicks[i].top <= probe) cur = i;
+      else break;
+    }
+    navTicks.forEach((t, i) => t.el.classList.toggle('active', i === cur));
+  }
+
+  function updateMsgNav() {
+    if (!navEl) return;
+    if (messagesDiv.scrollHeight !== navScrollHeight || navEl.clientHeight !== navTrackHeight) {
+      layoutMsgNav();
+    }
+    updateMsgNavActive();
+  }
+
+  function rebuildMsgNav() {
+    if (!navEl) return;
+    const msgs = Array.from(messagesDiv.querySelectorAll('.msg.user'));
+    // 条数和节点都没变时只重排，省掉流式追加期间的反复重建
+    if (msgs.length === navTicks.length && msgs.every((m, i) => navTicks[i].msg === m)) {
+      navScrollHeight = -1;
+      updateMsgNav();
+      return;
+    }
+    hideMsgNavTip();
+    navEl.innerHTML = '';
+    navTicks = msgs.map((msg, i) => {
+      const el = document.createElement('div');
+      el.className = 'msg-nav-tick';
+      el.dataset.idx = String(i + 1);
+      navEl.appendChild(el);
+      return { el, msg, top: 0 };
+    });
+    navScrollHeight = -1;
+    updateMsgNav();
+  }
+
+  function hideMsgNavTip() {
+    if (navTipEl) navTipEl.hidden = true;
+  }
+
+  function showMsgNavTip(tick) {
+    if (!navTipEl || !navEl) return;
+    const entry = navTicks.find((t) => t.el === tick);
+    if (!entry) return;
+    navTipEl.textContent = '';
+    const idx = document.createElement('span');
+    idx.className = 'msg-nav-tip-idx';
+    idx.textContent = '#' + tick.dataset.idx;
+    navTipEl.appendChild(idx);
+    navTipEl.appendChild(document.createTextNode(msgNavLabel(entry.msg)));
+    navTipEl.hidden = false;
+    // 垂直跟随横条，并夹在消息区内，避免首尾两端的提示被截掉
+    const center = navEl.offsetTop + tick.offsetTop + tick.offsetHeight / 2;
+    const maxTop = messagesDiv.clientHeight - navTipEl.offsetHeight - 4;
+    navTipEl.style.top = Math.max(4, Math.min(maxTop, center - navTipEl.offsetHeight / 2)) + 'px';
+  }
+
+  navEl?.addEventListener('mouseover', (e) => {
+    const tick = e.target.closest?.('.msg-nav-tick');
+    if (tick) showMsgNavTip(tick);
+  });
+  navEl?.addEventListener('mouseout', (e) => {
+    if (e.target.closest?.('.msg-nav-tick')) hideMsgNavTip();
+  });
+  navEl?.addEventListener('click', (e) => {
+    const tick = e.target.closest?.('.msg-nav-tick');
+    if (!tick) return;
+    const entry = navTicks.find((t) => t.el === tick);
+    if (!entry) return;
+    // 与会话内搜索一致：只动 messagesDiv.scrollTop，scrollIntoView 会连带滚动 window 和侧栏
+    const wrapRect = messagesDiv.getBoundingClientRect();
+    const msgRect = entry.msg.getBoundingClientRect();
+    messagesDiv.scrollTop += msgRect.top - wrapRect.top - 12;
+    // scroll 事件要到下一帧才会重算，这中间若有新消息到达，scrollToBottom 会看到
+    // 旧的 stickToBottom 把人拉回底部，所以这里同步置位
+    stickToBottom = false;
+    updateScrollbar();
+    entry.msg.classList.remove('nav-flash');
+    void entry.msg.offsetWidth;   // 重启动画，连点同一条也能看到落点
+    entry.msg.classList.add('nav-flash');
+  });
+
+  // 只观察直接子节点：消息增删才需要重建，流式更新改的是气泡内部，不会触发
+  if (navEl) {
+    new MutationObserver(() => {
+      if (navRebuildTimer) return;
+      navRebuildTimer = requestAnimationFrame(() => {
+        navRebuildTimer = 0;
+        rebuildMsgNav();
+      });
+    }).observe(messagesDiv, { childList: true });
+  }
+
+  rebuildMsgNav();
   updateScrollbar();
 
 
