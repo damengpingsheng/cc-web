@@ -154,7 +154,9 @@
   const SEARCH_HIT_CAP = 2000;
   // 服务端推送的网关可用模型 / effort 列表，null 表示尚未拿到
   let modelCatalog = null;
-  let currentAgent = AGENT_LABELS[localStorage.getItem('cc-web-agent')] ? localStorage.getItem('cc-web-agent') : DEFAULT_AGENT;
+  // 优先恢复本标签页自己的选择：sessionStorage 按标签页隔离、刷新不丢、关页才清空，
+  // 刷新后不被其他标签页的切换带偏；新开标签页没有本页记录时回退到 localStorage 的全局最后一次选择。
+  let currentAgent = normalizeAgent(sessionStorage.getItem('cc-web-agent') || localStorage.getItem('cc-web-agent'));
   let currentTheme = (document.documentElement.dataset.theme || localStorage.getItem('cc-web-theme') || 'washi');
   let codexConfigCache = null;
   let loadedHistorySessionId = null;
@@ -810,11 +812,14 @@
   }
 
   function getLastSessionForAgent(agent) {
-    return localStorage.getItem(getAgentSessionStorageKey(agent));
+    // 本页记录优先（sessionStorage 按标签页隔离）：其他标签页打开同侧会话时，
+    // 不带偏本页刷新后的落点；本页无记录（新开标签页）时回退到全局最后一次打开的会话
+    return sessionStorage.getItem(getAgentSessionStorageKey(agent)) || localStorage.getItem(getAgentSessionStorageKey(agent));
   }
 
   function setLastSessionForAgent(agent, sessionId) {
     localStorage.setItem(getAgentSessionStorageKey(agent), sessionId);
+    sessionStorage.setItem(getAgentSessionStorageKey(agent), sessionId);
     localStorage.setItem('cc-web-session', sessionId);
   }
 
@@ -1294,6 +1299,8 @@
   function setCurrentAgent(agent) {
     currentAgent = normalizeAgent(agent);
     localStorage.setItem('cc-web-agent', currentAgent);
+    // 本页选择另记一份 sessionStorage，刷新时优先恢复它而非全局最后一次选择
+    sessionStorage.setItem('cc-web-agent', currentAgent);
     currentMode = localStorage.getItem(getAgentModeStorageKey(currentAgent)) || 'yolo';
     modeSelect.value = currentMode;
     updateAgentScopedUI();
@@ -3776,6 +3783,7 @@
         const doDelete = () => {
           if (getLastSessionForAgent(currentAgent) === s.id) {
             localStorage.removeItem(getAgentSessionStorageKey(currentAgent));
+            sessionStorage.removeItem(getAgentSessionStorageKey(currentAgent));
           }
           invalidateSessionCache(s.id);
           sessionGoalState.delete(s.id);

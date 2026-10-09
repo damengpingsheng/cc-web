@@ -8,6 +8,21 @@
 
 ---
 
+## 分叉 v1.5.15
+
+### 修复
+
+- **刷新后按本标签页自己的状态恢复，不再被全局「最后一次选择」带偏。**有两处状态原先都记在全局 localStorage 里，多个标签页时会互相覆盖：
+  - **界面在哪侧**：A 页停在 Claude 侧，B 页切到 Codex，回到 A 刷新就被拽到 Codex 侧。现在 `setCurrentAgent` 在写 localStorage 之外，把当前选择同时记一份 `sessionStorage`（按标签页隔离、刷新不丢、关页才清空）；初始化优先读它，新开标签页没有本页记录时才回退到 localStorage，行为不变。
+  - **刷新后落在哪个会话**：原先恢复的是该 Agent 侧「最后打开的会话」（`cc-web-session-${agent}`，全局共享），没有「默认选中第一个会话」的逻辑；单页使用时恢复的就是刷新前在看的那个（通常正是列表第一个、最近活跃的），多标签页时才会被别的页打开的会话带偏。现在 `setLastSessionForAgent` / `getLastSessionForAgent` 同样加一份 per-tab 的 `sessionStorage`，读写本页记录优先；删除会话时两处一起清。
+
+### 验证
+
+- `node --check public/app.js` 通过；全文件 `currentAgent` 赋值仅初始化与 `setCurrentAgent` 两处，`'cc-web-agent'` 读写也仅这两处，所有切换路径（agent 菜单、`resetChatView`、`applySessionSnapshot`）都经 `setCurrentAgent`，per-tab 记录不会漏。`'cc-web-session-${agent}'` 的读写只有 `getLastSessionForAgent` / `setLastSessionForAgent` / 删除清理三处，全部同步覆盖两个 storage；初始恢复链路（首连 auth → 服务端推 `session_list` → `syncViewForAgent` loadLast → `openSession`）核对过完整。
+- 未实测：本机无浏览器，双标签页互相隔离、以及新开标签页回退全局值的实际行为没有验证过。
+- 已知边界：刷新前停在「新会话」（尚未发送、还没有会话 id）时，刷新后落回本页上一个真正打开过的会话，而不是空白新会话；per-tab 记录记的是「最后打开的会话」，空白态无处可记。
+- **生效前提：纯前端改动，不需要重启服务进程**，刷新页面即可（`?v=` 已打到 `1.5.1-my.22`，顺带激活了前一笔网关选择未 bump 的前端部分）。
+
 ## 分叉 v1.5.14
 
 ### 新增
