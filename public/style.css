@@ -3051,28 +3051,49 @@ html[data-theme='coolvibe'] .settings-back:hover {
   cursor: default;
 }
 
-/* === Chat gateway label（会话头部：当前 Codex 网关；Claude 会话不显示）=== */
+/* === Chat gateway label（会话头部：当前 Codex 网关，点开即切；Claude 会话不显示）=== */
 .chat-gateway {
   appearance: none;
   font-family: inherit;
   font-size: 11px;
-  color: var(--text-muted);
-  background: var(--bg-tertiary);
-  border: none;
-  padding: 2px 8px;
-  border-radius: 6px;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-light);
+  border: 1px solid var(--border-color);
+  padding: 2px 22px 2px 10px;
+  border-radius: 999px;
   flex-shrink: 0;
   max-width: 132px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
+  position: relative;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+/* 右端小三角：跟旁边「Codex」徽标同一个位置，一眼看出是下拉而不是纯展示的标签 */
+.chat-gateway::after {
+  content: '▾';
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-48%);
+  font-size: 10px;
+  color: var(--text-secondary);
 }
 .chat-gateway:hover {
-  background: #e9e0d4;
+  border-color: var(--accent);
 }
+/* custom 模式没有二选一可选：去掉箭头、退回只读标签的样子 */
 .chat-gateway[disabled] {
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  border-color: transparent;
+  padding-right: 10px;
   cursor: default;
+}
+.chat-gateway[disabled]::after {
+  content: none;
 }
 .chat-gateway-menu {
   min-width: 190px;
