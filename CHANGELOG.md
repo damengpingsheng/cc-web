@@ -8,6 +8,29 @@
 
 ---
 
+## 分叉 v1.5.17
+
+### 新增
+
+- **会话头部（「Codex」徽标与项目路径之间）显示当前网关，徽标本身就是会话内换网关的按钮；这一项只对 Codex 会话显示。**Claude 会话不走这一项：Claude 侧只有一个全局 `ANTHROPIC_BASE_URL`，没有会话级网关可选，所以徽标对 claude 直接隐藏。
+
+  取值口径跟 spawn 逻辑对齐（`lib/agent-runtime.js` 里那个 `session.codexGateway || codexConfig.gateway`）：建会话时选过的用会话级值；老会话、从终端导入的会话没这个字段，跟着全局 `config/codex.json` 的 `gateway` 走；custom 模式既不选 apirouter 也不选 localproxy，直接打在 profile 的 `apiBase` 上，徽标改标「自定义 Profile」，tooltip 里给出 API Base。文字取「公司 apirouter」/「本地代理」两个词，跟设置面板里的选项名一致；tooltip 再补一句来源（「本会话创建时选择」/「全局配置（本会话未单独指定）」），省得会话级与全局配了两个不同值时对不上。
+
+  数据是现成的，之前只是没下发：`session.codexGateway` 在建会话时就落盘了（commit 3e445e2 那笔只把这个字段写进了会话文件，没在 UI 上露出来），只是 `session_info` 没带着它。现在服务端在新建会话、`load_session` 以及 `/clear` 回推的 `session_info` 里补上原始值，前端 `normalizeSessionSnapshot` 收进快照——这一步不能省，切会话命中本地快照缓存时也要能拿到。另外收到 `codex_config` 时重算一次，于是在设置里改全局网关，开着的会话徽标立刻跟上，不用等重新 load。
+
+  徽标同时是这个会话的换网关入口：点开是个跟旁边「Codex」徽标同款的下拉，两项就是公司 apirouter 与本地代理（当前生效的那项标「当前」）。选中即写进本会话的 `session.codexGateway`；服务端只落这一个字段、回一条 `session_gateway`，前端据此同步徽标与本地快照，不重渲染消息，也不碰 `session.updated`（配置项，不是内容变更）。切换是下一轮生效：provider 的 `-c` 覆盖挂在 exec 层，resume 轮同样吃得到（commit 6f32562 修的就是这处），而且 local 模式两种网关共用同一个 `~/.codex`，thread id 不变，中途换网关不会丢上下文。custom 模式下网关二选一不成立，徽标置灰不可点，tooltip 指路去设置里改回「本地配置」。
+
+### 验证
+
+- `node --check public/app.js`、`node --check server.js` 均通过。
+- 起临时 server（`mkdtemp` 隔离 config/sessions/logs，`CLAUDE_PATH`/`CODEX_PATH` 指向仓库 mock，随机空闲端口）过 WS 实测 `session_info`：`codex + codexGateway=localproxy` → `codexGateway=localproxy`；`codex` 不带该字段 → 回落 `apirouter`；`claude` → `''`；对 localproxy 那个会话再 `load_session` 与 `/clear`，字段都还在（`/clear` 这条不能漏：这条 payload 是回显已加载会话，漏掉会让徽标错跳回全局配置）。
+- 端到端验了「换网关真的换到 spawn 参数上」（mock codex + 同一套临时 server）：新建会话跑一轮，`process.log` 的 `process_spawn` 行不带 provider 覆盖；发 `set_session_gateway=localproxy` 后回执、会话文件都到位，再跑一轮，新的 spawn 行出现 `model_provider="localproxy"` 与 `localproxy.base_url=http://127.0.0.1:8787/v1`，且仍是 `resume`（thread id 没换）；切回 apirouter 再跑一轮，provider 覆盖消失；claude 会话发同一条指令被服务端回错拒绝。
+- 从 `public/app.js` 里按花括号切出 `updateGatewayBadge` / `syncGatewayMenu` / `closeGatewayMenu` 的真实函数体（不是抄一份），套桩 DOM 跑了 7 个分支：claude 会话 / 无会话时隐藏、会话级 localproxy、老会话回落全局 localproxy 与 apirouter、`codex_config` 还没到时的兜底、custom 模式取 profile 的 apiBase 且按钮置灰不可点，全部通过；菜单里当前生效项是否标 active 一并断言。
+- 未实测：本机无浏览器，徽标在真实 header 里的观感、以及窄屏下与「运行中」/cwd/模式选择挤在一行的表现都没看过。`npm run regression` 因本机缺 `sqlite3` 仍跑不起来，且该套件不覆盖前端渲染。
+- **生效前提：本笔含 `server.js` 改动，需要重启服务进程**（前端 `?v=` 已打到 `1.5.1-my.25`）。
+
+---
+
 ## 分叉 v1.5.16
 
 ### 修复

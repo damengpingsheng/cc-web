@@ -2979,6 +2979,9 @@ wss.on('connection', (ws, req) => {
       case 'set_mode':
         handleSetMode(ws, msg.sessionId, msg.mode);
         break;
+      case 'set_session_gateway':
+        handleSetSessionGateway(ws, msg.sessionId, msg.gateway);
+        break;
       case 'list_models':
         handleListModels(ws);
         break;
@@ -3536,6 +3539,8 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           model: sessionModelLabel(session),
           effort: session.effort || '',
           agent: getSessionAgent(session),
+          // 会话级 Codex 网关（原始值，空表示该会话未单独指定，取值口径见前端 updateGatewayBadge）
+          codexGateway: session.codexGateway || '',
           cwd: session.cwd || null,
           totalCost: session.totalCost || 0,
           totalUsage: session.totalUsage || null,
@@ -3981,6 +3986,8 @@ function handleNewSession(ws, msg) {
     model: sessionModelLabel(session),
     effort: session.effort || '',
     agent,
+    // 会话级 Codex 网关（原始值，空表示该会话未单独指定，取值口径见前端 updateGatewayBadge）
+    codexGateway: session.codexGateway || '',
     cwd: session.cwd,
     totalCost: 0,
     totalUsage: session.totalUsage,
@@ -4069,6 +4076,8 @@ function handleLoadSession(ws, sessionId) {
     model: sessionModelLabel(session),
     effort: session.effort || '',
     agent: getSessionAgent(session),
+    // 会话级 Codex 网关（原始值，空表示该会话未单独指定，取值口径见前端 updateGatewayBadge）
+    codexGateway: session.codexGateway || '',
     hasUnread: hadUnread,
     cwd: effectiveCwd,
     totalCost: session.totalCost || 0,
@@ -4242,6 +4251,18 @@ function handleDeleteSession(ws, sessionId) {
   } catch {
     wsSend(ws, { type: 'error', message: 'Failed to delete session' });
   }
+}
+
+// 会话内切网关：只改 session.codexGateway。spawn 侧本来就是「会话级优先、缺省回落全局配置」
+// 现读现用，所以下一轮（含 resume 轮）即生效，既不换 CODEX_HOME 也不动 thread id。
+// 不碰 session.updated：这是配置项不是内容变更，与 save_codex_config 同一口径。
+function handleSetSessionGateway(ws, sessionId, gateway) {
+  const session = sessionId ? loadSession(sessionId) : null;
+  if (!session) return wsSend(ws, { type: 'error', message: '会话不存在，无法切换网关' });
+  if (getSessionAgent(session) !== 'codex') return wsSend(ws, { type: 'error', message: '只有 Codex 会话支持切换网关' });
+  session.codexGateway = gateway === 'localproxy' ? 'localproxy' : 'apirouter';
+  saveSession(session);
+  wsSend(ws, { type: 'session_gateway', sessionId: session.id, codexGateway: session.codexGateway });
 }
 
 function handleRenameSession(ws, sessionId, title) {

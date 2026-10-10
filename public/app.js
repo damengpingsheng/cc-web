@@ -167,6 +167,8 @@
   let uploadingAttachments = [];
   let loginPasswordValue = ''; // store login password for force-change flow
   let currentCwd = null;
+  // 当前会话的会话级 Codex 网关原始值（空表示未单独指定，展示口径见 updateGatewayBadge）
+  let currentCodexGateway = '';
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
@@ -204,6 +206,8 @@
   const chatAgentMenu = $('#chat-agent-menu');
   const chatRuntimeState = $('#chat-runtime-state');
   const chatCwd = $('#chat-cwd');
+  const chatGateway = $('#chat-gateway');
+  const chatGatewayMenu = $('#chat-gateway-menu');
   const chatModelState = $('#chat-model-state');
   const costDisplay = $('#cost-display');
   const attachmentTray = $('#attachment-tray');
@@ -863,6 +867,7 @@
       model: payload.model || '',
       effort: payload.effort || '',
       agent: normalizeAgent(payload.agent),
+      codexGateway: payload.codexGateway || '',
       hasUnread: !!payload.hasUnread,
       cwd: payload.cwd || null,
       totalCost: typeof payload.totalCost === 'number' ? payload.totalCost : 0,
@@ -1239,6 +1244,72 @@
     chatCwd.hidden = !currentCwd || (currentSessionRunning && shouldOverlayRuntimeBadge());
   }
 
+  // 会话头部的网关徽标：只对 Codex 会话显示（Claude 走全局 ANTHROPIC_BASE_URL，没有这一项）。
+  // 取值口径与 agent-runtime 的 spawn 逻辑一致：会话级 codexGateway 优先，缺省回落全局配置的 gateway；
+  // custom 模式既不选 apirouter 也不选 localproxy，直接打在 profile 的 apiBase 上，单独标一行。
+  // 徽标本身是会话内切网关的入口：点开菜单选另一个网关，写进本会话的 session.codexGateway，
+  // 下一轮 spawn 即生效（provider 的 -c 覆盖在 exec 层，resume 轮同样吃得到，见 commit 6f32562）。
+  function updateGatewayBadge() {
+    if (!chatGateway) return;
+    // 欢迎页（没有会话）不显示，与 cwd 徽标同一口径
+    if (currentAgent !== 'codex' || !currentSessionId) {
+      chatGateway.hidden = true;
+      chatGateway.textContent = '';
+      chatGateway.title = '';
+      syncGatewayMenu('');
+      return;
+    }
+    const config = codexConfigCache || {};
+    if (config.mode === 'custom') {
+      const profile = (Array.isArray(config.profiles) ? config.profiles : [])
+        .find((item) => item && item.name === config.activeProfile) || null;
+      chatGateway.textContent = '自定义 Profile';
+      chatGateway.title = `当前网关: 自定义 Profile${profile?.name ? `（${profile.name}）` : ''}`
+        + `\nAPI Base: ${profile?.apiBase || '未设置'}`
+        + '\ncustom 模式不走公司 apirouter / 本地代理，要切网关先在设置里改回「本地配置」';
+      chatGateway.disabled = true;
+      chatGateway.hidden = false;
+      syncGatewayMenu('');
+      return;
+    }
+    // 会话级值为空 = 建会话时没有单独选过（旧会话/导入会话），跟着全局配置走
+    const sessionLevel = (currentCodexGateway === 'localproxy' || currentCodexGateway === 'apirouter')
+      ? currentCodexGateway : '';
+    const gateway = sessionLevel || (config.gateway === 'localproxy' ? 'localproxy' : 'apirouter');
+    chatGateway.textContent = gateway === 'localproxy' ? '本地代理' : '公司 apirouter';
+    chatGateway.title = `当前网关: ${gateway === 'localproxy' ? '本地代理 (127.0.0.1:8787)' : '公司 apirouter'}`
+      + `\n来源: ${sessionLevel ? '本会话创建时选择' : '全局配置（本会话未单独指定）'}`
+      + '\n点击切换（下一轮生效）';
+    chatGateway.disabled = false;
+    chatGateway.hidden = false;
+    syncGatewayMenu(gateway);
+  }
+
+  // 网关菜单只服务上面那颗徽标，状态与它同源，所以由 updateGatewayBadge 一并同步
+  function syncGatewayMenu(activeGateway) {
+    if (!chatGatewayMenu) return;
+    chatGatewayMenu.querySelectorAll('[data-gateway]').forEach((btn) => {
+      btn.classList.toggle('active', !!activeGateway && btn.dataset.gateway === activeGateway);
+    });
+    // 没有可选中的网关（claude 会话、custom 模式、欢迎页）就不留开着的一半菜单
+    if (!activeGateway) closeGatewayMenu();
+  }
+
+  function closeGatewayMenu() {
+    if (!chatGatewayMenu) return;
+    chatGatewayMenu.hidden = true;
+    if (chatGateway) chatGateway.setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleGatewayMenu() {
+    if (!chatGatewayMenu || !chatGateway || chatGateway.disabled) return;
+    const willOpen = chatGatewayMenu.hidden;
+    // 两个下拉落在同一个位置，开一个就把另一个收起来
+    if (willOpen) closeAgentMenu();
+    chatGatewayMenu.hidden = !willOpen;
+    chatGateway.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  }
+
   // 输入框左侧的模型徽标。Claude 的思考强度是独立的 currentEffort；
   // Codex 则把强度写进模型名的 (level) 后缀，这里拆出来统一渲染成「模型 · 强度」。
   function updateModelBadge() {
@@ -1294,6 +1365,7 @@
       importSessionBtn.textContent = currentAgent === 'codex' ? '导入本地 Codex 会话' : '导入本地 Claude 会话';
     }
     updateModelBadge();
+    updateGatewayBadge();
   }
 
   function setCurrentAgent(agent) {
@@ -1326,6 +1398,7 @@
     clearSessionLoading();
     setCurrentSessionRunningState(false);
     currentCwd = null;
+    currentCodexGateway = '';
     currentModel = currentAgent === 'claude' ? 'opus' : '';
     currentEffort = '';
     isGenerating = false;
@@ -1337,6 +1410,7 @@
     abortBtn.hidden = true;
     chatTitle.textContent = '新会话';
     updateCwdBadge();
+    updateGatewayBadge();
     updateModelBadge();
     messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
     setStatsDisplay(null);
@@ -1363,6 +1437,8 @@
     setStatsDisplay(snapshot);
     currentCwd = snapshot.cwd || null;
     updateCwdBadge();
+    currentCodexGateway = snapshot.codexGateway || '';
+    updateGatewayBadge();
     if (snapshot.mode && MODE_LABELS[snapshot.mode]) {
       currentMode = snapshot.mode;
       modeSelect.value = currentMode;
@@ -1978,6 +2054,17 @@
         renderSessionList();
         break;
 
+      case 'session_gateway':
+        // 服务端已把会话级网关落盘，这里只同步本地快照与徽标（不重渲染消息）
+        updateCachedSession(msg.sessionId, (snapshot) => {
+          snapshot.codexGateway = msg.codexGateway || '';
+        });
+        if (msg.sessionId === currentSessionId) {
+          currentCodexGateway = msg.codexGateway || '';
+          updateGatewayBadge();
+        }
+        break;
+
       case 'imported_messages_appended': {
         // Native CLI history grew without changing existing messages.
         const appended = Array.isArray(msg.messages) ? msg.messages : [];
@@ -2249,6 +2336,7 @@
 
       case 'codex_config':
         codexConfigCache = msg.config || null;
+        updateGatewayBadge();
         if (typeof _onCodexConfig === 'function') _onCodexConfig(msg.config);
         break;
 
@@ -4698,6 +4786,22 @@
     });
   }
 
+  if (chatGateway && chatGatewayMenu) {
+    chatGateway.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleGatewayMenu();
+    });
+    chatGatewayMenu.querySelectorAll('[data-gateway]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeGatewayMenu();
+        // 菜单里标 active 的那项就是当前生效值，点它等于没点
+        if (!currentSessionId || btn.classList.contains('active')) return;
+        send({ type: 'set_session_gateway', sessionId: currentSessionId, gateway: btn.dataset.gateway });
+      });
+    });
+  }
+
   // Split new-chat button
   newChatBtn.addEventListener('click', () => showNewSessionModal());
   newChatArrow.addEventListener('click', (e) => {
@@ -4722,6 +4826,11 @@
         !chatAgentMenu.contains(e.target) &&
         e.target !== chatAgentBtn) {
       closeAgentMenu();
+    }
+    if (chatGatewayMenu && !chatGatewayMenu.hidden &&
+        !chatGatewayMenu.contains(e.target) &&
+        e.target !== chatGateway) {
+      closeGatewayMenu();
     }
   });
   sendBtn.addEventListener('click', sendMessage);

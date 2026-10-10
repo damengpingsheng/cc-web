@@ -3021,6 +3021,33 @@ html[data-theme='coolvibe'] .settings-back:hover {
   cursor: default;
 }
 
+/* === Chat gateway label（会话头部：当前 Codex 网关；Claude 会话不显示）=== */
+.chat-gateway {
+  appearance: none;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  border: none;
+  padding: 2px 8px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  max-width: 132px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.chat-gateway:hover {
+  background: #e9e0d4;
+}
+.chat-gateway[disabled] {
+  cursor: default;
+}
+.chat-gateway-menu {
+  min-width: 190px;
+}
+
 /* === Modal Overlay === */
 .modal-overlay {
   position: fixed;
