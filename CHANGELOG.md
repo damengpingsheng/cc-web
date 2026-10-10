@@ -8,6 +8,21 @@
 
 ---
 
+## 分叉 v1.5.16
+
+### 修复
+
+- **新建会话：点目录输入框不再清空刚输入的路径。**目录列表原先有两个「整块重建」的触发器，都重建 `localView.innerHTML`：输入框一拿到焦点走一遍，行容器上的 click 再走一遍（只放过 ★/✕）。重建时预设行的值重新取自 localStorage 的 pinned/recent 列表，自定义行是新建的空 input，于是刚输入的路径、以及手动改过的预设路径都会被打回去；重建后又对新建节点调 `focus()`，新节点上挂着同样的 focus 处理器，还会递归重建直到 `RangeError: Maximum call stack size exceeded`。
+
+  现在新增 `applyLocalSelection()`：只按 `selectedLocalIndex` 同步行高亮（边框/背景）与 `.ns-cwd-radio` 的选中态，不碰输入框节点；focus 与行 click 两处改调它，未提交的输入原地保留。★ 固定 / ✕ 移除仍走 `renderLocalView()` 重建（列表内容真的变了，该重建），同时删掉重建后 `freshInput.focus()` + `setSelectionRange()` 那段只为重建后光标服务的补偿代码。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 把 `showNewSessionModal` 的真实函数体切出来在 jsdom 里跑：自定义目录输入后聚焦，值保留、节点未替换、无 `RangeError`（改前是空值 + 栈溢出），选中态正确落到自定义行；预设行改值后聚焦值保留；点行只切高亮、不丢输入；点预设行创建 → `cwd=/dir/a`，输入自定义目录创建 → `cwd=/tmp/mydir2`；★/✕ 仍正常更新 pinned/recent，重建后高亮也对。
+- 未实测：本机没有可用浏览器（Playwright 在 ubuntu 20.04 上不支持 chromium），真机点击未手验；`npm run regression` 因本机缺 `sqlite3` 跑不起来。
+- **生效前提：纯前端改动，不需要重启服务进程**，刷新页面即可（`?v=` 已打到 `1.5.1-my.23`）。
+
 ## 分叉 v1.5.15
 
 ### 修复

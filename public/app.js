@@ -6272,7 +6272,7 @@
         row.addEventListener('click', (e) => {
           if (e.target.closest('.ns-pin-btn') || e.target.closest('.ns-del-dir-btn')) return;
           selectedLocalIndex = Number(row.dataset.localRow);
-          renderLocalView();
+          applyLocalSelection();
         });
       });
 
@@ -6281,13 +6281,7 @@
           const row = input.closest('[data-local-row]');
           if (!row) return;
           selectedLocalIndex = Number(row.dataset.localRow);
-          renderLocalView();
-          const freshInput = localView.querySelector(row.dataset.localRow === String(filledDirs.length) ? '#ns-cwd-custom' : `.ns-cwd-item[data-idx="${row.dataset.localRow}"]`);
-          if (freshInput) {
-            const val = freshInput.value;
-            freshInput.focus();
-            if (typeof freshInput.setSelectionRange === 'function') freshInput.setSelectionRange(val.length, val.length);
-          }
+          applyLocalSelection();
         });
       });
 
@@ -6320,6 +6314,17 @@
           if (selectedLocalIndex > 0) selectedLocalIndex -= 1;
           renderLocalView();
         });
+      });
+    }
+
+    // 仅同步选中态（高亮 + radio），不重建 DOM，避免打断正在编辑的输入框
+    function applyLocalSelection() {
+      localView.querySelectorAll('[data-local-row]').forEach(row => {
+        const isSelected = Number(row.dataset.localRow) === selectedLocalIndex;
+        row.style.border = '1px solid ' + (isSelected ? 'var(--accent)' : 'transparent');
+        row.style.background = isSelected ? 'var(--accent-dim,rgba(100,150,255,0.08))' : 'transparent';
+        const radio = row.querySelector('.ns-cwd-radio');
+        if (radio) radio.checked = isSelected;
       });
     }
 
