@@ -4105,6 +4105,7 @@
         for (const s of ungrouped) sessionList.appendChild(buildSessionItem(s));
       }
     }
+    highlightCurrentGroupHeader();
   }
 
   function startEditSessionTitle(itemEl, session) {
@@ -4149,6 +4150,20 @@
   function highlightActiveSession() {
     document.querySelectorAll('.session-item').forEach((el) => {
       el.classList.toggle('active', el.dataset.id === currentSessionId);
+    });
+    highlightCurrentGroupHeader();
+  }
+
+  // 当前会话所在的分组被折叠时，会话条目根本没渲染，列表里没有 active 项可定位，
+  // 于是把高亮补到组头上；分组展开着（能看到 active 条目）就不高亮，免得重复两处。
+  function highlightCurrentGroupHeader() {
+    const meta = sessions.find((s) => s.id === currentSessionId) || null;
+    // 只认当前 agent 的会话，跟 getVisibleSessions 同一口径（会话不属于列表时不亮）
+    const activeGroupKey = meta && normalizeAgent(meta.agent) === currentAgent ? (meta.group || '') : null;
+    sessionList.querySelectorAll('.session-group-header').forEach((header) => {
+      const groupKey = header.dataset.groupId || '';
+      header.classList.toggle('session-group-current',
+        activeGroupKey !== null && groupKey === activeGroupKey && collapsedGroups.has(groupKey));
     });
   }
 

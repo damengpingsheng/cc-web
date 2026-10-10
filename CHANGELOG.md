@@ -8,6 +8,23 @@
 
 ---
 
+## 分叉 v1.5.18
+
+### 新增
+
+- **当前会话落在已折叠的分组里时，组头高亮，方便一眼看出会话在哪个分组；分组展开着（列表里能看到那条 active 会话）就不高亮。**收起的分组不渲染组内会话，列表里没有 `active` 条目可以定位，所以把高亮补到 `.session-group-header` 上（`highlightCurrentGroupHeader()`），只在「该组正是当前会话所在组」且「该组已折叠」时加 `.session-group-current`；展开态照旧只靠会话条目的 `active`，不重复标两处。高亮跟着 `renderSessionList()` 和 `highlightActiveSession()` 一起走，收起/展开、切会话、切 agent 都会即时刷新。
+
+  底色不能直接铺在组头盒子上：组头的 `padding` 是「上 10 / 下 4」的偏心值（下面那 4px 是跟首个会话条目之间的间隔），直接铺底色，方框中线会比组名高 3px。中途试过用下移 3px 的实心 `box-shadow` 冒充底色，结果只剩盒子外面那 3px 一条边——外层阴影画在盒子内部的那部分在用户环境里没被画出来（同一份 CSS 里换成 `background` 就正常显示），所以最终改成：给方框腾一个 3px 的透明上边框，底色只画 padding box（`background-clip: padding-box`），方框整体下移 3px、上下各留 7px；上边框撑高的 3px 由 `padding-top` 10→7 抵消（行内文字位置不动），方框下移多出的 3px 由 `margin-bottom: -3px` 抵掉（下方元素一个没挪）。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 用桩 DOM 把 `highlightCurrentGroupHeader()` 的真实函数体切出来跑了分支：当前会话在折叠组 / 在展开组 / 在未分组且未分组段折叠 / 当前会话属于另一个 agent / 无当前会话，断言 `.session-group-current` 只落在该落的那一个组头上。
+- 又从 `public/app.js` 里按花括号切出 `renderSessionList` / `buildGroupHeader` / `buildSessionItem` / `toggleGroupCollapse` / `highlightCurrentGroupHeader` / `getVisibleSessions` 的真实函数体，套桩 DOM 走完整链路：展开态当前会话不高亮 → 点组头折叠 → 该组头拿到 `.session-group-current` → 再展开 → 高亮摘掉 → 折叠别的组不高亮 → 未分组段折叠只亮未分组段头 → 切会话后重算，全部通过（意思是「手动折叠后没高亮」是渲染问题，不是 class 没加上）。
+- 未实测：真实浏览器里的观感（`--accent-light` 底色 + 组名/箭头取 `--accent`，两套主题各自取色；方框下沿比组头盒子低 3px，落在与首个会话条目之间的那段间隔里，若下方正好有 hover/active 的会话条目会把那 3px 盖住）。纯前端改动，不需要重启服务进程（`?v=` 已打到 `1.5.1-my.28`）。
+
+---
+
 ## 分叉 v1.5.17
 
 ### 新增

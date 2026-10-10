@@ -792,6 +792,25 @@ body.session-loading-active {
   outline: 1px dashed var(--accent);
   outline-offset: -1px;
 }
+/* 当前会话所在分组被折叠：组头亮一下，好定位会话在哪个分组（展开时不高亮）。
+   组头的 padding 是「上 10 / 下 4」的偏心值（下面那 4px 是跟首个会话条目之间的间隔），
+   底色直接铺在盒子上，方框中线会比组名高 3px。所以给方框腾一个 3px 的透明上边框，
+   底色只画 padding box（background-clip: padding-box），方框整体下移 3px、上下各留 7px：
+   - 上边框撑高的 3px 由 padding-top 10→7 抵消，行内文字位置一点没动；
+   - 方框下移多出的 3px 由 margin-bottom: -3px 抵掉，下方元素也一个没挪。
+   （别改回 box-shadow：外层阴影落在盒子内部的那部分在有些环境里不画，只剩盒子外面一条边。） */
+.session-group-header.session-group-current {
+  background: var(--accent-light);
+  background-clip: padding-box;
+  border-top: 3px solid transparent;
+  padding-top: 7px;
+  padding-bottom: 7px;
+  margin-bottom: -3px;
+}
+.session-group-header.session-group-current .session-group-name,
+.session-group-header.session-group-current .session-group-toggle {
+  color: var(--accent);
+}
 .session-group-name {
   flex: 1;
   min-width: 0;
