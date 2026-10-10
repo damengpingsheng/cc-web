@@ -1975,6 +1975,11 @@
 
       case 'session_info':
         const snapshot = normalizeSessionSnapshot(msg);
+        // 服务端在 load_session 里已经把这条会话磁盘上的 hasUnread 清了，但它不回推
+        // session_list，而侧栏红点读的是本地 sessions：不在这里跟着灭，红点就会一直挂到
+        // 下一次列表刷新（别的会话跑完 / 改名归组 / 刷新页面）。snapshot.hasUnread 是清除前
+        // 的值，只用来弹「后台任务已完成」，不动它。
+        markSessionReadLocally(msg.sessionId);
         // 断线补齐前置判定：applySessionSnapshot 会改写 currentSessionId / isGenerating / pendingText，
         // 先按调用前状态捕获「本次快照是否保留流式」（条件与 applySessionSnapshot 内 preserveStreaming 同源）
         const snapshotKeepsStreaming = !!(msg.sessionId === currentSessionId && msg.isRunning && isGenerating);
@@ -4068,6 +4073,15 @@
       while (groups.some((g) => g.name === `分组${n}`)) n++;
       send({ type: 'group_create', name: `分组${n}` });
     });
+  }
+
+  // 打开会话时把本地 sessions 里那条 hasUnread 抹掉（服务端那份在 load_session 里已经清了，
+  // 见 case 'session_info'）。只动这一条，不重排、不动别的字段；数组按现有写法整体重建，
+  // 免得和 session_list 到达时的整体替换搅在一起。
+  function markSessionReadLocally(sessionId) {
+    if (!sessionId) return;
+    if (!sessions.some((s) => s.id === sessionId && s.hasUnread)) return;
+    sessions = sessions.map((s) => (s.id === sessionId ? { ...s, hasUnread: false } : s));
   }
 
   function renderSessionList() {

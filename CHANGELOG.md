@@ -8,6 +8,23 @@
 
 ---
 
+## 分叉 v1.5.20
+
+### 修复
+
+- **打开会话后，侧栏那枚未读红点现在会立刻灭掉，不用再等下一次列表刷新。**红点在服务端只有一个置位点（`server.js:2533`，任务收尾时该任务的输出没人挂着），也只在 `handleLoadSession` 里清除——但它清的是磁盘上那份，且这个分支没跟着推 `session_list`（新建/删除/改名/归组/任务收尾/重连都有推，只有它没有）。前端侧栏读的是本地 `sessions`，那份只在 `session_list` 到达时整体替换，于是「切过去读了，红点还在」，一直挂到下一次列表刷新（别的会话跑完、改名归组、刷新页面、标签页切回来）才消失；顺带还让 `getSessionCacheDisposition` 在这期间给不出 `strong`（`hasUnread` 是排除项），那段时间每次点开这条会话都要走一次完整 `load_session`。
+
+  改法在前端：`case 'session_info'` 里收到服务端快照后调用新增的 `markSessionReadLocally(msg.sessionId)`，把本地 `sessions` 里这一条的 `hasUnread` 抹掉，随后 `applySessionSnapshot` 里的 `renderSessionList()` 就把它渲染掉。选 `session_info` 这个入口是因为它等价于「服务端已经清过了」的确认信号（`handleLoadSession` 先清盘再回这个包），不存在「本地灭早了、下次刷新又冒出来」的窗口；传进去的 `snapshot.hasUnread` 是清除前抓的副本，仍然照原样拿去弹「后台任务已完成」toast，不受影响。函数只改命中的那一条（整数组按现有写法重建，其余字段原样带过去），当前会话不在列表里、或那条已经没有未读时直接原样返回。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 桩 DOM 另跑一轮（切出 `renderSessionList` / `buildSessionItem` / `markGroupsWithUnreadSessions` / `markSessionReadLocally` 等真实函数体）：读掉 s1 后只有 s1 的条目红点消失、s3/s4 保留；折叠态下它所在分组组头的红点同步消失、别的分组与未分组段不受影响；逐个读掉后未分组段那枚仍在；重复读同一条（已无未读）数组引用原样返回不重建；读一个不在列表里的 id 不报错、其他条目一个不动，全部通过。
+- 同一次改动没有碰上一笔的分组徽标：`markGroupsWithRunningSessions` / `markGroupsWithUnreadSessions` 那 12 条断言重跑仍全 PASS。
+- 未实测：真实浏览器里红点消失的即时观感（这台机器没有可用浏览器）。纯前端改动，不需要重启服务进程（`?v=` 已打到 `1.5.1-my.31`）。
+
+---
+
 ## 分叉 v1.5.19
 
 ### 新增
