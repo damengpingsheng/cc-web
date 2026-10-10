@@ -830,6 +830,17 @@ body.session-loading-active {
   border-radius: 999px;
   padding: 1px 7px;
 }
+/* 折叠的分组里有会话在跑时组头那枚「运行中」：复用会话条目那枚的配色和呼吸点，
+   只把内边距/边框压到跟旁边计数徽标同一档（都是 10px 字 + 上下 1px），组头高度不变。 */
+.session-group-header .session-item-status {
+  padding: 1px 7px;
+  border: none;
+}
+/* 折叠的分组里有未读时组头那枚红点：同样复用条目那枚，只去掉它靠右时留的 4px margin，
+   跟组头里其他元素一样只吃 gap，两枚徽标并排时间距均匀。 */
+.session-group-header .session-unread-dot {
+  margin-left: 0;
+}
 .session-group-actions {
   display: none;
   gap: 2px;

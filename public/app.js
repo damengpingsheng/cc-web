@@ -4106,6 +4106,8 @@
       }
     }
     highlightCurrentGroupHeader();
+    markGroupsWithRunningSessions();
+    markGroupsWithUnreadSessions();
   }
 
   function startEditSessionTitle(itemEl, session) {
@@ -4164,6 +4166,40 @@
       const groupKey = header.dataset.groupId || '';
       header.classList.toggle('session-group-current',
         activeGroupKey !== null && groupKey === activeGroupKey && collapsedGroups.has(groupKey));
+    });
+  }
+
+  // 折叠的分组里若有会话在跑，组头也挂一枚「运行中」：组内条目被收起来了，
+  // 不标就完全看不出这里面还有任务在跑。展开态不标（条目自己带，标了是重复）。
+  function markGroupsWithRunningSessions() {
+    const runningKeys = new Set();
+    for (const s of getVisibleSessions()) {
+      if (s.isRunning) runningKeys.add(s.group || '');
+    }
+    sessionList.querySelectorAll('.session-group-header').forEach((header) => {
+      const groupKey = header.dataset.groupId || '';
+      if (!collapsedGroups.has(groupKey) || !runningKeys.has(groupKey)) return;
+      const running = document.createElement('span');
+      // 复用会话条目那枚「运行中」的配色与呼吸点（见 css 里 .session-group-header 下的覆盖）
+      running.className = 'session-group-running session-item-status';
+      running.textContent = '运行中';
+      header.insertBefore(running, header.querySelector('.session-group-count'));
+    });
+  }
+
+  // 同理：折叠的分组里有未读会话，组头挂一枚红点（复用条目那枚 .session-unread-dot）。
+  // 展开态不标——条目自己带红点；插在「运行中」之后、计数徽标之前，两枚同时出现时顺序稳定。
+  function markGroupsWithUnreadSessions() {
+    const unreadKeys = new Set();
+    for (const s of getVisibleSessions()) {
+      if (s.hasUnread) unreadKeys.add(s.group || '');
+    }
+    sessionList.querySelectorAll('.session-group-header').forEach((header) => {
+      const groupKey = header.dataset.groupId || '';
+      if (!collapsedGroups.has(groupKey) || !unreadKeys.has(groupKey)) return;
+      const dot = document.createElement('span');
+      dot.className = 'session-group-unread session-unread-dot';
+      header.insertBefore(dot, header.querySelector('.session-group-count'));
     });
   }
 

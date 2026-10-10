@@ -8,6 +8,24 @@
 
 ---
 
+## 分叉 v1.5.19
+
+### 新增
+
+- **折叠起来的分组里若有会话在跑 / 有未读，组头也挂上对应标记。**组内条目被收起来了，不标就完全看不出里面还有任务在跑、还有没读的东西；展开态不标——条目自己就带「运行中」和红点，标了是重复。
+
+  两枚标记分别由挂在 `renderSessionList()` 末尾的 `markGroupsWithRunningSessions()` 和 `markGroupsWithUnreadSessions()` 插上：按当前 agent 的可见会话算出「哪些分组键里有 `isRunning` / `hasUnread`」（含 `''`=未分组段），只给已折叠且命中的组头插一个 `span`——「运行中」复用条目那枚 `.session-item-status`，红点直接复用条目那枚 `.session-unread-dot`，都插在计数徽标之前（两枚同时出现时顺序是「运行中」→ 红点 → 计数）。展开、切 agent、折叠/展开、任务起停与未读变化（`session_list` 到达即重渲染）都会即时跟上；数据是现成的，渲染时算一次就够，不需要额外的定时刷新。
+
+  样式只在 `.session-group-header` 下覆盖两处：「运行中」的 `padding` 压到 `1px 7px`、去掉那 1px 边框，让它跟旁边的计数徽标同为「10px 字 + 上下 1px」的一档，徽标出现/消失不会把组头顶高或压扁（避免又出现上次那种几像素的错位）；红点去掉它贴右时留的那 4px `margin-left`，跟组头里其他元素一样只吃 `gap`。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 从 `public/app.js` 里按花括号切出 `renderSessionList` / `buildGroupHeader` / `buildSessionItem` / `toggleGroupCollapse` / `highlightCurrentGroupHeader` / `markGroupsWithRunningSessions` / `markGroupsWithUnreadSessions` / `getVisibleSessions` 的真实函数体，套桩 DOM 走完整链路：折叠组里有运行中的会话 → 该组头插上「运行中」且位置在计数徽标之前；折叠组里有未读会话 → 插上红点；同一组两样都有 → 顺序是「运行中」→ 红点 → 计数；同样情况展开 → 都不插；折叠组里既没在跑也没未读 → 不插；命中的会话属于另一个 agent → 不插；未分组段折叠且里面有会话在跑/未读 → 未分组段头插上；点组头折叠/展开即时增删；`hasUnread` 由 true 转 false 后红点消失；上一笔「当前分组高亮」未被破坏，全部通过。
+- 未实测：真实浏览器里的观感（呼吸点动画、与组名/计数徽标挤在一行时的疏密）。纯前端改动，不需要重启服务进程（`?v=` 已打到 `1.5.1-my.30`）。
+
+---
+
 ## 分叉 v1.5.18
 
 ### 新增
