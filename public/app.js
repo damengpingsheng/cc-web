@@ -3848,7 +3848,7 @@
     ` : '';
     item.innerHTML = `
       <div class="session-item-main">
-        <span class="session-item-title">${escapeHtml(s.title || 'Untitled')}</span>
+        <span class="session-item-title" title="${escapeHtml(s.title || 'Untitled')}">${escapeHtml(s.title || 'Untitled')}</span>
         ${s.isRunning ? '<span class="session-item-status">运行中</span>' : ''}
       </div>
       ${s.hasUnread ? '<span class="session-unread-dot"></span>' : ''}
@@ -4150,6 +4150,7 @@
       // Restore
       const span = document.createElement('span');
       span.className = 'session-item-title';
+      span.title = newTitle;
       span.textContent = newTitle;
       input.replaceWith(span);
       if (actions) actions.style.display = '';

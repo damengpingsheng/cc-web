@@ -8,6 +8,23 @@
 
 ---
 
+## 分叉 v1.5.22
+
+### 新增
+
+- **侧栏会话标题悬停可看完整标题。**标题落在 `.session-item-title` 上，`flex: 1` 加 `text-overflow: ellipsis`，长标题在 280px 侧栏里只剩前半截，改名和辨识都得靠点进去看。
+
+  改法走原生 `title`：`<span class="session-item-title">` 上补一个 `title`，值就是 `escapeHtml(s.title || 'Untitled')`——跟同一段模板里 Claude 会话 ID 那行（`.session-item-claude-id`）用的同一套写法，也走同一个 `escapeHtml`（它已经把 `"` 转成 `&quot;`），标题里带引号或尖括号不会把属性提前截断。原生 tooltip 只在悬停时弹出，不进布局，`text-overflow: ellipsis` 的截断观感不变；非截断的短标题悬停也会弹一次，内容与标题完全一致，不构成干扰。
+
+  改名后的临时回填（`startEditSessionTitle` 的 `save()` 里重建 span）同步设 `span.title = newTitle`，避免刚改完名字、服务端广播新列表之前那一小段时间里 tooltip 还是旧标题。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 未实测：本机没有可用浏览器，未在真实侧栏里 hover 过。**纯前端改动，不需要重启服务进程**，刷新页面即可（`?v=` 已打到 `1.5.1-my.33`）。
+
+---
+
 ## 分叉 v1.5.21
 
 ### 修复
