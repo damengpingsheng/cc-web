@@ -8,6 +8,28 @@
 
 ---
 
+## 分叉 v1.5.23
+
+### 新增
+
+- **Codex 侧会话列表也显示会话 id 和复制按钮，跟 Claude 侧一致。**侧栏每个会话项标题下方那行 CLI 侧 session id 之前只有 Claude 会话有：`buildSessionItem` 按 `normalizeAgent(s.agent) === 'claude'` 取 `s.claudeSessionId`，Codex 会话走的是另一套 `codexThreadId`，所以一直是空的 —— 想拿 Codex 的 rollout thread id 得回 `~/.codex/sessions` 自己找。
+
+  服务端 `sendSessionList` 的列表摘要之前只挑出 `claudeSessionId` 一个 id 字段（侧栏只需要几个字段，全量解析会话 JSON 太慢，走的是 mtime+size 缓存），这里补上 `codexThreadId`。缓存键没变，agent-runtime 写入新 thread id 会改会话文件 mtime，缓存自然失效重解析。
+
+  前端新增一段独立的 `codexIdRow`（不动原有 `claudeIdRow`）：同样是标题下方一整行，同样 hover 才露出复制按钮，宽度/折行那套排布直接复用 `.session-item-claude-id` 的样式，只多挂一个 `.session-item-codex-id` 便于区分。未拿到 thread id 的新会话（首轮跑完前）不渲染这一行，与 Claude 侧行为一致。
+
+  点击委托里新增 Codex 分支，**必须放在 Claude 分支之前**：Codex 那枚按钮为了复用定位/显隐样式也挂了 `.session-item-claude-id-copy`，顺序反了会先命中 Claude 分支，把空的 `claudeSessionId` 复制走、还弹一句「Claude 会话 ID 已复制」。代码里对这一条留了注释。
+
+### 验证
+
+- `node --check public/app.js` / `node --check server.js` 通过。
+- `npm run regression` 全绿（含导入/删除、模式切换保 thread id 等 Codex 相关场景）。本机没有 `sqlite3` CLI，临时用了一个转发到 python3 `sqlite3` 模块的 shim（只在 /tmp，未进仓库）才跑起来。
+- 临时起了一个隔离实例读 `session_list`：Codex 会话摘要带上了 `codexThreadId`、Claude 会话带 `claudeSessionId`、未跑过的 Codex 会话为空串。
+- 从 `public/app.js` 抽出 `buildSessionItem` 在最小 DOM stub 里实跑：三种会话的渲染、以及两枚复制按钮在「两个 class 同时命中」时的取值与提示文案都符合预期。
+- 未实测：本机没有可用浏览器，真实侧栏里 Codex 那行的观感没看过。**这次动了 `server.js`，需要重启服务进程才生效**（新字段进的是 `session_list` 摘要缓存）；重启后强刷页面（`?v=` 已打到 `1.5.1-my.34`）。
+
+---
+
 ## 分叉 v1.5.22
 
 ### 新增

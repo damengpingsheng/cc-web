@@ -1772,6 +1772,9 @@ function sendSessionList(ws) {
             // CLI 侧的真实 session id（侧栏每个会话项的标题下方展示）。每轮任务 done 后
             // 本函数都会重推，所以 resume 换了 id 前端也能跟上。
             claudeSessionId: s.claudeSessionId || '',
+            // Codex 侧同理：~/.codex/sessions 下 rollout jsonl 的文件名（codex thread id），
+            // 侧栏 Codex 会话项的标题下方展示这一行。
+            codexThreadId: s.codexThreadId || '',
           };
           sessionSummaryCache.set(f, { mtimeMs: stat.mtimeMs, size: stat.size, summary });
         }

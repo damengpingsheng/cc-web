@@ -3834,7 +3834,7 @@
     item.draggable = true;
     // 标题下方补一行 CLI 侧的 session id（不是 cc-web 自己的会话 id），拿它才能去
     // ~/.claude/projects 下定位 jsonl。新建会话在首轮跑完前服务端还没拿到 id，
-    // Codex 会话用的是另一套 codexThreadId，两种情况都不渲染这一行。
+    // Codex 会话用的是另一套 codexThreadId（见下面的 codexIdRow），两种情况都不渲染这一行。
     // id 文本自己不拦点击（点到它照样切会话，这一行紧贴标题，误触率太高），
     // 复制走右端 hover 才露出的小按钮，与 ✎/⧉/× 那排的交互一致。
     const claudeId = normalizeAgent(s.agent) === 'claude' ? (s.claudeSessionId || '') : '';
@@ -3842,6 +3842,18 @@
       <div class="session-item-claude-id" title="Claude 会话 ID ${escapeHtml(claudeId)}">
         <span class="session-item-claude-id-value">${escapeHtml(claudeId)}</span>
         <button type="button" class="session-item-claude-id-copy" title="复制 Claude 会话 ID" aria-label="复制 Claude 会话 ID">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.6" y="5.6" width="8" height="8" rx="1.6"/><path d="M10.4 3.4H3.4a1 1 0 0 0-1 1v7"/></svg>
+        </button>
+      </div>
+    ` : '';
+    // Codex 侧同款一行：展示 Codex 自己的 thread id（~/.codex/sessions 下 rollout jsonl 的
+    // 文件名），Codex 会话没有 claudeSessionId。宽度/折行那套排布和上面那行完全一致，所以
+    // 直接复用 .session-item-claude-id 的样式，只多挂一个 .session-item-codex-id 便于区分。
+    const codexId = normalizeAgent(s.agent) === 'codex' ? (s.codexThreadId || '') : '';
+    const codexIdRow = codexId ? `
+      <div class="session-item-claude-id session-item-codex-id" title="Codex 会话 ID ${escapeHtml(codexId)}">
+        <span class="session-item-claude-id-value">${escapeHtml(codexId)}</span>
+        <button type="button" class="session-item-claude-id-copy session-item-codex-id-copy" title="复制 Codex 会话 ID" aria-label="复制 Codex 会话 ID">
           <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.6" y="5.6" width="8" height="8" rx="1.6"/><path d="M10.4 3.4H3.4a1 1 0 0 0-1 1v7"/></svg>
         </button>
       </div>
@@ -3859,10 +3871,21 @@
         <button class="session-item-btn delete" title="删除">×</button>
       </div>
       ${claudeIdRow}
+      ${codexIdRow}
     `;
 
     item.addEventListener('click', (e) => {
       const target = e.target;
+      // Codex 那枚按钮为了复用定位/显隐样式也挂了 .session-item-claude-id-copy，
+      // 所以必须先判它：调换顺序会让 Codex 会话去复制空的 claudeSessionId。
+      if (target.classList.contains('session-item-codex-id-copy')) {
+        // 只复制，不切会话（copyTextToClipboard 内含非 secure context 的 execCommand 降级）
+        e.stopPropagation();
+        copyTextToClipboard(codexId).then((ok) => {
+          showToast(ok ? 'Codex 会话 ID 已复制' : '复制失败，请手动选中');
+        });
+        return;
+      }
       if (target.classList.contains('session-item-claude-id-copy')) {
         // 只复制，不切会话（copyTextToClipboard 内含非 secure context 的 execCommand 降级）
         e.stopPropagation();
