@@ -1703,6 +1703,20 @@
   };
   marked.setOptions({ renderer, breaks: true, gfm: true });
 
+  // marked 的内联 del 规则是 /^(~~?)(?=[^\s~])([\s\S]*?[^\s~])\1(?=[^~]|$)/，`~~?` 里的
+  // 第二个 `?` 让单个 `~` 也算删除线定界符（GFM 规范只认 `~~`），于是正文里成对出现的
+  // 半角区间写法（57~58、900~1793）会被配对，中间一整段被划掉。这里收窄成只认 `~~`。
+  // 不匹配时必须返回 undefined：marked 的 tokenizer 扩展只在返回 false 时才回落到默认实现。
+  marked.use({
+    tokenizer: {
+      del(src) {
+        const match = /^(~~)(?=[^\s~])([\s\S]*?[^\s~])\1(?=[^~]|$)/.exec(src);
+        if (!match) return;
+        return { type: 'del', raw: match[0], text: match[2], tokens: this.lexer.inlineTokens(match[2]) };
+      },
+    },
+  });
+
   // navigator.clipboard 只在 secure context（https / localhost）下存在。内网 http://IP:PORT
   // 访问时它是 undefined，直接 .writeText 会抛 TypeError —— 降级到 execCommand('copy')。
   // 必须留在 click 的同步调用栈里，execCommand 脱离用户手势就会被浏览器拒掉。
