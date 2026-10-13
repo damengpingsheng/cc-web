@@ -2388,6 +2388,12 @@
           // Task completed for current session — clear generating state without reloading
           // (reloading would trigger scrollToBottom and interrupt user reading)
           finishGenerating(msg.sessionId);
+          // 但能收到这条的前提是本连接不是 entry.ws：服务端在 broadcastBackgroundDone 里跳过
+          // 发起端，只发给其余连接（server.js 的 broadcastBackgroundDone）。也就是说这一轮的
+          // text_delta 我们一条都没收到，上面那句只负责封口，界面会永久停在残缺/空白，只能靠
+          // 手动刷新页面把历史拉回来。所以这里再走一遍 session_list 兜底用的那条静默补同步：
+          // 非阻塞、不弹遮罩，拿到完整历史后按正常收尾渲染。
+          beginSessionSwitch(msg.sessionId, { blocking: false, force: true });
         } else {
           // Task completed for background session — update cache + refresh session list
           updateCachedSession(msg.sessionId, (snapshot) => { snapshot.isRunning = false; });

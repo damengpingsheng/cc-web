@@ -8,6 +8,42 @@
 
 ---
 
+## 分叉 v1.5.26
+
+### 修复
+
+- **多标签页 / 多设备旁观同一个会话时，任务跑完不再停在残缺或空白的内容上，不需要手动刷新页面。**现象：A 页正看着某个会话，B 页在同一个会话里发起一轮；B 页正常流式出字、正常收尾，A 页从头到尾一个字都不动，卡在上一轮的旧内容（若 A 页是刚打开的空视图，就一直空白），只有手动刷新把历史拉回来才看得到结果。
+
+  根因是「流式推送」和「跑完通知」走了两条不同的通道。`text_delta` / `tool_start` / `tool_end` 只推给 `entry.ws`（当前挂在这个进程上的那一条连接），`done` 也只发给 `entry.ws`（`server.js:2585`）。A 页这条连接不是 `entry.ws`，所以本轮一条 delta 都收不到；它能收到的只有 `background_done` —— 而这条恰恰是「跳过发起端」发出去的（`server.js:2588` 的 `broadcastBackgroundDone(sessionId, entry, entry.ws)`，只发给除 `entry.ws` 以外的连接，函数体在 `server.js:2415`）。前端在 `background_done` 命中当前会话时只调用 `finishGenerating()` 封口（`public/app.js:2378` 起），不重新拉历史：气泡本来就是空的，于是永久停在空 / 残缺状态。刷新页面能救回来，是因为刷新走 `load_session`，那条路径会做完整的 `session_history` 回放。
+
+  改法是在 `background_done` 命中当前会话时，紧跟 `finishGenerating()` 之后补一条既有的静默补同步（`public/app.js:2396`，新增 6 行、未改动任何已有行）：
+
+  ```js
+  beginSessionSwitch(msg.sessionId, { blocking: false, force: true });
+  ```
+
+  这是 `session_list` 兜底那条同款调用（`public/app.js:1977`，那里的注释写着「服务端确认 isRunning 从 true→false 且前端仍在生成态，说明 done/background_done 因 WS detach 漏掉了」）——非阻塞、不弹遮罩，拿到完整历史后按正常收尾渲染。能走到这一支，就说明本连接不是发起端、必然漏了本轮 delta，所以不需要再额外判断是否 `entry.ws`。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 真浏览器 A/B（playwright + headless firefox，本仓库首次有可跑的浏览器实测）。从当前 `HEAD` 起一份干净副本当对照组，使两边差异只剩这笔 6 行；两条腿各跑一遍两标签页场景——① B 页建会话、跑一轮 `WARMUP`；② A 页打开同一会话（此刻没有进程在跑，A 一定不是 `entry.ws`，且已看到 WARMUP 内容）；③ B 页发第二条，mock 分 6 块、每块 400ms 吐字，最后补一句 `E2E_FINAL_ANSWER`；④ A / B 两页各读 `#messages` 的文本：
+
+  | 观测 | HEAD（改前） | 改后 |
+  |---|---|---|
+  | A 页看到 WARMUP 内容 | ✓ | ✓ |
+  | 运行中 A 页收到 `CHUNK_1` | ✗ | ✗ |
+  | 运行中 B 页收到 `CHUNK_1` | ✓ | ✓ |
+  | 跑完 B 页有 `E2E_FINAL_ANSWER` | ✓ | ✓ |
+  | **跑完 A 页（全程未刷新）有 `E2E_FINAL_ANSWER`** | **✗** | **✓** |
+  | 跑完 A 页 6 块 `CHUNK_1..6` 齐全 | ✗ | ✓ |
+
+  两条腿两个页面都没有 `pageerror`，改后 A 页输入框保持可用。
+- 未实测：只覆盖了「A 页停在底部空白 / 残缺」这一支；`beginSessionSwitch` 里「用户往上滚读旧消息时会被带到最新」的分支没造场景验证——行为与既有的 `session_list` 兜底完全一致（同一函数、同一参数），风险不变。
+- 纯前端改动（`public/app.js` 新增 6 行 + `public/index.html` 的 `?v=` 由 `1.5.1-my.36` 打到 `1.5.1-my.37`），**不需要重启服务进程**，刷新页面即可生效。
+
+---
+
 ## 分叉 v1.5.25
 
 ### 修复
