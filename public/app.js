@@ -2561,6 +2561,7 @@
     // 和气泡末尾那个撞成两串点（resume_generating 带空 text 时就会踩到）。
     textDiv.innerHTML = pendingText ? renderMarkdown(pendingText) : '';
     decorateCodeBlocks(textDiv);
+    streamEl._ccRawText = pendingText || '';
     scrollToBottom();
   }
 
@@ -2601,6 +2602,62 @@
     el.className = 'msg-time';
     setMsgTimeText(el, date);
     return el;
+  }
+
+  // 气泡外侧悬停操作条的图标（内联 SVG + currentColor，配色跟随主题）。
+  // 纯装饰，语义由按钮的 title / aria-label 承担。
+  const MSG_ICON_COPY = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+  const MSG_ICON_EDIT = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>';
+  const MSG_ICON_CHECK = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>';
+
+  // 气泡外侧的悬停操作条（复制，user 消息额外有编辑）。复制取原始文本
+  // （assistant 是 markdown 源文本，user 是输入原文），而不是渲染后的 innerText ——
+  // 否则代码块围栏、列表符号会在复制时丢失。原始文本挂在元素上，流式刷新时同步更新。
+  function attachMsgActions(div, role, content, beforeEl) {
+    div._ccRawText = typeof content === 'string' ? content : '';
+
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'msg-action-btn';
+    copyBtn.innerHTML = MSG_ICON_COPY;
+    copyBtn.title = '复制';
+    copyBtn.setAttribute('aria-label', '复制这条消息');
+    copyBtn.addEventListener('click', () => {
+      const text = div._ccRawText || '';
+      if (!text) return;
+      copyTextToClipboard(text).then((ok) => {
+        copyBtn.innerHTML = ok ? MSG_ICON_CHECK : MSG_ICON_COPY;
+        copyBtn.classList.toggle('copied', ok);
+        copyBtn.classList.toggle('failed', !ok);
+        setTimeout(() => {
+          copyBtn.innerHTML = MSG_ICON_COPY;
+          copyBtn.classList.remove('copied', 'failed');
+        }, 1500);
+      });
+    });
+    actions.appendChild(copyBtn);
+
+    if (role === 'user') {
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'msg-action-btn';
+      editBtn.innerHTML = MSG_ICON_EDIT;
+      editBtn.title = '编辑';
+      editBtn.setAttribute('aria-label', '把这条输入放回输入框重新编辑');
+      editBtn.addEventListener('click', () => {
+        msgInput.value = div._ccRawText || '';
+        autoResize();
+        msgInput.focus();
+        const end = msgInput.value.length;
+        msgInput.setSelectionRange(end, end);
+      });
+      actions.appendChild(editBtn);
+    }
+
+    div.insertBefore(actions, beforeEl || null);
   }
 
   function createMsgElement(role, content, attachments = [], timestamp = null) {
@@ -2651,6 +2708,7 @@
     div.appendChild(bubble);
     const time = buildMsgTimeElement(timestamp);
     if (time) div.appendChild(time);
+    if (role === 'user' || role === 'assistant') attachMsgActions(div, role, content, time);
     return div;
   }
 
@@ -2975,7 +3033,7 @@
   // 在文本节点上包 <mark>，命中落在折叠区内时自动展开祖先。
   // 只切分/还原文本节点，绝不碰 innerHTML —— 否则 decorateCodeBlocks 注入的
   // Copy / Preview 按钮的事件监听会被一起打掉。
-  const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search, .msg-time';
+  const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search, .msg-time, .msg-actions';
 
   function collectSearchTextNodes() {
     const walker = document.createTreeWalker(messagesDiv, NodeFilter.SHOW_TEXT, {

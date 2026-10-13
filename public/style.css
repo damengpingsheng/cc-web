@@ -1606,6 +1606,51 @@ mark.search-hit.current {
   user-select: none;
 }
 
+/* 悬停操作条：复制（user 消息另有编辑）。默认透明且不接收点击，悬停/聚焦时显现。 */
+.msg-actions {
+  align-self: flex-end;
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  padding-bottom: 3px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* 触屏设备没有 hover，直接常显，否则按钮永远点不到 */
+@media (hover: none) {
+  .msg-actions { opacity: 1; pointer-events: auto; }
+}
+.msg-action-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  padding: 5px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.msg-action-btn svg { display: block; }
+.msg-action-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+.msg-action-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* 复制成功/失败各闪 1.5s（图标已换成对勾 / 保留原图标） */
+.msg-action-btn.copied { color: var(--success); border-color: var(--success); }
+.msg-action-btn.failed { color: var(--danger); border-color: var(--danger); }
+
 /* 本地命令卡片：不是对话，所以不走左右分栏的气泡样式，整行铺开单独呈现 */
 .msg.local-command {
   align-self: stretch;

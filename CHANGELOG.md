@@ -8,6 +8,38 @@
 
 ---
 
+## 分叉 v1.5.27
+
+### 新功能
+
+- **每条对话气泡加上悬停操作条：agent 回复可一键复制，用户输入可复制或放回输入框编辑。**参考桌面版 agent 客户端的交互——鼠标移到某条消息上，气泡外侧（assistant 在右、user 在左）浮出图标按钮（不占文字）：所有 assistant / user 消息都有一个复制图标，user 消息另有一个铅笔图标；文案由 `title` / `aria-label` 承担，悬停可看到「复制 / 编辑」。复制取的是**原始文本**（assistant 是 markdown 源文本，user 是输入原文），不是渲染后的 `innerText`——否则代码块围栏、`**加粗**`、列表符号会在复制时丢失；复制成功图标换成对勾并染成主题绿 1.5s，失败则染红。点编辑图标把该条输入原文写回输入框、自动调整高度并聚焦，光标停在末尾等待修改，原气泡保持不动。
+
+  实现集中在三处：新增 `attachMsgActions()`（`public/app.js:2616` 起）在 `createMsgElement` 构建气泡时挂上按钮，三个内联 SVG 图标（复制 / 铅笔 / 对勾，`currentColor` 跟随主题）定义在函数上方，原始文本挂在元素 `_ccRawText` 上；流式回复的文本边流边变，`flushRender`（`public/app.js:2564`）每次同步刷新这个字段，所以进行中的 assistant 气泡也能复制到当前全文；`SEARCH_SKIP_SELECTOR`（`public/app.js:3036`）补上 `.msg-actions`，注入的 UI 文案不会被会话内搜索命中。按钮样式在 `public/style.css`（`.msg-actions` / `.msg-action-btn`）：默认透明且 `pointer-events:none`，`:hover` 或 `:focus-within` 时显现；`@media (hover: none)` 下常显，保证触屏也能点到。tool 调用卡片、本地命令卡片、系统消息不带操作条。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 真浏览器实测（playwright + headless firefox，本地静态托管 `public/`，用假 WebSocket 灌入 `session_info` 历史 + `text_delta`，并把 `navigator.clipboard.writeText` 换成记录函数来断言复制内容）：
+
+  | 观测 | 结果 |
+  |---|---|
+  | user 消息按钮 | 2 个图标（复制 + 编辑） |
+  | assistant 消息按钮 | 1 个图标（复制） |
+  | 复制 assistant（含代码块） | 得到 markdown 源文本 `你好，这是 **markdown**。\n\n```js\nconsole.log(1)\n``` ` |
+  | 复制 user（含 `**`） | 得到原文 `第一行\n第二行 **加粗**文本` |
+  | 复制成功反馈 | 图标短暂换成对勾并加 `.copied`（主题绿），1.5s 后复原 |
+  | 点编辑图标 | `#msg-input` 值 = 该条原文，`document.activeElement` 为 `#msg-input`，高度自动调整 |
+  | 流式 assistant 气泡复制 | 得到累积全文 `流式第一段 第二段` |
+  | hover 行为（`ui.primaryPointerCapabilities=6`） | 移开鼠标 `opacity:0 / pointer-events:none`，悬停 `opacity:1 / pointer-events:auto` |
+  | 触屏分支（`hover:none`） | 操作条常显，按钮可点 |
+  | 会话内搜索 | 搜 `markdown` 命中 `1/1`；图标按钮不产生可搜索文本 |
+  | 边界：带图 user 消息复制 / 编辑 | 只带文本，不含附件；仅工具调用的空 assistant 消息点复制无异常 |
+  | `pageerror` | 全程为空 |
+
+- 纯前端改动（`public/app.js` 新增 `attachMsgActions` + `flushRender` 补 1 行同步 + `SEARCH_SKIP_SELECTOR` 补 1 项，`public/style.css` 新增操作条样式，`public/index.html` 的 `?v=` 由 `1.5.1-my.37` 打到 `1.5.1-my.39`），**不需要重启服务进程**，刷新页面即可生效。
+
+---
+
 ## 分叉 v1.5.26
 
 ### 修复
