@@ -3979,6 +3979,13 @@ function handleNewSession(ws, msg) {
     remoteCwd: taskMode === 'remote' ? remoteCwd : '',
   };
   saveSession(session);
+  // 摘掉本 ws 在旧进程上的挂载，语义与 handleLoadSession 的那段完全一致：
+  // 缺了它，新建空白会话时旧会话的 text_delta/tool_* 会继续推到这个 ws，
+  // 新会话会显示别的会话的流式内容，并被置成生成态导致消息发不出去。
+  for (const [, entry] of activeProcesses) {
+    if (entry.ws === ws) entry.ws = null;
+  }
+  stopImportedSync(ws);
   wsSessionMap.set(ws, id);
   wsSend(ws, {
     type: 'session_info',

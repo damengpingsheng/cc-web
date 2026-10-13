@@ -27,6 +27,29 @@
 
 ---
 
+## 分叉 v1.5.24
+
+### 修复
+
+- **新建空白会话时，正在运行的旧会话的流式输出不再串进来，输入框里的内容也不再被「正在生成」状态吃掉。**`handleNewSession` 只做了 `wsSessionMap.set(ws, id)`，漏了 `handleLoadSession` 开头那段「把本 ws 从旧进程上摘下来」（`server.js:4064`）。于是「看着某个正在跑的会话 → 点新建会话」时，旧进程的 `entry.ws` 仍然指着这个连接：`text_delta` / `tool_start` / `tool_end` 继续推过来，而前端这几个 case 是按「ws 上的流就是当前会话」渲染的（消息体里也没带 `sessionId`，见 `lib/agent-runtime.js:449`），空白新会话就显示成了旧会话的内容；同时第一个 `text_delta` 触发前端 `startGenerating()`，把 `isGenerating` 置真、发送按钮换成停止按钮，而 `sendMessage()` 第一行就是 `if (isGenerating) return`，于是消息发不出去。来回切会话能恢复，是因为切换走 `load_session`/`detach_view`，那两条路径本来就会摘挂载——但每次切回时还在管道里的 delta 会再次把新会话置成生成态，所以要靠反复切。
+
+  改法就地照抄 `handleLoadSession` 的同名逻辑（新增 6 行，未改动任何已有行）：`saveSession(session)` 之后、`wsSessionMap.set(ws, id)` 之前，把本 ws 从所有 `activeProcesses` entry 上摘掉，再 `stopImportedSync(ws)`。旧会话就此转入既有的后台语义（跑完走 `hasUnread` 红点 + `background_done` 通知），与手动切到别的会话完全一致，不需要新增任何机制。
+
+### 验证
+
+- `node --check server.js` 通过。
+- `npm run regression` 全绿。本机没有 `sqlite3` CLI，仍用转发到 python3 `sqlite3` 模块的临时 shim（只在 /tmp，未进仓库）。
+- 隔离 A/B：把 `HEAD` 版和改动版各起一个隔离实例（独立 PORT/CONFIG/SESSIONS/LOGS/HOME，`CLAUDE_PATH` 指向一个每 300ms 吐一块文本的慢速 mock），同一个驱动跑两遍——① 建会话并让它开跑，② 在它还在跑时再 `new_session` 建一个空白会话，③ 统计空白会话在「没有提问」的那 3.5s 窗口里收到多少条旧会话的 `text_delta`：
+
+  | | 旧版 | 改动后 |
+  |---|---|---|
+  | 空白会话收到的旧会话 delta | 11 条（每 300ms 一条，实测值） | 0 条 |
+
+  改动后空白会话再发第一条消息能正常起进程、正常流式回包（同一驱动里那 5 条 delta 是它自己那轮的回复，不是旧会话的）。
+- 未实测：「点发送发不上去」这一步是纯前端 `isGenerating` 门控（`public/app.js:4684`），裸 WebSocket 驱动复现不了，只能靠代码路径推断；本机也没有可用浏览器验证真实观感。**这次动了 `server.js`，需要重启服务进程才生效**；前端一行没动，不需要 bump `?v=`，也不用刷页面。
+
+---
+
 ## 分叉 v1.5.23
 
 ### 新增
