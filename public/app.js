@@ -152,7 +152,9 @@
   let searchIndex = -1;
   let searchTerm = '';
   let searchRescanTimer = null;
+  let searchInputTimer = null;
   const SEARCH_HIT_CAP = 2000;
+  const SEARCH_INPUT_DEBOUNCE = 120;
   // 服务端推送的网关可用模型 / effort 列表，null 表示尚未拿到
   let modelCatalog = null;
   // 优先恢复本标签页自己的选择：sessionStorage 按标签页隔离、刷新不丢、关页才清空，
@@ -3283,6 +3285,7 @@
   function closeMsgSearch() {
     if (!searchBar || searchBar.hidden) return;
     clearTimeout(searchRescanTimer);
+    clearTimeout(searchInputTimer);
     clearSearchHighlights();
     searchTerm = '';
     searchBar.hidden = true;
@@ -3291,13 +3294,30 @@
   }
 
   if (searchBar && searchInput) {
-    searchInput.addEventListener('input', () => runSearch(searchInput.value));
+    // 命中上千个时「清高亮 + 重扫 + 重建 <mark>」一圈实测约 65ms（其中样式与布局约 45ms），
+    // 逐键跑会让输入明显掉帧，所以输入防抖：停手 120ms 再搜一次。
+    // 跳转前必须先把待执行的那次结算掉，否则会拿着上一个词的命中列表跳。
+    const flushSearchInput = () => {
+      if (!searchInputTimer) return;
+      clearTimeout(searchInputTimer);
+      searchInputTimer = null;
+      runSearch(searchInput.value);
+    };
+    searchInput.addEventListener('input', () => {
+      clearTimeout(searchInputTimer);
+      searchInputTimer = setTimeout(() => {
+        searchInputTimer = null;
+        runSearch(searchInput.value);
+      }, SEARCH_INPUT_DEBOUNCE);
+    });
     searchInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
+        flushSearchInput();
         stepSearchHit(e.shiftKey ? -1 : 1);
       } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault();
+        flushSearchInput();
         stepSearchHit(e.key === 'ArrowDown' ? 1 : -1);
       } else if (e.key === 'Escape') {
         e.preventDefault();
@@ -3305,8 +3325,8 @@
         closeMsgSearch();
       }
     });
-    $('#msg-search-prev').addEventListener('click', () => stepSearchHit(-1));
-    $('#msg-search-next').addEventListener('click', () => stepSearchHit(1));
+    $('#msg-search-prev').addEventListener('click', () => { flushSearchInput(); stepSearchHit(-1); });
+    $('#msg-search-next').addEventListener('click', () => { flushSearchInput(); stepSearchHit(1); });
     $('#msg-search-close').addEventListener('click', closeMsgSearch);
   }
 

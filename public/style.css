@@ -24,7 +24,7 @@
   --info: #5b7ea1;                 /* 縹色 blue-gray */
   --scrollbar-thumb: #c9baa9;
   --scrollbar-track: transparent;
-  --search-hit-bg: #ffe066;        /* 会话内搜索：普通命中 */
+  --search-hit-bg: #ffd83d;        /* 会话内搜索：普通命中 */
   --search-hit-current-bg: #ff9f1a;/* 会话内搜索：当前命中 */
   --search-hit-current-ring: #8f4300;
   --search-hit-current-glow: rgba(255, 159, 26, 0.35);
@@ -1483,6 +1483,8 @@ mark.search-hit {
   color: inherit;
   border-radius: 2px;
   padding: 0 1px;
+  /* 内嵌细描边：密排的命中之间不会互相叠，浅底气泡上也有清晰的两个边 */
+  box-shadow: inset 0 0 0 1px rgba(160, 104, 0, 0.45);
 }
 mark.search-hit.current {
   background: var(--search-hit-current-bg);

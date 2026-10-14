@@ -8,6 +8,47 @@
 
 ---
 
+## 分叉 v1.5.31
+
+### 修改
+
+- **普通命中再加强一档：底色 `#ffe066` → `#ffd83d`，并加一条内嵌 1px 描边。**v1.5.30 那版把普通命中调实过一次，但在长会话里仍然偏淡：命中落在 `#fff9f2` 的助手气泡上，黄底和暖白背景的明度差不够，「一眼扫出命中的位置」还是吃力。这一版换成更饱和的高亮黄，再加 `box-shadow: inset 0 0 0 1px rgba(160, 104, 0, 0.45)`（[public/style.css:27](/home/huxiaojie/Tools/cc-web-my/public/style.css:27)、[public/style.css:1481](/home/huxiaojie/Tools/cc-web-my/public/style.css:1481)）。描边用 `inset` 而不是外描边，是因为命中密排时外描边会互相叠、糊成一片；下划线方案（`text-decoration-thickness: 2px`）在密集正文里也偏弱，都试过截图对比后弃用。当前命中保持 v1.5.30 的样子不变（2px 深棕描边 + 5px 光晕 + `search-hit-pop`），因为实测它对性能没有可测影响（见下）。
+
+- **会话内搜索的输入框加 120ms 防抖，跳转前先把待执行的那次搜索结算掉。**起因是实测发现「命中多时搜索卡」的根因不在渲染而在搜索本身：一圈搜索（清高亮 + 重扫 + 重建 `<mark>` + 首次强制布局）在顶到 `SEARCH_HIT_CAP = 2000` 命中时要 61~67ms，其中样式重算 + 布局占 42~50ms —— 平均每个 `<mark>` 三四十微秒，成本几乎全在新建元素引发的样式/布局，跟底色、描边无关（同样一份 DOM 搜一个不命中的词只要 1~3ms）。而 `searchInput` 的 `input` 处理器原来是无防抖的 `runSearch(searchInput.value)`（[public/app.js:3294](/home/huxiaojie/Tools/cc-web-my/public/app.js:3294) 一带），逐键跑整圈：模拟逐字符输入 `android` 累计 508ms（每键约 72ms，等于每敲一下卡四五帧）。
+
+  改法：`input` 改成 120ms 防抖（新增 `SEARCH_INPUT_DEBOUNCE`，与 `SEARCH_HIT_CAP` 同处声明），命中列表只在停手后重建一次；防抖期间按回车 / Shift+回车 / 上下方向键 / 「‹」「›」按钮时，先用新增的 `flushSearchInput()` 把待执行的那次立刻跑掉再跳转，否则会拿着上一个词的命中列表跳（这与改之前的行为一致：改之前 input 事件已经先跑过一遍搜索了）。`closeMsgSearch()` 里在原有 `clearTimeout(searchRescanTimer)` 旁边补了一行 `clearTimeout(searchInputTimer)`，避免「输入后马上 Esc 关掉搜索、120ms 后又补一刀高亮」。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 防抖时序：把 `public/app.js` 里真实的 `let searchInputTimer` / `const SEARCH_INPUT_DEBOUNCE` / `closeMsgSearch()` / `if (searchBar && searchInput) {…}` 用花括号切出来，套桩 DOM（记录 `runSearch` / `stepSearchHit` 调用序列）跑 6 个分支，全部 PASS（脚本 `/tmp/search-hit-check/debounce-check.js`，不在仓库内）：
+
+  | 分支 | 结果 |
+  |---|---|
+  | 连敲三下（`a`→`an`→`and`） | 防抖期内 0 次搜索，停手后 1 次，用的是 `and` |
+  | 输入后立刻回车 | 调用序为 `runSearch('android')` → `stepSearchHit(1)`（先搜后跳） |
+  | 输入后立刻 Shift+回车 | `runSearch('android')` → `stepSearchHit(-1)` |
+  | 停手后（无待执行搜索）回车 | `runSearch` 仍是 1 次，不重复扫描 |
+  | 输入后立刻 Esc | `runSearch` 0 次、`closeMsgSearch` 已跑、搜索条已隐藏 |
+  | 输入后立刻点「›」 | 先搜后跳，方向为 +1 |
+
+- 性能 A/B（playwright-core 1.36 + 缓存里的 firefox-1419 headless，本地静态页引真实 `public/style.css`，复刻 `app.js` 的同一套搜索算法，300 条消息 / 2000 命中，两组交替跑三轮取中位；脚本 `/tmp/search-hit-check/perf.js`、`perf-normal.js`，不在仓库内）：
+
+  | 观测 | 结果 |
+  |---|---|
+  | 一圈搜索（2000 命中） | 61~68ms（clear 12 + 包 mark 8~11 + 布局 42~50）|
+  | 同样 DOM 搜不命中的词 | 1~3ms |
+  | 逐字符输入 `android`（7 次 input） | 改前 508ms → 防抖后一次约 65ms |
+  | 普通命中加描边前 / 后 | 一圈 68.0ms / 66.0ms（布局同为 45ms），全页截图代理 122ms / 113ms → 无回归 |
+  | 当前命中的 3 种样式（描边+光晕+动画 / 只有描边 / 只有底色）帧间隔 | 16.64 / 16.66 / 16.66ms，900 命中 DOM 下无差异 |
+
+- 真浏览器 computed style（三套主题）：普通命中 `rgb(255, 216, 61)` + `rgba(160, 104, 0, 0.45) 0 0 0 1px inset`；当前命中仍是 `rgb(255, 159, 26)` + 2px 深棕描边 + 光晕 + `search-hit-pop`，截图确认助手气泡 / 用户气泡 / 行内代码 / 深色代码块四种落点都清楚，`pageerror` 全程为空。
+- 未实测：真实 cc-web 页面里连续打字的实际手感（本机起服务要密码，只做了静态渲染与桩 DOM 时序）；防抖 120ms 意味着高亮比按键晚约 0.12s 出现，若嫌迟钝可调小 `SEARCH_INPUT_DEBOUNCE`。
+- 纯前端改动（`public/style.css` 改 1 个色值 + 1 条 `box-shadow`，`public/app.js` 新增 2 个声明 + 1 个 `flushSearchInput` + 3 处 `flushSearchInput()` 调用，`public/index.html` 的 `?v=` 由 `1.5.1-my.41` 打到 `1.5.1-my.42`），**不需要重启服务进程**，刷新页面即可生效。
+
+---
+
+
 ## 分叉 v1.5.30
 
 ### 修改
