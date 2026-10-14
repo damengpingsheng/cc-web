@@ -3597,6 +3597,12 @@
 
     const details = createToolCallElement(toolUseId, tool, done);
 
+    // 本轮卡片按 toolUseId 直接记账（存在 activeToolCalls 的条目上，随本轮结束一起清）。
+    // DOM id 不能当身份用：Codex 的 item id 每轮从 item_0 重新计数，与页面上早先轮次
+    // 同 id 的卡片重名，getElementById 只会命中最早那张，本轮卡片就永远停在 Running。
+    const record = activeToolCalls.get(toolUseId);
+    if (record) record.el = details;
+
     // 折叠策略：只维护唯一一个 .tool-group 父节点
     // 散落的 .tool-call 直接子节点达到3个时，将它们全部移入父节点；之后继续散落，再达3个再移入
     const FOLD_AT = 3;
@@ -3632,7 +3638,9 @@
   }
 
   function updateToolCall(toolUseId, result) {
-    const el = document.getElementById(`tool-${toolUseId}`);
+    // 优先用本轮 appendToolCall 记下的元素；DOM id 在 Codex 会话里会跨轮重名，只能兜底
+    const record = activeToolCalls.get(toolUseId);
+    const el = (record && record.el) || document.getElementById(`tool-${toolUseId}`);
     if (!el) return;
     const tool = activeToolCalls.get(toolUseId) || {
       id: toolUseId,

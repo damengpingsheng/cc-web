@@ -8,6 +8,37 @@
 
 ---
 
+## 分叉 v1.5.32
+
+### 修复
+
+- **Codex 会话里本轮的工具卡片不再停在 `Running` 等到刷新才变 `Done`。**现象：一轮 agent 回复已经结束，但卡片（最常见的是本轮第一张 reasoning 卡片）仍显示灰点闪烁的 `Running`，刷新页面后全部变成 `Done`。根因在前端用 DOM id 当卡片身份：每张卡片都带 `id="tool-<toolUseId>"`（[public/app.js:3563](/home/huxiaojie/Tools/cc-web-my/public/app.js:3559)），`tool_end` 更新时走 `document.getElementById('tool-' + toolUseId)`，而该方法按规范只返回**文档序第一张**同名卡片。Claude 的 tool id 是 `toolu_*` UUID，跨轮唯一，所以一直没暴露；Codex 的 item id 每轮进程从 `item_0` 重新计数（本机 20 个 Codex 会话实测，几乎每轮首条都是 `item_0`），于是本轮卡片与页面上早先轮次的卡片重名，`tool_end` 更新到了旧卡片，**本轮那张永远是 `Running`**。刷新之所以「治好」它，是因为历史重建走 `buildMsgElement()`，第三个参数把 `done` 写死成 `true`（[public/app.js:3008](/home/huxiaojie/Tools/cc-web-my/public/app.js:3008)），与内存里的真实状态无关。
+
+  修法是给卡片记一份本轮的直接引用，两处、共 4 行：`appendToolCall` 建完元素后在 `activeToolCalls` 的条目上记一份（[public/app.js:3603](/home/huxiaojie/Tools/cc-web-my/public/app.js:3603)），`updateToolCall` 优先用它、`getElementById` 降级为兜底（[public/app.js:3642](/home/huxiaojie/Tools/cc-web-my/public/app.js:3642)）。没有改卡片 id、没有动折叠策略与收尾逻辑；引用挂在现有 `activeToolCalls` 条目上，随 `startGenerating` / `finishGenerating` 既有的 `activeToolCalls.clear()` 一起清，不新增需要维护的生命周期。`goal_feedback` 封口气泡（只摘 `streaming-msg`、不清 `activeToolCalls`）之后到达的 `tool_end` 也因此仍能落到正确卡片上——这条路径以前会走 DOM 兜底、有可能误命中旧卡片。
+
+  遗留（本笔未改）：超出 `MAX_TOOL_CALLS = 200` 之后，`ensureCodexToolCall` 仍会对存不下的 item 照发 `tool_start`（[lib/agent-runtime.js:361](/home/huxiaojie/Tools/cc-web-my/lib/agent-runtime.js:361)），于是 `item.started` + `item.completed` 会给同一个 id 发两次 `tool_start`，多出来的那张卡片没有任何 `tool_end` 认领，仍会停在 `Running`（合成 205 条 reasoning + 1 条命令实测：`tool_start 207 / tool_end 206`）。要修得动服务端，留待后续。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 用 jsdom（真实 DOM 语义）加载**未做改动的公共脚本入口** `public/index.html` + `public/app.js`，只把 `WebSocket` / `ResizeObserver` / `marked` / `DOMPurify` / `hljs` 换成桩，按 Codex 的真实事件序列灌入两轮（每轮 `tool_start` → `tool_end`，两轮 id 都为 `item_0` / `item_2`），比较卡片状态（脚本 `/tmp/ccweb-dom/drive.js`，不在仓库内）：
+
+  | 观测 | 改之前 | 改之后 |
+  |---|---|---|
+  | 第 1 轮两张卡片 | `Done` / `Exit 0` | `Done` / `Exit 0`（未破坏） |
+  | 第 2 轮 reasoning 卡片 | `Running`（错） | `Done` |
+  | 第 2 轮命令卡片 | `Running`（错） | `Exit 0` |
+
+  同一序列的「先加载带历史的会话、再发一条消息」版本（`/tmp/ccweb-dom/drive-history.js`）结果一致：改之前本轮两张卡片都停在 `Running`，改之后都正确收尾。jsdom 的 `getElementById` 行为已单独核对为「返回文档序第一张」，与浏览器一致。
+
+- 边界（`/tmp/ccweb-dom/edge.js`）：没有本轮 `tool_start` 的孤儿 `tool_end`（走 DOM 兜底，不抛错、不误改状态）通过；`tool_start` → `goal_feedback` 封口 → `tool_end` 的状态为 `Exit 0`（落在正确卡片）通过；`resume_generating` 重放两张卡片后补 `tool_end`，结果为 `Done` / `Exit 0` 且未影响更早的卡片，通过。
+
+- 未实测：真实浏览器内的观感（本机无浏览器；动的是纯 DOM 查找路径，jsdom 已覆盖）。
+- **纯前端改动，不需要重启 cc-web 服务进程**；`public/app.js` 变了，`public/index.html` 的两个 `?v=` 已一起从 `my.42` 打到 `my.43`。
+
+---
+
+
 ## 分叉 v1.5.31
 
 ### 修改
