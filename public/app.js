@@ -4533,6 +4533,68 @@
   }
   setSidebarCollapsed(sidebarCollapsed);
 
+  // --- 会话列宽度拖拽 ---
+  // 桌面端按住列右边缘左右拖动改宽度：宽度只写 :root 的 --sidebar-width
+  // （列宽和收起动画的 padding-left 都读这个变量），再存 localStorage，刷新后保持。
+  // 移动端侧栏是抽屉，手柄由 CSS 隐藏。
+  const SIDEBAR_WIDTH_KEY = 'cc-web-sidebar-width';
+  const SIDEBAR_WIDTH_MIN = 200;
+  const SIDEBAR_WIDTH_MAX = 900;
+  const sidebarResizer = $('#sidebar-resizer');
+
+  function clampSidebarWidth(px) {
+    // 上限跟着窗口收：聊天区至少留 360px
+    const viewportMax = Math.max(SIDEBAR_WIDTH_MIN, window.innerWidth - 360);
+    return Math.round(Math.min(SIDEBAR_WIDTH_MAX, viewportMax, Math.max(SIDEBAR_WIDTH_MIN, px)));
+  }
+
+  function applySidebarWidth(px, persist) {
+    const width = clampSidebarWidth(px);
+    document.documentElement.style.setProperty('--sidebar-width', width + 'px');
+    if (persist) localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width));
+    return width;
+  }
+
+  // 只有存过宽度才动样式：没存过就沿用主题里的默认值
+  const savedSidebarWidth = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+  if (savedSidebarWidth > 0) applySidebarWidth(savedSidebarWidth, false);
+
+  if (sidebarResizer) {
+    let resizing = false;
+    let resizeStartX = 0;
+    let resizeStartWidth = 0;
+
+    function onResizeMove(e) {
+      if (!resizing) return;
+      applySidebarWidth(resizeStartWidth + (e.clientX - resizeStartX), true);
+      e.preventDefault();
+    }
+
+    function onResizeEnd() {
+      if (!resizing) return;
+      resizing = false;
+      sidebarResizer.classList.remove('dragging');
+      document.body.classList.remove('sidebar-resizing');
+      window.removeEventListener('pointermove', onResizeMove);
+      window.removeEventListener('pointerup', onResizeEnd);
+      window.removeEventListener('pointercancel', onResizeEnd);
+    }
+
+    sidebarResizer.addEventListener('pointerdown', (e) => {
+      if ((e.pointerType === 'mouse' && e.button !== 0) || app.classList.contains('sidebar-collapsed')) return;
+      resizing = true;
+      resizeStartX = e.clientX;
+      resizeStartWidth = sidebar.getBoundingClientRect().width;
+      sidebarResizer.classList.add('dragging');
+      document.body.classList.add('sidebar-resizing');
+      // 监听挂在 window 上：拖到列外、甚至拖出窗口也跟得住
+      window.addEventListener('pointermove', onResizeMove);
+      window.addEventListener('pointerup', onResizeEnd);
+      window.addEventListener('pointercancel', onResizeEnd);
+      e.preventDefault();
+    });
+  }
+
   function openSidebar() {
     sidebar.classList.add('open');
     sidebarOverlay.hidden = false;

@@ -8,6 +8,54 @@
 
 ---
 
+## 分叉 v1.5.33
+
+### 新增
+
+- **会话列右边缘可拖动调宽。**`#sidebar` 末尾加了一个 6px 宽的手柄（`#sidebar-resizer`，[public/index.html:56](/home/huxiaojie/Tools/cc-web-my/public/index.html:56)），按住左右拖动即改会话列宽度。宽度只写 `:root` 的 `--sidebar-width`（[public/app.js:4552](/home/huxiaojie/Tools/cc-web-my/public/app.js:4552)）：列宽本身、桌面端收起动画期间撑位置的 `padding-left` 全都读这一个变量（[public/style.css:559](/home/huxiaojie/Tools/cc-web-my/public/style.css:559)、[public/style.css:969](/home/huxiaojie/Tools/cc-web-my/public/style.css:969)），所以没引入新的布局状态，也没动 `setSidebarCollapsed()` 那套收放逻辑。松手宽度落进 localStorage（`cc-web-sidebar-width`），刷新后恢复；范围 200~560px，窗口窄时上限再跟着收，保证聊天区至少 360px。手柄平时透明，悬停/拖动时亮一条 `--accent-light`，拖动期间整页切 `col-resize` 光标并关掉文字选择（`body.sidebar-resizing`，[public/style.css:592](/home/huxiaojie/Tools/cc-web-my/public/style.css:592)）。收起态（`.app.sidebar-collapsed`）与移动端抽屉（`max-width: 768px`）都把手柄隐藏，并给移动端侧栏补了 `max-width: 86vw`，免得桌面端拖出来的大宽度带到手机上撑破视口。
+
+  事件用 pointer 系列挂在 `window` 上（[public/app.js:4583](/home/huxiaojie/Tools/cc-web-my/public/app.js:4583)），拖出列外、拖出窗口也跟得住；`.sidebar` 只多了一行 `position: relative` 给手柄定位，其余原有规则一字未改。
+
+  移动端那条宽度上限必须带 `min-width: 0`（[public/style.css:597](/home/huxiaojie/Tools/cc-web-my/public/style.css:597)）：基础规则里的 `.sidebar { min-width: var(--sidebar-width) }` 优先级高于 `max-width`，只写 `max-width: 86vw` 实测无效——420px 视口下抽屉仍是 560px 宽，撑出屏幕。
+
+  上限最后定在 900px（`SIDEBAR_WIDTH_MAX`，[public/app.js:4542](/home/huxiaojie/Tools/cc-web-my/public/app.js:4542)）：初版按 560px 出，试过之后嫌太窄，改成 900px；窗口不够宽时仍按「聊天区至少 360px」再往下收，所以 1280px 视口实际能拉到 900px（聊天区剩 380px），1024px 视口拉到 664px。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- jsdom 加载**未改动的公共脚本入口** `public/index.html` + `public/app.js`（只把 `WebSocket` / `ResizeObserver` / `marked` / `DOMPurify` / `hljs` 换桩，`getBoundingClientRect` 按当前 `--sidebar-width` 伪造出真实列宽），手动发 pointer 事件跑分支（脚本 `~/work_dir/tmp/20261014-sidebar-resize/resize-check.js`，不在仓库内），19 条断言全 PASS：
+
+  | 分支 | 结果 |
+  |---|---|
+  | 无存档启动 | 不写 `--sidebar-width`，localStorage 保持空（主题默认 280px 原样） |
+  | 右拖 100px | `--sidebar-width: 380px`，落库 `380` |
+  | 松手后再 `pointermove` | 宽度不再变，`dragging` / `body.sidebar-resizing` 都已摘掉 |
+  | 狂拖到最右 / 最左 | 夹到窗口允许的上限（1024px 视口 = 664px）/ 200px，落库为夹住后的值 |
+  | 收起态按下手柄 | 不进入拖动态，宽度不变 |
+  | 鼠标右键按下手柄 | 不进入拖动态；左键正常 |
+  | 存档 420 启动 | 恢复 `--sidebar-width: 420px`，且不重写 localStorage |
+  | 存档 900 启动 | 启动即按窗口上限夹到 664px（1024px 视口） |
+
+- **真实浏览器里用鼠标真拖了一遍**（Playwright 1.36 + 本机缓存里的 firefox-1419，无头）：静态起 `public/`、只把 CDN 的三个库换成桩，1280×800 视口下 26 条断言全 PASS（脚本 `~/work_dir/tmp/20261014-sidebar-resize/browser-check.js`，不在仓库内），补上了 jsdom 测不到的部分：
+
+  | 观测 | 结果 |
+  |---|---|
+  | 手柄几何 | 宽 6px，右缘落在列右边框内侧 1px（`right: 0` 相对 padding box，不是 border box） |
+  | 悬停 | 计算样式底色从 `rgba(0, 0, 0, 0)` 变成 `--accent-light`；光标 `col-resize` |
+  | 真拖 120px | 列宽 280 → 400、聊天区 1000 → 880；拖动中 `body` 光标 `col-resize`、手柄带 `dragging` |
+  | 松手 | `dragging` / `body.sidebar-resizing` / 光标全部复位（`auto`） |
+  | 越界真拖 | 夹到 200 / 900 并落库（1280px 视口能到满上限 900） |
+  | 刷新 | 恢复 900px |
+  | 点「«」收起 | 列宽 0、手柄 `display: none`、在列缘拖动不改宽度；点 ☰ 展开回到 900 |
+  | 视口缩到 420px | 手柄隐藏，抽屉宽度 ≤ 86vw（就是上面那条 `min-width: 0` 的来源） |
+
+  另截了两张边界特写（`~/work_dir/tmp/20261014-sidebar-resize/edge-hover.png`、`edge-dragging.png`），确认悬停/拖动时列右缘确实亮起一条浅色竖线。
+
+- 未实测：其他主题下的观感（`--accent-light` 两套主题各有取值，未逐套截图）；触屏设备上的拖拽（手柄在移动端隐藏，桌面宽度下的粗指针设备未经真机验证）。
+- 纯前端改动，**不需要重启 cc-web 服务进程**；`public/index.html` 的两个 `?v=` 由 `my.43` 打到 `my.45`（先 `my.44`，改上限后为了让已经刷过旧页面的浏览器重新取 `app.js` 再打一档）。
+
+---
+
 ## 分叉 v1.5.32
 
 ### 修复

@@ -564,6 +564,38 @@ body.session-loading-active {
   flex-direction: column;
   transition: transform 0.3s ease;
   overflow: hidden;
+  /* 右边缘的拖动手柄按它定位 */
+  position: relative;
+}
+
+/* 会话列右边缘的拖动手柄：按住左右拖动改 --sidebar-width（桌面端）。
+   贴边 6px，平时透明，悬停/拖动时亮一条，给一点可拖的提示。 */
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 6px;
+  z-index: 5;
+  cursor: col-resize;
+  touch-action: none;
+  background: transparent;
+  transition: background 0.15s;
+}
+.sidebar-resizer:hover,
+.sidebar-resizer.dragging {
+  background: var(--accent-light);
+}
+/* 收起态手柄跟着列一起消失，别在 0 宽的列边上留一条能点的缝 */
+.app.sidebar-collapsed .sidebar-resizer { display: none; }
+/* 拖动期间整页都用拖动光标，顺手把文字选择关掉 */
+body.sidebar-resizing { cursor: col-resize; user-select: none; }
+
+@media (max-width: 768px) {
+  /* 移动端侧栏是抽屉，宽度不由拖拽决定，且不许超过视口
+     （基础规则里的 min-width 会让 max-width 失效，所以要一并压掉） */
+  .sidebar { min-width: 0; max-width: 86vw; }
+  .sidebar-resizer { display: none; }
 }
 .sidebar-header {
   padding: 12px;
