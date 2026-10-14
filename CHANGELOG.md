@@ -8,6 +8,42 @@
 
 ---
 
+## 分叉 v1.5.28
+
+### 新功能
+
+- **一轮跑完时，只要这一轮启动过后台任务，就在该轮气泡末尾补一条状态条和一个「唤醒」按钮。**起因是一次真实的事故：会话里把板端编译丢进后台（工具入参 `run_in_background: true`），然后以「现在编译进行中（-j8），完成后我验证产物、替换 /opt/lib 并通知你」收尾；编译 2 秒后就跑完了，但之后十分钟页面毫无动静，提交按钮一直可用，只能由用户自己再追问一句才继续。
+
+  根因不在渲染，而在架构。cc-web 是「一条用户消息 = 一个一次性 `claude -p` 进程」（[lib/agent-runtime.js](/home/huxiaojie/Tools/cc-web-my/lib/agent-runtime.js:86) 组装 `-p`，[server.js](/home/huxiaojie/Tools/cc-web-my/server.js:4583) 把这一轮的输入写进 stdin 后立刻 `end()`），回合收尾进程就退出 —— 后台任务比回合活得久时，它的完成通知**没有活着的收件人**。CLI 侧本身还有一层投递窗口：同一份会话记录里 `dequeue`（真正送达）与 `remove`（丢弃）是两种动作，那个会话 14 条后台完成通知里 10 条走的是 `remove`。两层叠加，「跑完自动叫醒我」这条路径在本架构下不可靠，而 cc-web 之前对此**完全不可见**（`<task-notification>` 还会被导入历史过滤掉，见 [server.js](/home/huxiaojie/Tools/cc-web-my/server.js:4850)）——用户只能感到「模型突然不说话了」。
+
+  界面能做的只有别让人干等：把这一轮的收尾如实标出来，并给一个一键补发的入口。状态条文案 `本轮已结束。后台任务 bg123 跑完后不会自动继续`，按钮「唤醒」替用户发一条 `后台任务跑完了吗？继续`。
+
+  实现（纯前端，未改 `server.js`）：新增 `isBackgroundToolInput()` / `extractBackgroundTaskId()` / `rememberBackgroundTask()` / `attachBackgroundTaskId()` / `collectBackgroundTasks()` / `buildBackgroundNoteElement()` / `appendBackgroundNote()` 与常量 `BACKGROUND_WAKE_TEXT`（[public/app.js](/home/huxiaojie/Tools/cc-web-my/public/app.js:2670) 起）。判据是工具入参里的 `run_in_background: true`（对象形态；被服务端 `truncateObj` 截断成长字符串时退化成匹配 `"run_in_background":true`）。**实时路径**：`tool_start` 先按入参记一笔（[public/app.js:2186](/home/huxiaojie/Tools/cc-web-my/public/app.js:2186)），`tool_end` 再从结果里的 `Command running in background with ID: <id>` 补出任务 id（[public/app.js:2197](/home/huxiaojie/Tools/cc-web-my/public/app.js:2197)），`resume_generating` 重连补流时同上（[public/app.js:2318](/home/huxiaojie/Tools/cc-web-my/public/app.js:2318)）；`finishGenerating()` 封口气泡时把状态条追加进该轮的 `.msg-bubble`（[public/app.js:2527](/home/huxiaojie/Tools/cc-web-my/public/app.js:2527)）。**历史路径**：原生会话记录保留了工具入参，`buildMsgElement()` 用同一判据补同样的状态条（[public/app.js:3045](/home/huxiaojie/Tools/cc-web-my/public/app.js:3045)），所以刷新 / 切回会话后它仍挂在该轮下方（历史里没有工具结果，拿不到任务 id，文案退化成不带 id 的那句）。**唤醒按钮**：先留一份手上草稿，把输入框置成继续指令，直接调既有的 `sendMessage()` —— 与手敲回车完全同一条路径（渲染用户气泡、进入生成态、记入历史），发完把草稿放回去。没有 `run_in_background` 的轮次什么都不出现。
+
+  样式在 [public/style.css:1654](/home/huxiaojie/Tools/cc-web-my/public/style.css:1654)（`.msg-bg-note` / `.msg-bg-note-text` / `.msg-bg-note-btn`）：挂在气泡内部末尾、与工具卡片同级，`唤醒` 是描边药丸按钮，悬停反色。状态条自己的文案已进 `SEARCH_SKIP_SELECTOR`（[public/app.js:3133](/home/huxiaojie/Tools/cc-web-my/public/app.js:3133)），不会被会话内搜索命中。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- 真浏览器实测（playwright + headless firefox，本地静态托管 `public/`，用假 WebSocket 灌入 `session_info` 历史 + `tool_start` / `tool_end` / `text_delta` / `done`；驱动脚本 `~/work_dir/tmp/20261013-bg-note-e2e/drive.py`，不在仓库内）：
+
+  | 观测 | 结果 |
+  |---|---|
+  | 历史里带 `run_in_background` 的那条 assistant 回复 | 出现状态条：`本轮已结束。这一轮启动过后台任务，它跑完后不会自动继续` |
+  | 同一份历史的另外 3 条 assistant 回复 | 均无状态条（4 条 assistant 共 1 条状态条） |
+  | 实时一轮（`tool_start` → `tool_end` → `text_delta` → `done`） | 收尾后出现状态条并带出任务 id：`本轮已结束。后台任务 bg123 跑完后不会自动继续` |
+  | 只有前台工具调用的一轮 | 收尾后状态条数量不变（2 → 2） |
+  | 点「唤醒」 | 真的发出 `{type:'message', text:'后台任务跑完了吗？继续', sessionId:'s1', mode:'yolo', agent:'claude'}` |
+  | 流式气泡 / 输入框 | 气泡已封口（无 `#streaming-msg`）、输入框可用 |
+  | 会话内搜索 | 搜 `本轮已结束` → `无结果`、`0` 个 `<mark>`；搜正文 `好，我丢后台跑` → `1/1` |
+  | 视觉 | 截图确认状态条挂在气泡内、与工具卡片同级，`唤醒` 为描边药丸按钮 |
+  | `pageerror` | 全程为空 |
+
+- 未覆盖：Codex 侧 `run_in_background` 的真实入参形态（判据取的是通用入参字段，但没有 Codex 样本可验）；历史路径拿不到后台任务 id。
+- 纯前端改动（`public/app.js` 净新增 97 行、`public/style.css` 新增 41 行、`public/index.html` 的 `?v=` 由 `1.5.1-my.39` 打到 `1.5.1-my.40`），**不需要重启服务进程**，刷新页面即可生效。
+
+---
+
 ## 分叉 v1.5.27
 
 ### 新功能

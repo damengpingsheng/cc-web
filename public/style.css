@@ -1651,6 +1651,47 @@ mark.search-hit.current {
 .msg-action-btn.copied { color: var(--success); border-color: var(--success); }
 .msg-action-btn.failed { color: var(--danger); border-color: var(--danger); }
 
+/* 后台任务状态条：这一轮把命令丢进了后台（run_in_background），跑完不会自动继续，
+   所以给一条提示 + 一个「唤醒」按钮。挂在气泡内部末尾，宽度随气泡走，不参与左右分栏。 */
+.msg-bg-note {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.msg-bg-note-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.msg-bg-note-btn {
+  appearance: none;
+  flex-shrink: 0;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.msg-bg-note-btn:hover {
+  background: var(--accent);
+  color: #fff;
+}
+.msg-bg-note-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* 本地命令卡片：不是对话，所以不走左右分栏的气泡样式，整行铺开单独呈现 */
 .msg.local-command {
   align-self: stretch;

@@ -134,6 +134,7 @@
   let activeToolCalls = new Map();
   let toolGroupCount = 0;   // 当前 .msg-tools 直接子节点数（含已有父目录）
   let hasGrouped = false;  // 本次输出是否已触发过折叠
+  let pendingBackgroundTasks = [];  // 本轮出现过的 run_in_background 调用（收尾时补状态条）
   let cmdMenuIndex = -1;
   let currentMode = 'yolo';
   let currentModel = 'opus';
@@ -2182,6 +2183,7 @@
         if (!isGenerating || !document.getElementById('streaming-msg')) startGenerating();
         activeToolCalls.set(msg.toolUseId, { name: msg.name, input: msg.input, kind: msg.kind || null, meta: msg.meta || null, done: false });
         appendToolCall(msg.toolUseId, msg.name, msg.input, false, msg.kind || null, msg.meta || null);
+        rememberBackgroundTask(msg.toolUseId, msg.name, msg.input);
         break;
 
       case 'tool_end':
@@ -2192,6 +2194,7 @@
           activeToolCalls.get(msg.toolUseId).result = msg.result;
         }
         updateToolCall(msg.toolUseId, msg.result);
+        attachBackgroundTaskId(msg.toolUseId, msg.result);
         break;
 
       case 'cost':
@@ -2312,6 +2315,8 @@
               done: tc.done,
             });
             appendToolCall(tc.id, tc.name, tc.input, tc.done, tc.kind || null, tc.meta || null);
+            rememberBackgroundTask(tc.id, tc.name, tc.input);
+            attachBackgroundTaskId(tc.id, tc.result);
             if (tc.done && tc.result) {
               updateToolCall(tc.id, tc.result);
             }
@@ -2432,6 +2437,7 @@
     activeToolCalls.clear();
     toolGroupCount = 0;
     hasGrouped = false;
+    pendingBackgroundTasks = [];
     sendBtn.hidden = true;
     abortBtn.hidden = false;
     // 不禁用输入框，允许用户继续输入（但无法发送）
@@ -2517,6 +2523,8 @@
       const time = streamEl.querySelector(':scope > .msg-time');
       if (time) setMsgTimeText(time, new Date());
       streamEl.removeAttribute('id');
+      // 本轮出现过 run_in_background：在气泡末尾补状态条 + 唤醒按钮（见 buildBackgroundNoteElement）
+      appendBackgroundNote(streamEl.querySelector('.msg-bubble'), pendingBackgroundTasks);
     }
 
     if (sessionId) currentSessionId = sessionId;
@@ -2524,6 +2532,7 @@
     activeToolCalls.clear();
     toolGroupCount = 0;
     hasGrouped = false;
+    pendingBackgroundTasks = [];
     // /goal: process exited, mark goal inactive (B+); done is authoritative — clear optimism too
     const goalSid = sessionId || currentSessionId;
     const goalState = goalSid ? sessionGoalState.get(goalSid) : null;
@@ -2658,6 +2667,90 @@
     }
 
     div.insertBefore(actions, beforeEl || null);
+  }
+
+  // === 后台任务状态条（CHANGELOG v1.5.28） ===
+  // cc-web 是「一条用户消息 = 一个一次性 claude -p 进程」，回合收尾进程就退出。若这一轮把
+  // 编译 / 实验丢进后台（工具入参带 run_in_background: true），它完成时已经没有活着的收件人，
+  // 会话不会自动继续，看起来就是「模型突然不说话了」。这里只做两件事：在该轮气泡末尾提示
+  // 这一点，并给一个「唤醒」按钮替用户补发一条继续指令；不改任何既有行为。
+  const BACKGROUND_WAKE_TEXT = '后台任务跑完了吗？继续';
+
+  // 入参可能是解析后的对象，也可能是被 truncateObj 截断的 JSON 字符串（服务端截到 500 字符）。
+  function isBackgroundToolInput(input) {
+    if (input && typeof input === 'object' && !Array.isArray(input)) return input.run_in_background === true;
+    if (typeof input === 'string') return input.indexOf('"run_in_background":true') !== -1;
+    return false;
+  }
+
+  // "Command running in background with ID: b6c1hoad6" → b6c1hoad6；取不到就留空。
+  function extractBackgroundTaskId(text) {
+    const m = /running in background with ID:\s*([A-Za-z0-9_-]+)/i.exec(typeof text === 'string' ? text : '');
+    return m ? m[1] : '';
+  }
+
+  // 实时路径：tool_start 时按入参记下（此刻还没有任务 id），tool_end 拿到结果再补 id。
+  function rememberBackgroundTask(toolUseId, name, input) {
+    if (!isBackgroundToolInput(input)) return;
+    if (pendingBackgroundTasks.some((t) => t.toolUseId === toolUseId)) return;
+    pendingBackgroundTasks.push({ toolUseId, id: '', name: name || '' });
+  }
+
+  function attachBackgroundTaskId(toolUseId, result) {
+    const task = pendingBackgroundTasks.find((t) => t.toolUseId === toolUseId);
+    if (!task) return;
+    const id = extractBackgroundTaskId(result);
+    if (id) task.id = id;
+  }
+
+  // 历史路径：原生会话记录里保留了工具入参，所以刷新后同样认得出这一轮有过后台任务。
+  function collectBackgroundTasks(toolCalls) {
+    const tasks = [];
+    for (const tc of toolCalls || []) {
+      if (!tc || !isBackgroundToolInput(tc.input)) continue;
+      tasks.push({ toolUseId: tc.id || '', id: extractBackgroundTaskId(tc.result), name: tc.name || '' });
+    }
+    return tasks;
+  }
+
+  function buildBackgroundNoteElement(tasks) {
+    const note = document.createElement('div');
+    note.className = 'msg-bg-note';
+    const ids = (tasks || []).map((t) => t.id).filter(Boolean);
+    const label = document.createElement('span');
+    label.className = 'msg-bg-note-text';
+    label.textContent = ids.length > 0
+      ? '本轮已结束。后台任务 ' + ids.join('、') + ' 跑完后不会自动继续'
+      : '本轮已结束。这一轮启动过后台任务，它跑完后不会自动继续';
+    note.appendChild(label);
+
+    const wakeBtn = document.createElement('button');
+    wakeBtn.type = 'button';
+    wakeBtn.className = 'msg-bg-note-btn';
+    wakeBtn.textContent = '唤醒';
+    wakeBtn.title = '发一条「' + BACKGROUND_WAKE_TEXT + '」，让 agent 接着处理';
+    wakeBtn.setAttribute('aria-label', wakeBtn.title);
+    wakeBtn.addEventListener('click', () => {
+      if (isGenerating || isBlockingSessionLoad()) return;
+      // 借 sendMessage 走与手敲完全相同的路径（用户气泡 + 生成态 + 记入历史）；
+      // 手上若还留着没发出去的草稿，发完再放回去，避免被顶掉。
+      const draft = msgInput.value;
+      msgInput.value = BACKGROUND_WAKE_TEXT;
+      autoResize();
+      sendMessage();
+      msgInput.value = draft;
+      autoResize();
+      msgInput.focus();
+    });
+    note.appendChild(wakeBtn);
+    return note;
+  }
+
+  // 状态条挂在气泡内部末尾（与 .msg-tools 同级），实时收尾与历史重建的位置因此完全一致。
+  function appendBackgroundNote(container, tasks) {
+    if (!container || !tasks || tasks.length === 0) return;
+    if (container.querySelector(':scope > .msg-bg-note')) return;
+    container.appendChild(buildBackgroundNoteElement(tasks));
   }
 
   function createMsgElement(role, content, attachments = [], timestamp = null) {
@@ -2947,6 +3040,10 @@
         }
       }
     }
+    // 后台任务状态条：口径与实时收尾一致，刷新 / 切回会话后仍然在
+    if (m.role === 'assistant') {
+      appendBackgroundNote(el.querySelector('.msg-bubble'), collectBackgroundTasks(m.toolCalls));
+    }
     return el;
   }
 
@@ -3033,7 +3130,7 @@
   // 在文本节点上包 <mark>，命中落在折叠区内时自动展开祖先。
   // 只切分/还原文本节点，绝不碰 innerHTML —— 否则 decorateCodeBlocks 注入的
   // Copy / Preview 按钮的事件监听会被一起打掉。
-  const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search, .msg-time, .msg-actions';
+  const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search, .msg-time, .msg-actions, .msg-bg-note';
 
   function collectSearchTextNodes() {
     const walker = document.createTreeWalker(messagesDiv, NodeFilter.SHOW_TEXT, {
