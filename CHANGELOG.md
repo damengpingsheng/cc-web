@@ -8,6 +8,36 @@
 
 ---
 
+## 分叉 v1.5.30
+
+### 修改
+
+- **会话内搜索的高亮重新调色：普通命中换成更实的黄，当前命中换成橙底 + 深色描边 + 一圈光晕，并在跳到新命中的瞬间让光晕闪一下。**原来的三个色值是 `#ffe9a8` / `#ffb454`，两个都是浅黄系，当前项只比普通项深一点点、外圈只有 1px，扫一眼容易看不出「现在停在哪一条」；命中本身落在 `#fff9f2` / `#d8e6f4` 这类浅底色上也不够跳。
+
+  改动全在 [public/style.css](/home/huxiaojie/Tools/cc-web-my/public/style.css:27) 的三个色值加一条新变量 `--search-hit-current-glow`（`#ffe066` / `#ff9f1a` / `#8f4300` / `rgba(255, 159, 26, 0.35)`），以及 [public/style.css:1487](/home/huxiaojie/Tools/cc-web-my/public/style.css:1487) 的 `mark.search-hit.current`：描边从 1px 加到 2px、外面再套一圈 5px 光晕，圆角 2px → 3px，文字取 `--text-primary`（深色代码块里底是橙的，继承浅色代码文字会读不清），并挂一个 0.5s 的 `search-hit-pop` 动画把外圈从 12px 收到 5px。动画只动外圈，底色从第一帧起就是最终色，所以就算动画没重放（同一个 `<mark>` 连着被 `focusSearchHit` 重设 `.current` 时不会重放），当前项也一直是橙底描边的样子。三个主题（默认 / coolvibe / editorial）都只有 `:root` 定义这套变量，没有各自的覆盖，所以一次改动三套主题同时生效。
+
+  JS 一行没动：`.current` 仍然是 `focusSearchHit()` 那一套 `classList` 增删（[public/app.js:3215](/home/huxiaojie/Tools/cc-web-my/public/app.js:3215)），跳到下一个命中时目标 `<mark>` 是新拿到 `.current` 的元素，动画自然会重放一次。
+
+### 验证
+
+- `node --check public/app.js` 通过（本笔未改 JS，仅作没被连带破坏的确认）。
+- 真浏览器渲染（playwright-core 1.36 + 缓存里的 firefox-1419，headless，本地静态页直接引 `public/style.css`，喂同一套 `<mark class="search-hit">` / `.current` 结构；脚本与截图在 `/tmp/search-hit-check/`，不在仓库内）：
+
+  | 观测 | 结果 |
+  |---|---|
+  | 三套主题的普通命中 computed 背景 | `rgb(255, 224, 102)` |
+  | 三套主题的当前命中 computed 背景 | `rgb(255, 159, 26)`，`border-radius` 3px |
+  | 当前命中 computed `box-shadow` | `rgb(143, 67, 0) 0 0 0 2px` + `rgba(255, 159, 26, 0.35) 0 0 0 5px`（动画播放中能观察到 6.4~7.8px 的中间态，说明关键帧生效） |
+  | 当前命中 computed `animation-name` | `search-hit-pop` |
+  | 三套主题 @ 助手气泡 / 用户气泡 / 行内代码 / 深色代码块 | 截图确认：普通命中是实黄色块，当前命中是橙块 + 深棕描边 + 光晕；深色代码块里当前命中文字为深色，读得清 |
+  | `pageerror` | 全程为空 |
+
+- 未实测：真实 cc-web 页面里按 Enter / Shift+Enter 连续跳转时的观感（本机起服务要密码，只做了静态渲染）；光晕是 `box-shadow`，在横向溢出的宽表格 / 长代码行里贴近容器边缘时可能被裁掉一小截（`mark` 自身不裁剪，容器 `overflow` 才会）。
+- 纯前端改动（`public/style.css` 改 3 个色值 + 新增 1 个变量，`mark.search-hit.current` 一条规则再新增一个 `@keyframes`；`public/index.html` 的 `?v=` 由 `1.5.1-my.40` 打到 `1.5.1-my.41`），**不需要重启服务进程**，刷新页面即可生效。
+
+---
+
+
 ## 分叉 v1.5.29
 
 ### 新功能（服务端）

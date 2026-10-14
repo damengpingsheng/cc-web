@@ -24,9 +24,10 @@
   --info: #5b7ea1;                 /* 縹色 blue-gray */
   --scrollbar-thumb: #c9baa9;
   --scrollbar-track: transparent;
-  --search-hit-bg: #ffe9a8;        /* 会话内搜索：普通命中 */
-  --search-hit-current-bg: #ffb454;/* 会话内搜索：当前命中 */
-  --search-hit-current-ring: #c2610c;
+  --search-hit-bg: #ffe066;        /* 会话内搜索：普通命中 */
+  --search-hit-current-bg: #ff9f1a;/* 会话内搜索：当前命中 */
+  --search-hit-current-ring: #8f4300;
+  --search-hit-current-glow: rgba(255, 159, 26, 0.35);
   --sidebar-width: 280px;
   --header-height: 52px;
   --input-max-height: 200px;
@@ -1485,7 +1486,16 @@ mark.search-hit {
 }
 mark.search-hit.current {
   background: var(--search-hit-current-bg);
-  box-shadow: 0 0 0 1px var(--search-hit-current-ring);
+  color: var(--text-primary);
+  border-radius: 3px;
+  box-shadow: 0 0 0 2px var(--search-hit-current-ring), 0 0 0 5px var(--search-hit-current-glow);
+  animation: search-hit-pop 0.5s ease-out;
+}
+/* 跳到新命中时把外圈亮一下，眼睛容易跟上；动画只在外圈，底色一直保持在位 */
+@keyframes search-hit-pop {
+  0% { box-shadow: 0 0 0 2px var(--search-hit-current-ring), 0 0 0 12px rgba(255, 159, 26, 0); }
+  45% { box-shadow: 0 0 0 2px var(--search-hit-current-ring), 0 0 0 11px var(--search-hit-current-glow); }
+  100% { box-shadow: 0 0 0 2px var(--search-hit-current-ring), 0 0 0 5px var(--search-hit-current-glow); }
 }
 /* 窄屏让出跳转按钮与滚动条的位置 */
 @media (max-width: 560px) {
