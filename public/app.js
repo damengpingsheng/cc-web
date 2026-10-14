@@ -130,6 +130,7 @@
   let pendingText = '';
   let renderTimer = null;
   let renderPendingHidden = false;  // 标签隐藏期间被跳过的流式渲染，转回前台补一次
+  let renderPendingResize = false;  // 拖会话列宽度期间被跳过的流式渲染，松手时补一次
   let scrollBottomRaf = 0;          // scrollToBottom 的 rAF 去重句柄
   let activeToolCalls = new Map();
   let toolGroupCount = 0;   // 当前 .msg-tools 直接子节点数（含已有父目录）
@@ -2553,6 +2554,10 @@
     // 收尾路径（finishGenerating / resume_generating / goal_feedback）直接调
     // flushRender，不经过这里，所以最终文本不会因后台而丢失。
     if (document.hidden) { renderPendingHidden = true; return; }
+    // 拖会话列宽度期间同理：一次 flushRender 要把累积的整段文本重新解析 + 重建气泡 +
+    // 重排，长会话下几十毫秒，100ms 一次的节奏叠在拖动上就是持续的长卡；这段时间只累积
+    // pendingText，松手时由 onResizeEnd 补渲染一次。
+    if (document.body.classList.contains('sidebar-resizing')) { renderPendingResize = true; return; }
     if (renderTimer) return;
     renderTimer = setTimeout(() => {
       renderTimer = null;
@@ -2568,12 +2573,86 @@
     if (!bubble) return;
     let textDiv = bubble.querySelector('.msg-text');
     if (!textDiv) { textDiv = bubble; }
-    // 空文本走 renderMarkdown 会再吐一个 typing-indicator 到 .msg-text 里，
-    // 和气泡末尾那个撞成两串点（resume_generating 带空 text 时就会踩到）。
-    textDiv.innerHTML = pendingText ? renderMarkdown(pendingText) : '';
-    decorateCodeBlocks(textDiv);
+    if (pendingText) {
+      renderStreamingText(textDiv, pendingText);
+    } else {
+      // 空文本走 renderMarkdown 会再吐一个 typing-indicator 到 .msg-text 里，
+      // 和气泡末尾那个撞成两串点（resume_generating 带空 text 时就会踩到）。
+      textDiv.innerHTML = '';
+      textDiv._ccStream = null;
+    }
     streamEl._ccRawText = pendingText || '';
     scrollToBottom();
+  }
+
+  // --- 流式文本增量渲染 ---
+  // 原先每次 flush 都把整段 pendingText 重新交给 marked.parse 再重建 innerHTML，
+  // 长会话下一次就是几十毫秒（实测 30k 字符 ≈30ms，且随文本变长线性增长），
+  // agent 运行中即便不拖动也持续掉帧。这里把气泡切成两段：
+  //   「已提交前缀」= 已经写完的整块内容，渲染一次就不再动；
+  //   「尾巴」       = 当前还没写完的那个块，每次 flush 只重渲染这一小段。
+  // 单次渲染代价因此与消息总长度无关，最终 finishGenerating 仍走全量渲染，输出一致。
+  const STREAM_CONT_PREFIX = /^(\s|[>|]|[-*+][ \t]|[-*+]$|[-*_]{3,}\s*$|\d{1,9}[.)]([ \t]|$))/;
+
+  // 找一个安全切点：切点左侧单独渲染的结果，与它拼在整段里渲染的结果一致。
+  // 只认「空行之后、下一行不是续行开头」的位置（空行是块边界，续行开头会让右侧内容
+  // 改变左侧那个块的解析：列表/引用/表格/缩进代码块）；围栏内部和末行（还没写完，
+  // 内容还可能变）都不切。
+  function streamSafeCut(text, from) {
+    let fence = '';       // '`' / '~'：当前处在未闭合围栏内部
+    let lastSafe = from;
+    let pos = 0;
+    while (pos < text.length) {
+      const nl = text.indexOf('\n', pos);
+      if (nl === -1) break;
+      const line = text.slice(pos, nl);
+      const fenceMark = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+      if (fence) {
+        if (fenceMark && fenceMark[1][0] === fence && line.trim() === fenceMark[1]) fence = '';
+      } else if (fenceMark) {
+        fence = fenceMark[1][0];
+      } else if (line.trim() === '' && nl + 1 < text.length) {
+        // 下一行必须已经收到换行，否则它可能继续长成续行（例如 "3" → "3. 项"）
+        const nextNl = text.indexOf('\n', nl + 1);
+        if (nextNl !== -1 && !STREAM_CONT_PREFIX.test(text.slice(nl + 1, nextNl))) {
+          lastSafe = nl + 1;
+        }
+      }
+      pos = nl + 1;
+    }
+    return lastSafe;
+  }
+
+  // display:contents 的包装只用来让「尾巴」可整段替换，不产生额外盒子，
+  // .msg-bubble p / ul 这些后代选择器照旧命中。已提交的块直接插进 .msg-text，
+  // 不套包装，这样 p:last-child 的边距规则和全量渲染时完全一致。
+  function createStreamPart() {
+    const el = document.createElement('div');
+    el.className = 'msg-stream-part';
+    return el;
+  }
+
+  // 挂在 textDiv 上的状态：committed 是已提交前缀原文，tail 是承载未完成尾部（含
+  // 已提交部分之前的定位锚点）的元素。校验不通过（文本被整体改写、DOM 被别处重建）
+  // 就退回全量重建，startGenerating / resume_generating 等重置点无需逐个挂钩。
+  function renderStreamingText(textDiv, text) {
+    let st = textDiv._ccStream;
+    if (!st || !st.tail || st.tail.parentElement !== textDiv || !text.startsWith(st.committed)) {
+      textDiv.innerHTML = '';
+      st = textDiv._ccStream = { committed: '', tail: createStreamPart() };
+      textDiv.appendChild(st.tail);
+    }
+    const cut = streamSafeCut(text, st.committed.length);
+    if (cut > st.committed.length) {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = renderMarkdown(text.slice(st.committed.length, cut));
+      textDiv.insertBefore(tpl.content, st.tail);
+      st.committed = text.slice(0, cut);
+      decorateCodeBlocks(textDiv);
+    }
+    const tailText = text.slice(st.committed.length);
+    st.tail.innerHTML = tailText ? renderMarkdown(tailText) : '';
+    if (tailText) decorateCodeBlocks(st.tail);
   }
 
   // 不变量：marked.parse 输出经 DOMPurify sanitize 后返回。Copy/Preview 按钮 + 预览
@@ -3769,6 +3848,9 @@
 
   // force：切会话、整区重渲染、用户自己发消息等必须落到底部的场景
   function scrollToBottom(force = false) {
+    // 拖会话列宽度期间不跟着吸底：它每帧读 scrollHeight（强制同步布局），长会话下和改宽叠在
+    // 一起就是双份重排；松手时 onResizeEnd 会补一次。force 的那些调用（切会话/加载完）照常走。
+    if (!force && document.body.classList.contains('sidebar-resizing')) return;
     if (!force && !stickToBottom) {
       updateScrollbar();
       return;
@@ -3820,6 +3902,9 @@
   });
 
   function updateScrollbar() {
+    // 拖会话列宽度时，每帧一次改宽都会触发一轮 ResizeObserver，这里再读 scrollHeight、
+    // 重排导航条，等于把拖动成本又叠一层；拖动期间先跳过，松手时 onResizeEnd 补一次。
+    if (document.body.classList.contains('sidebar-resizing')) return;
     updateJumpButtons();
     updateMsgNav();
     if (!scrollbarEl || !thumbEl) return;
@@ -3894,10 +3979,11 @@
   const navTipEl = document.getElementById('msg-nav-tip');
   const NAV_TICK_MIN_H = 4;
   const NAV_TICK_MAX_H = 10;
-  let navTicks = [];          // [{ el, msg, top }]，top 是缓存的 offsetTop
+  let navTicks = [];          // [{ el, msg, top, y, h }]，top 是缓存的 offsetTop，y/h 是已写入的落位
   let navScrollHeight = -1;   // 上次布局时的内容高度与轨道高度，任一变化才重排
   let navTrackHeight = -1;
   let navRebuildTimer = 0;
+  let navActiveIndex = -1;    // 当前高亮的刻度下标，避免每次滚动都全量 toggle class
 
   // local-command 卡片和续接摘要不带 .user 类，天然不会混进提问列表
   function msgNavLabel(msg) {
@@ -3917,9 +4003,15 @@
     // 先批量读 offsetTop 再批量写 style：读写交替会让每条横条各触发一次强制重排，
     // 流式生成时 scrollHeight 每帧都在变，长会话足以卡住。
     for (const t of navTicks) t.top = t.msg.offsetTop;
+    // 写之前先比缓存：拖动/流式时 scrollHeight 每帧都在变，但 1px 以内的落位差肉眼
+    // 看不出来，量化到 0.5px 后绝大多数横条可以直接跳过写 style。
     for (const t of navTicks) {
-      const y = (t.top / scrollH) * trackH - tickH / 2;
-      t.el.style.top = Math.max(0, Math.min(trackH - tickH, y)) + 'px';
+      const y = Math.max(0, Math.min(trackH - tickH, (t.top / scrollH) * trackH - tickH / 2));
+      const yq = Math.round(y * 2) / 2;
+      if (t.y === yq && t.h === tickH) continue;
+      t.y = yq;
+      t.h = tickH;
+      t.el.style.top = yq + 'px';
       t.el.style.height = tickH + 'px';
     }
     navScrollHeight = scrollH;
@@ -3936,7 +4028,13 @@
       if (navTicks[i].top <= probe) cur = i;
       else break;
     }
-    navTicks.forEach((t, i) => t.el.classList.toggle('active', i === cur));
+    // 长会话下这里有上百条刻度，每次都全量 toggle 一遍在流式期间是纯浪费
+    if (cur === navActiveIndex) return;
+    if (navActiveIndex >= 0 && navTicks[navActiveIndex]) {
+      navTicks[navActiveIndex].el.classList.remove('active');
+    }
+    if (cur >= 0) navTicks[cur].el.classList.add('active');
+    navActiveIndex = cur;
   }
 
   function updateMsgNav() {
@@ -3958,6 +4056,8 @@
     }
     hideMsgNavTip();
     navEl.innerHTML = '';
+    // 刻度元素全部重建，高亮记录跟着失效
+    navActiveIndex = -1;
     navTicks = msgs.map((msg, i) => {
       const el = document.createElement('div');
       el.className = 'msg-nav-tick';
@@ -4513,6 +4613,13 @@
 
     // 先让"脱离文档流"那套样式落地，再翻 collapsed，transform 才有过渡起点
     app.classList.add('sidebar-animating');
+    // 动画期间 .app 要按真实列宽给侧栏撑出槽位，而 CSS 那条 padding-left 读的 --sidebar-width
+    // 现在只写在 .sidebar 上（见 applySidebarWidth），.app 读不到，所以这里把同一个值落到像素
+    // padding 上。只有"展开"方向需要撑：收起方向沿用原样，让聊天区立刻铺满。
+    // 没拖动过（没有内联变量）就不写，交给 CSS 里的默认值，行为和以前一致。
+    const animWidth = sidebar.style.getPropertyValue('--sidebar-width');
+    if (!next && animWidth) app.style.paddingLeft = animWidth;
+    else app.style.removeProperty('padding-left');
     void sidebar.offsetWidth;
     app.classList.toggle('sidebar-collapsed', next);
 
@@ -4521,6 +4628,7 @@
       clearTimeout(timer);
       sidebar.removeEventListener('transitionend', onEnd);
       app.classList.remove('sidebar-animating');
+      app.style.removeProperty('padding-left');
       if (endSidebarAnim === finish) endSidebarAnim = null;
     };
     function onEnd(e) {
@@ -4534,13 +4642,19 @@
   setSidebarCollapsed(sidebarCollapsed);
 
   // --- 会话列宽度拖拽 ---
-  // 桌面端按住列右边缘左右拖动改宽度：宽度只写 :root 的 --sidebar-width
-  // （列宽和收起动画的 padding-left 都读这个变量），再存 localStorage，刷新后保持。
+  // 桌面端按住列右边缘左右拖动改宽度，再存 localStorage，刷新后保持。
+  // 宽度写在 .sidebar 自己身上，不写 :root：:root 上的自定义属性一变，浏览器要重算整棵文档的
+  // computed style，长会话（几万节点）下每帧就是两三百毫秒，拖起来直接卡成幻灯片；写在侧栏
+  // 子树里只失效这一小块，实测同一次改宽 320ms -> 60ms。
   // 移动端侧栏是抽屉，手柄由 CSS 隐藏。
   const SIDEBAR_WIDTH_KEY = 'cc-web-sidebar-width';
   const SIDEBAR_WIDTH_MIN = 200;
   const SIDEBAR_WIDTH_MAX = 900;
   const sidebarResizer = $('#sidebar-resizer');
+  // 拖动期间接管光标/文字选择的整页遮罩：以前是给 body 加 sidebar-resizing 类改 cursor +
+  // user-select，两者都是继承属性，几万节点下每次加/摘都要全文档重算样式（实测各 ~800/600ms），
+  // 拖动按下和松手就会各卡一次。遮罩只有一个元素，切换它几乎不花钱。
+  const dragShield = $('#drag-shield');
 
   function clampSidebarWidth(px) {
     // 上限跟着窗口收：聊天区至少留 360px
@@ -4550,7 +4664,7 @@
 
   function applySidebarWidth(px, persist) {
     const width = clampSidebarWidth(px);
-    document.documentElement.style.setProperty('--sidebar-width', width + 'px');
+    sidebar.style.setProperty('--sidebar-width', width + 'px');
     if (persist) localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width));
     return width;
   }
@@ -4563,34 +4677,73 @@
     let resizing = false;
     let resizeStartX = 0;
     let resizeStartWidth = 0;
+    let pendingWidth = null;
+    let resizeRaf = 0;
+
+    // 一帧最多改一次宽度：pointermove 的密度可以远高于刷新率（高回报率鼠标），逐条改的话
+    // 每条都要付一遍样式重算 + 重排，长会话下每一遍都是几百毫秒。
+    function flushResize() {
+      resizeRaf = 0;
+      if (pendingWidth === null) return;
+      applySidebarWidth(pendingWidth, true);
+      pendingWidth = null;
+    }
 
     function onResizeMove(e) {
       if (!resizing) return;
-      applySidebarWidth(resizeStartWidth + (e.clientX - resizeStartX), true);
+      pendingWidth = resizeStartWidth + (e.clientX - resizeStartX);
+      if (!resizeRaf) resizeRaf = requestAnimationFrame(flushResize);
       e.preventDefault();
     }
 
     function onResizeEnd() {
       if (!resizing) return;
       resizing = false;
+      // 最后一条 pointermove 可能还压在待执行的那帧里，先结算掉再收尾
+      if (resizeRaf) { cancelAnimationFrame(resizeRaf); resizeRaf = 0; }
+      if (pendingWidth !== null) { const width = pendingWidth; pendingWidth = null; applySidebarWidth(width, true); }
       sidebarResizer.classList.remove('dragging');
+      // 侧栏回到文档流、聊天区按最终列宽重排这一次（拖动期间它一直被 padding 钉在旧宽度上）
+      app.classList.remove('sidebar-dragging');
+      app.style.removeProperty('padding-left');
       document.body.classList.remove('sidebar-resizing');
+      if (dragShield) dragShield.hidden = true;
       window.removeEventListener('pointermove', onResizeMove);
       window.removeEventListener('pointerup', onResizeEnd);
       window.removeEventListener('pointercancel', onResizeEnd);
+      window.removeEventListener('blur', onResizeEnd);
+      // 拖动期间被跳过的流式渲染，在这里补一次（同样要先摘掉 sidebar-resizing）
+      if (renderPendingResize) { renderPendingResize = false; flushRender(); }
+      // 拖动期间被跳过的滚动条 / 导航条 / 吸底，在这里补一次（要先摘掉 sidebar-resizing）
+      scrollToBottom();
     }
 
     sidebarResizer.addEventListener('pointerdown', (e) => {
       if ((e.pointerType === 'mouse' && e.button !== 0) || app.classList.contains('sidebar-collapsed')) return;
+      // 收起/展开动画期间侧栏已经在动，插进来会把两套状态叠在一起，这一次不响应
+      if (app.classList.contains('sidebar-animating')) return;
       resizing = true;
       resizeStartX = e.clientX;
       resizeStartWidth = sidebar.getBoundingClientRect().width;
+      // 整段拖动把侧栏摘出文档流（CSS .app.sidebar-dragging），槽位改用 .app 的 padding-left 钉住
+      // 拖动前的列宽：聊天区宽度因此在拖动期间不变，每帧只重排侧栏自己，几千条消息不参与；
+      // 松手时 onResizeEnd 摘掉这两样，聊天区按最终宽度重排这一次。
+      app.style.paddingLeft = resizeStartWidth + 'px';
+      app.classList.add('sidebar-dragging');
+      // 已经排好队、马上要跑的那次流式渲染也一起推迟（scheduleRender 的守卫只管新调度
+      // 进来的 delta，在途的定时器会照常在拖动中触发一次全量重排）
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; renderPendingResize = true; }
       sidebarResizer.classList.add('dragging');
       document.body.classList.add('sidebar-resizing');
+      // 光标与文字选择改由遮罩承担（见 dragShield 注释），避免给 body 加类触发全文档样式重算
+      if (dragShield) dragShield.hidden = false;
       // 监听挂在 window 上：拖到列外、甚至拖出窗口也跟得住
       window.addEventListener('pointermove', onResizeMove);
       window.addEventListener('pointerup', onResizeEnd);
       window.addEventListener('pointercancel', onResizeEnd);
+      // 拖到一半窗口失焦（alt-tab、弹窗抢焦点）时不会来 pointerup，这里兜底收尾：
+      // 否则 sidebar-resizing 会一直挂着，把滚动条同步和吸底一起关掉。
+      window.addEventListener('blur', onResizeEnd);
       e.preventDefault();
     });
   }

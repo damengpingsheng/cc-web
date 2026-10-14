@@ -588,8 +588,17 @@ body.session-loading-active {
 }
 /* 收起态手柄跟着列一起消失，别在 0 宽的列边上留一条能点的缝 */
 .app.sidebar-collapsed .sidebar-resizer { display: none; }
-/* 拖动期间整页都用拖动光标，顺手把文字选择关掉 */
-body.sidebar-resizing { cursor: col-resize; user-select: none; }
+/* 拖动期间整页都用拖动光标，顺手把文字选择关掉。
+   为什么不直接写 body.sidebar-resizing：cursor 和 user-select 都是继承属性，给 body 加这个类
+   会让浏览器重算全文档的 computed style（几万节点的会话实测一次 ~800ms，按下和松手各卡一次）。
+   改成整页遮罩后只有这一个元素要算，代价可以忽略，光标和选择行为完全一样。 */
+#drag-shield {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  cursor: col-resize;
+  user-select: none;
+}
 
 @media (max-width: 768px) {
   /* 移动端侧栏是抽屉，宽度不由拖拽决定，且不许超过视口
@@ -971,6 +980,20 @@ body.sidebar-resizing { cursor: col-resize; user-select: none; }
   }
   .app.sidebar-animating.sidebar-collapsed .sidebar {
     transform: translateX(-100%);
+  }
+
+  /* 拖动列宽期间：侧栏同样摘出文档流，但要跟手，所以不带过渡；它让出来的槽位由 JS 写在
+     .app 的 padding-left 上（钉在拖动前的列宽）。这样整段拖动里聊天区宽度不变，每帧只有侧栏
+     自己那十几个条目重排，几千条消息一动不动——长会话下那才是拖动卡顿的大头。 */
+  .app.sidebar-dragging .sidebar {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 50;
+    width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
+    border-right: 1px solid var(--border-color);
   }
 }
 
@@ -1563,6 +1586,11 @@ mark.search-hit.current {
   max-width: 85%;
   min-width: 0;
   animation: fadeIn 0.25s ease;
+  /* 把每条消息的布局与绘制失效范围关在自己这一条里：长会话（几万节点）下，流式输出每
+     帧只改一条气泡的一小段文字，但浏览器会顺着消息列表一路往上重算，实测单帧 Layout
+     14ms + PrePaint 27ms，帧率被压到 40fps 左右；加了 layout containment 之后 PrePaint
+     基本归零、帧率回到 58~60fps，而每条消息的几何、缩放后的重排都完全不变。 */
+  contain: layout;
 }
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(6px); }
@@ -1814,6 +1842,9 @@ mark.search-hit.current {
 
 /* Markdown content */
 .msg-bubble p { margin: 0 0 8px 0; }
+/* 流式气泡里承载「还没写完的那段」的容器：display: contents 让它不进盒树，
+   气泡内的块级盒子与整段全量渲染时完全一致（前缀块是 .msg-text 的直接子节点）。 */
+.msg-stream-part { display: contents; }
 .msg-bubble p:last-child { margin-bottom: 0; }
 .msg-bubble ul, .msg-bubble ol { margin: 4px 0 8px 20px; }
 .msg-bubble li { margin-bottom: 2px; }

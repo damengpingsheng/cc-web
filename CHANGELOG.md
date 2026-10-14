@@ -8,6 +8,130 @@
 
 ---
 
+## 分叉 v1.5.37
+
+### 修改
+
+延续 v1.5.36 的记账（「agent 运行中、不拖动时页面也只有约 30fps」）。真会话里逐项归因后，这一笔把剩下的三段成本都砍掉了：流式每帧重建整条气泡、导航刻度全量重写、以及给 `body` 加类改继承属性引发的全文档样式重算。
+
+1. **流式气泡改成「前缀提交 + 尾巴」增量渲染**（[public/app.js:2638](/home/huxiaojie/Tools/cc-web-my/public/app.js:2638)、切点判断 [public/app.js:2601](/home/huxiaojie/Tools/cc-web-my/public/app.js:2601)）。原来每约 100ms 一次 `flushRender` 都把累积的整段 `pendingText` 重新交给 `marked.parse` 再 `innerHTML` 重建，代价随消息长度线性增长（实测 30k 字符一次 ≈30ms）。现在把气泡切成「已经写完的块（渲染一次就不再动）」和「还没写完的那一块（每帧只重渲这一小段）」：只在空行处切，且当下一行可能是续行（列表 / 引用 / 表格 / 缩进代码块）时不切，围栏内部与还没收到换行的末行也不切。每一帧的渲染代价因此与消息总长度无关；`finishGenerating` 仍走全量渲染，最终输出与以前逐字节一致。尾部用 `display: contents` 的包装承载（[public/style.css:1847](/home/huxiaojie/Tools/cc-web-my/public/style.css:1847) 的 `.msg-stream-part`），不进盒树，所以气泡内的块级盒子与整段全量渲染时完全一致。
+2. **导航刻度只更新变化的那几条**（[public/app.js:4023](/home/huxiaojie/Tools/cc-web-my/public/app.js:4023)、[public/app.js:3996](/home/huxiaojie/Tools/cc-web-my/public/app.js:3996)）。`updateMsgNavActive` 记下当前高亮下标，只在换轮次时摘一个、挂一个；`layoutMsgNav` 写入前先比缓存，落位量化到 0.5px 后绝大多数刻度直接跳过写 `style`。长会话里这里有 170+ 条刻度，原来每次滚动都逐个 `classList.toggle` + 逐个写样式。
+3. **拖动光标与文字选择改由整页遮罩承担**（[public/style.css:595](/home/huxiaojie/Tools/cc-web-my/public/style.css:595)、[public/app.js:4657](/home/huxiaojie/Tools/cc-web-my/public/app.js:4657)、[public/app.js:4739](/home/huxiaojie/Tools/cc-web-my/public/app.js:4739)）。这是用户实测「拖动还是不流畅」的真正原因：原来 `body.sidebar-resizing` 上写着 `cursor` 和 `user-select`，两者都是**继承属性**，给 `body` 加/摘这个类会让浏览器重算全文档 computed style——93k 节点的会话里按下要 763ms、松手要 588ms（`UpdateLayoutTree` 单次最大 656ms），也就是「抓起手柄卡一下、松手再卡一下」。改成拖动期间显示一个 `#drag-shield` 全屏遮罩（`cursor: col-resize; user-select: none`），只有一个元素要算；`body.sidebar-resizing` 保留为纯 JS 状态位（无 CSS 规则，加/摘免费）。
+4. **每条消息加 `contain: layout`**（[public/style.css:1593](/home/huxiaojie/Tools/cc-web-my/public/style.css:1593)）。探针实测：在 3381 条消息 / 93k 节点的会话里，只往一个可见段落里追加几个字符，一帧就要 Layout 14ms + PrePaint 27ms（帧率被压到 41fps）；加上 layout containment 后 PrePaint 归零（2.5s 内 671ms → 48ms）、帧率回到 58~60fps。`.msg` 上本来就有 0.25s 的 `fadeIn` transform 动画，等于这段时间每条消息本来就会成为包含块，所以 containment 带来的包含块 / 层叠上下文变化没有引入新的视觉或定位差异。
+
+### 验证
+
+- `node --check public/app.js` 通过；`node scripts/regression.js` 12 项全过。
+- jsdom 25 条、Playwright Chromium / Firefox 各 45 条全 PASS；拖动期间流式行为 4 条 PASS。
+- **增量渲染等价性**：把 11 段 markdown（段落 / 列表 / 松散列表 / 围栏代码块 / 表格 / 引用 / 缩进代码块 / setext 标题 / 嵌套列表 / 2k 字长段落 / 围栏内含反引号）按 1~13 字符切片喂给「旧实现（HEAD 的 app.js，每帧全量重建）」与「新实现」，逐帧比对气泡 DOM 结构（忽略 `display: contents` 包装），**550/550 帧完全一致**，含每段收尾后 `done` → 新一轮不残留、`resume_generating` 整体改写正文两条路径。
+- **增量确实在生效**：流式 860 字符 / 43 片的过程中，已提交块数随流式增长（5 → 12），尾巴始终只含当前未完成块（85 字符 → 最后 6 字符）。
+- **`contain: layout` 的布局/视觉回归**：同一会话 3381 条消息，加上前后逐条比 `offsetTop / offsetHeight / offsetWidth`、气泡几何、导航刻度落位、`scrollHeight`（515125 不变）全部一致；8 个滚动位置 + 代码块 Preview 展开态的前后截图逐像素比对，差异均为 0（个别位置 4 像素、最大通道差 43，属抗锯齿噪声）。
+- 性能（真实会话 3257 条消息 / `#messages` 93k 节点，agent 流式输出中，真 `marked` + `DOMPurify`）：
+
+  | 场景 | v1.5.36（本笔之前） | 本笔 |
+  |---|---|---|
+  | 流式输出中不拖动，帧率 | 26.3 / 26.5 / 27.1 fps（帧间隔中位 26~32ms） | **50.7 / 49.6 / 50.5 fps（中位 16.7ms）** |
+  | 同上，1.5s 内 50ms 以上长任务 | 630 / 647 / 586ms | 116 / 155 / 69ms |
+  | 流式输出中拖动列宽，帧率 | 57.7 fps / 长任务 925ms（其中按下那一下 909ms） | **56.8 fps / 长任务 0 个（中位 16.7ms、p90 21.9ms）** |
+  | 拖动窗口里 `UpdateLayoutTree` 单次最大 | 656ms | **9ms** |
+
+- 仍未解决（另记账）：流式期间每帧仍有约 20~30ms 花在「内容变高 → 吸底滚动 → 视口新暴露区域绘制」这一套上，1.5s 内累计 300~500ms 长任务。要彻底吃掉得上消息列表虚拟滚动 / `content-visibility`（即之前讨论的 C 方案），本笔不动。
+- 纯前端改动，**不需要重启 cc-web 服务进程**；`public/index.html` 的两个 `?v=` 由 `my.48` 打到 `my.49`。
+
+---
+
+## 分叉 v1.5.36
+
+### 修改
+
+- **拖动列宽期间把流式渲染也推迟到松手：agent 正在跑的时候拖动不再被输出打断。**起因是 v1.5.35 之后用户在那条 3252 条消息的真实会话里实测，agent 运行中拖动仍然不流畅。把真会话（`sessions/32865b58-…`，3257 条消息 / `#messages` 内 66468 个节点）喂进浏览器复测后发现：**拖动本身已经是免费的**（拖动期间聊天区尺寸变化 0 次、0 次强制布局），剩下的是流式输出自己——每约 100ms 一次 `flushRender` 要把累积的整段文本重新解析、重建气泡 DOM 再重排一次，实测单次约 60ms。agent 在跑的时候这条链本来就让页面只有 ~30fps，叠在拖动上就是「每 100ms 卡一下」。
+
+  1. **拖动期间不排新的流式渲染**（[public/app.js:2560](/home/huxiaojie/Tools/cc-web-my/public/app.js:2560)）：`scheduleRender()` 在 `body.sidebar-resizing` 期间只累积 `pendingText` 并置 `renderPendingResize`，复用 `renderPendingHidden`（后台标签页）那条同款思路。
+  2. **在途的那次定时器也一起推迟**（[public/app.js:4641](/home/huxiaojie/Tools/cc-web-my/public/app.js:4641)）：守卫只管新调度进来的 delta，`pointerdown` 时可能已经有一个 100ms 定时器在队列里，不拦住它会照常在拖动中触发一次全量重排。
+  3. **松手时补渲染一次**（[public/app.js:4622](/home/huxiaojie/Tools/cc-web-my/public/app.js:4622)）：和滚动条 / 吸底一样，先摘掉 `sidebar-resizing` 再补，补完文本与一直不动的会话完全一致。
+
+### 验证
+
+- `node --check public/app.js` 通过；`node scripts/regression.js` 12 项全过（这台机器负载高时这套 WS 时序用例偶发超时，同一份代码连跑通过，已确认与本次改动无关）。
+- jsdom 25 条、Playwright Chromium / Firefox 各 45 条旧断言全 PASS，未回归。
+- 新增真实浏览器断言 4 条（`stream-drag-check`）：拖动前流式已渲染；拖动期间确实处于拖动态；**拖动期间流式气泡没被重渲染**（内容停在拖动前那一段）；松手后把拖动期间攒下的文本补渲染出来。
+- 性能（真实会话 3252 条消息 / 66468 节点，agent 流式输出中，同 1.5s 合成拖动）：
+
+  | 指标 | v1.5.35 | 本笔 |
+  |---|---|---|
+  | 拖动期间帧率 | 38~50 fps（夹杂 50~60ms 的流式长任务） | **52~54 fps，帧间隔中位 16.7ms、p90 16.9~19ms** |
+  | 拖动期间 50ms 以上的长任务 | 2~6 个（每个 50~60ms，来自流式渲染） | 0 个 |
+
+- 仍未解决（与本笔无关、另记账）：**agent 运行中、不拖动时页面本身只有约 30fps**。同一份 trace 归因显示这段时间主要花在 `updateMsgNavActive`（每轮 flush 把 172 个导航刻度逐个 `classList.toggle`，2.5s 窗口内 JS 自耗时 97~122ms）以及随之而来的 PrePaint（2.5s 内 630ms）/Layout（253ms），是「每 100ms 一次的流式重排」这套机制本身的成本，要单独优化。
+- 纯前端改动，**不需要重启 cc-web 服务进程**；`public/index.html` 的两个 `?v=` 由 `my.47` 打到 `my.48`。
+
+---
+
+## 分叉 v1.5.35
+
+### 修改
+
+- **拖动列宽期间让聊天区「不参与重排」：几千条消息的会话里拖动提速到满帧。**v1.5.34 之后剩下的卡顿只剩一项——聊天列宽度一变，整条消息列表的文字都要重新换行，这一项跟我们的 JS 无关，测出来是「什么都不做、只强制一次布局」就要 72ms（3260 条消息 / 39120 节点）。既然躲不掉，就让它整段拖动里只发生一次：
+
+  1. **拖动期间侧栏临时摘出文档流，槽位改用 `.app` 的 `padding-left` 钉在拖动前的列宽上**（[public/style.css:979](/home/huxiaojie/Tools/cc-web-my/public/style.css:979) 的 `.app.sidebar-dragging .sidebar`，配合 [public/app.js:4630](/home/huxiaojie/Tools/cc-web-my/public/app.js:4630) 在 pointerdown 写 padding、[public/app.js:4609](/home/huxiaojie/Tools/cc-web-my/public/app.js:4609) 在松手时摘掉）。侧栏照样跟手改宽度，但只重排它自己那十几个会话条目；聊天区宽度全程不变，于是那 72ms 一次都不付。松手时侧栏回到文档流、聊天区按最终宽度重排这一次。
+  2. **收起/展开动画期间不响应拖动**（[public/app.js:4623](/home/huxiaojie/Tools/cc-web-my/public/app.js:4623)）：那 300ms 里侧栏已经在 absolute + 过渡中，插进来会把两套状态叠在一起，这一次直接不理会。
+
+### 取舍
+
+- 拖动中侧栏会浮在聊天内容上：往宽拖时盖住左边一部分文字，往窄拖时露出一条聊天背景的空隙，松手后文字按新宽度归位。换来的是拖动全程满帧，以及松手时仅一帧的重排。
+- 拖动前就在收起态、以及窗口窄于 769px 时手柄本来就不响应，行为不变。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- jsdom 25 条断言全 PASS，含新增四条：拖动期间 `.app` 挂 `sidebar-dragging` 且 `padding-left` 钉在拖前列宽；松手后两者一并摘掉；动画期间 pointerdown 不进入拖动态；动画结束后恢复可拖动。
+- Playwright 真实浏览器 45 条断言全 PASS，Chromium 与 Firefox（无头）各跑一遍。新增五条：拖动中侧栏 `position:absolute`（跟手不带过渡）；拖动中 `.app` 挂 `sidebar-dragging` 且 `padding-left:280px`；**拖动中列宽已跟到 400 而聊天区仍是拖动前的 1000**（这是本方案的核心保证）；松手后侧栏回到 `relative`、两类状态清干净；展开动画进行中 pointerdown 不进入拖动态、动画结束后无残留状态。
+- 性能（同一台机器、3000 条消息 / 39120 节点的合成会话、同 1.5s 合成拖动）：
+
+  | 指标 | v1.5.34 | 本笔 |
+  |---|---|---|
+  | 拖动帧率（Chromium 无头） | 3.5 fps（帧间隔中位 299ms） | **60.4 fps（中位 16.6ms、p90 16.9ms）** |
+  | 拖动帧率（Firefox 无头） | 23.1 fps（中位 27ms、p90 78ms） | **60.8 fps（中位 17ms）** |
+  | 拖动期间聊天区尺寸变化次数（ResizeObserver 计数） | 每帧一次 | **0 次** |
+  | 松手那一帧（真正重排聊天区） | —— | 33.8ms（Chromium）/ 21ms（Firefox） |
+
+- 未实测：真实 Chrome / Edge / Safari 上的绝对数字与视觉细节（本机只有无头浏览器）；改后的每帧成本已经与消息数量脱钩，剩下的绝对开销来自侧栏自己那十几个条目。
+- 纯前端改动，**不需要重启 cc-web 服务进程**；`public/index.html` 的两个 `?v=` 由 `my.46` 打到 `my.47`。
+
+---
+
+## 分叉 v1.5.34
+
+### 修改
+
+- **拖会话列不再每帧重算整棵文档的样式，拖动期间滚动条与吸底也延后到松手。**起因是长会话里拖列宽明显卡：一轮 agent 正在跑、去拖右边缘，窗口跟不上手，输出也随之顿。实测（同机无头 Firefox，3000 条消息 / `#messages` 内 36000 个节点）每次改宽要 320ms，帧率 6fps；把开销拆开是**全文档样式重算 230~254ms + 消息列表重排 55~58ms**——前者几乎全是「`--sidebar-width` 写在 `:root` 上，浏览器只能把整棵文档的 computed style 全部失效重算」，后者是改宽本身躲不掉的文字重排。空会话同口径只要 1~2ms，所以卡顿和会话长度强相关。
+
+  1. **宽度变量从 `:root` 收窄到 `.sidebar`**（[public/app.js:4569](/home/huxiaojie/Tools/cc-web-my/public/app.js:4569)）：同一份 DOM 下「写变量 + 强制布局」从 320ms 降到 60ms（对照：`.sidebar` 范围下 57~60ms，其中 55~58ms 是无改动也要付的布局）。连带一处必须处理：`.app.sidebar-animating:not(.sidebar-collapsed) { padding-left: var(--sidebar-width) }` 是给收起/展开动画撑槽位用的，而 `.app` 现在读不到写在 `.sidebar` 上的变量，于是 [`setSidebarCollapsed()`](/home/huxiaojie/Tools/cc-web-my/public/app.js:4526) 在**展开**方向把同一个像素值落到 `.app` 的 `padding-left` 上（收尾清掉）；收起方向、以及从没拖动过（没有内联变量）的情况一律不写，沿用 CSS 默认值，行为与改前一致。
+
+  2. **拖动侧收口**：pointermove 用 rAF 合并，一帧最多改一次宽度、松手时结算压在帧里的最后一条（[public/app.js:4587](/home/huxiaojie/Tools/cc-web-my/public/app.js:4587)）；`updateScrollbar()`（[public/app.js:3828](/home/huxiaojie/Tools/cc-web-my/public/app.js:3828)）与 `scrollToBottom()`（[public/app.js:3774](/home/huxiaojie/Tools/cc-web-my/public/app.js:3774)）在 `body.sidebar-resizing` 期间直接返回——它们每帧都会读 `scrollHeight`、还会让导航条按 1500 个提问刻度整体重排，和改宽叠在一起等于双份重排；松手时 `onResizeEnd` 补一次，`force` 的那些调用（切会话 / 加载完历史）不受影响。
+
+  3. **拖动中途窗口失焦兜底**：alt-tab、弹窗抢焦点这类情况下收不到 `pointerup`，于是给 `blur` 也挂上 `onResizeEnd`（[public/app.js:4630](/home/huxiaojie/Tools/cc-web-my/public/app.js:4630)），照样结算最后一条 move 并收尾；否则 `sidebar-resizing` 会一直挂在 `body` 上，把滚动条同步和吸底一起关掉。
+
+### 验证
+
+- `node --check public/app.js` 通过。
+- jsdom（真实 `index.html` + `app.js`，只换 WebSocket / CDN 桩）21 条断言全 PASS，含新增的三条：同帧内两条 pointermove 都还没落样式、下一帧才按最后一条落；松手时把未执行的那帧结算掉；拖动期间 `:root` 上的内联变量始终为空。
+- Playwright + 本机 firefox（无头）39 条断言全 PASS，含新增的动画槽位四条（没拖动过时收起/展开动画都不写内联 padding、来回后列宽回到 280；拖动到 900 后展开动画确实按 `900px` 撑槽位、收尾清干净）与失焦收尾三条（失焦前确实在拖动态、失焦后拖动态收干净、失焦收尾时结算最后一条 move 并落库）。
+- 性能前后对比（同一台机器、同一个 3000 条消息的合成会话、同 1.5s 合成拖动）：
+
+  | 指标 | 改前 | 改后 |
+  |---|---|---|
+  | 单次改宽（写变量 + 样式 + 布局） | 320ms | 60ms |
+  | 真实拖动帧率 | 6.0 fps（帧间隔中位 350ms） | 22.6 fps（中位 27ms） |
+  | 流式输出中拖动 | 约 3 fps（329ms/次改宽） | 14~19 fps |
+  | 拖动期间滚动条 thumb 样式写入 | —— | 0 次，松手后补齐（与按新几何算出的期望值一致） |
+  | 拖动期间流式正文 | —— | 仍在增长（4000+ 字符），没被饿死 |
+
+- 未实测：真实 Chrome / Edge / Safari 上的绝对数字（本机只有旧版 firefox 可用，Chrome 的样式与布局都快得多，方向性结论不变）；改后剩下的每帧 ~30ms 就是消息列表自己的文字重排，要从根上解决仍得做消息虚拟化（[上游问题，本笔未动]）。
+- 纯前端改动，**不需要重启 cc-web 服务进程**；`public/index.html` 的两个 `?v=` 由 `my.45` 打到 `my.46`。
+
+---
+
 ## 分叉 v1.5.33
 
 ### 新增
