@@ -8,6 +8,35 @@
 
 ---
 
+## 分叉 v1.5.29
+
+### 新功能（服务端）
+
+- **给 CLI 子进程加一个 `CC_WEB_SESSION=1` 标记，好让 hooks 能判断「这一轮是 cc-web 拉起来的」。**起因是上一笔（v1.5.28）的状态条只能**事后**提示，管不了「模型自己以为完成通知会来」这件事；而模型在本环境里**无法自行分辨**自己在 cc-web 还是在终端 —— `-p` 模式和交互模式拿到的 Bash 工具说明是同一份，里面写着 `run_in_background` 的 `it keeps running across turns and re-invokes you when it exits`，与实际行为相反（回合进程一退，后台命令就被 kill，任务输出文件里只剩 `[killed]`，见 v1.5.28 的实测）。所以「按环境收紧规则」这件事必须由运行时告诉模型和 hook，不能留给模型判断。
+
+  落地方式是给两处 spawn spec 加一行：`buildClaudeSpawnSpec`（[lib/agent-runtime.js:119](/home/huxiaojie/Tools/cc-web-my/lib/agent-runtime.js:119)）与 `buildCodexSpawnSpec`（[lib/agent-runtime.js:252](/home/huxiaojie/Tools/cc-web-my/lib/agent-runtime.js:252)）在组装子进程 env 时置 `env.CC_WEB_SESSION = '1'`，并各自留了注释说明为什么只在 cc-web 置位。终端里的交互会话不带这个标记，所以配套 hook（拒绝 `run_in_background`、注入环境说明）对非 cc-web 场景零影响 —— 这正是加标记而不是无条件收紧的原因：终端下后台任务真的能跨回合存活、完成通知也真的会把人叫醒。
+
+  为什么环境说明不走 `--append-system-prompt`：这个 CLI 的 `--system-prompt-snapshot` 默认 `on`，会把系统提示在会话的**第一次请求**时记录并在后续请求 / `--resume` 中逐字复用（`claude --help` 原文：`every later request and resume sends the record as-is, even when a later launch passes different text, until the conversation is compacted`）。那会带来两个问题：已经存在的会话（含事故会话）resume 时拿不到追加文本，除非压缩重来；反过来，在 cc-web 里新建、之后在终端 resume 的会话会一直带着「你在 cc-web 下」这句，污染终端会话。SessionStart hook 是每次进程启动时注入，两个问题都不存在，所以这一笔只留环境标记，说明文本交给配套 hook。
+
+### 验证
+
+- `node --check lib/agent-runtime.js` 通过。
+- 不依赖模型的确定性验证：用桩依赖调 `createAgentRuntime(...)`，再调两个 build\*SpawnSpec 打印参数与环境（脚本 `~/work_dir/tmp/20261013-bgcheck/verify_spawn.js`，不在仓库内）：
+
+  | 观测 | 结果 |
+  |---|---|
+  | claude 侧 env | `CC_WEB_SESSION = "1"` |
+  | `CC_WEB_PASSWORD` / `CLAUDECODE` | 仍被剔除，未被本次改动破坏 |
+  | 其他环境变量（`FOO`） | 照旧透传 |
+  | codex 侧 env | `CC_WEB_SESSION = "1"` |
+  | claude 参数行 | `-p --output-format stream-json --verbose --dangerously-skip-permissions --resume abc-123`（本次未新增参数） |
+
+- 未实测：模型侧对「自己在 cc-web 下」的感知依赖配套 hook（本笔不含 hook）；且验证时本机模型网关整体不可用（`403 Insufficient account balance` / 多条通道超时），跑不了真实一轮。
+- **本笔动了 `lib/agent-runtime.js`，需要重启 cc-web 服务进程才生效**；前端一行没动，不需要 bump `?v=`。
+
+---
+
+
 ## 分叉 v1.5.28
 
 ### 新功能
