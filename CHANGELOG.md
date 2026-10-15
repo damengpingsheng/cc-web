@@ -8,6 +8,30 @@
 
 ---
 
+## 分叉 v1.5.39
+
+### 修改
+
+提问导航条悬停时的提问原文气泡调大字号、同时也放宽容量，长提问能多看到些内容（[public/style.css:1377](/home/huxiaojie/Tools/cc-web-my/public/style.css:1377)）。原值是 `font-size: 12px` / `max-width: 260px` / `-webkit-line-clamp: 3`，现改成 `16px` / `min(400px, calc(100% - 44px))` / `6`：字号比默认大两档，宽度约 1.54 倍，可见行数翻倍。宽度用 `min()` 加了一层兜底（[public/style.css:486](/home/huxiaojie/Tools/cc-web-my/public/style.css:486) 已有同样写法），窄窗口下最多占满容器再留 44px（左侧留白 + 与轨道的间距），不会因为变宽把左边缘顶出 `.messages-wrap` 被裁掉。
+
+只改 `.msg-nav-tip` 的三条声明；`right: 22px`、`padding`、`line-height` 与 JS 侧的落位逻辑都没动——气泡的 `top` 仍按 `messagesDiv.clientHeight - offsetHeight` 夹取（[public/app.js:4629](/home/huxiaojie/Tools/cc-web-my/public/app.js:4629)），气泡变高后贴边那条会自动往上收，越界时退化成贴顶显示。导航刻度本身是 2px 横线、没有文字，不涉及。
+
+### 验证
+
+- 只有 CSS 里的三条声明变化，`public/app.js` 未动，`node --check public/app.js` 不适用；改动后 `git diff` 只含这几行加版本号与本节记账。
+- **可见容量实测**：登录页进不去聊天区，就用仓库里真实的 `public/style.css`（去掉首行拉 Google Fonts 的 `@import`，离线会一直等 link 的 load）复刻 `.messages-wrap` + `.msg-nav-tip` 的结构量。同一条 216 字的提问，逐字量 Range rect 数「实际露出来的字数」：
+
+  | 聊天列宽 | 旧（12px/260px/3 行） | 新（16px/min()/6 行） |
+  |---|---|---|
+  | 980px | 气泡 260×64，露 58 字 | 气泡 400×151，**露 137 字** |
+  | 520px | 气泡 260×64，露 58 字 | 气泡 400×151，**露 137 字** |
+  | 320px（窄面板） | 气泡 260×64，露 58 字 | 气泡 276×151（`min()` 兜底生效），**露 94 字** |
+
+  三档列宽下左边缘都在 `.messages-wrap` 内（`clippedLeft` 均为 false），窄到 320px 也只是收窄而不会被裁掉。探针脚本 `~/work_dir/tmp/20261015-navg-tip/probe2.js`。
+- 纯前端改动，**不需要重启 cc-web 服务进程**；`public/index.html` 的两个 `?v=` 由 `my.50` 打到 `my.53`（中途两档 `my.51`、`my.52` 是 14px / 16px 那两版，在同一条未提交的改动上逐次重打，避免浏览器吃旧缓存）。
+
+---
+
 ## 分叉 v1.5.38
 
 ### 修改

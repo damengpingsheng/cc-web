@@ -1378,20 +1378,20 @@ body.session-loading-active {
   position: absolute;
   right: 22px;
   z-index: 8;
-  max-width: 260px;
+  max-width: min(400px, calc(100% - 44px));
   padding: 6px 9px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: var(--surface-strong);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: 16px;
   line-height: 1.45;
   overflow-wrap: anywhere;
   pointer-events: none;
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 6;
   overflow: hidden;
 }
 .msg-nav-tip[hidden] { display: none; }
