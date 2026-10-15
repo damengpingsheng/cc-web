@@ -1416,7 +1416,9 @@
     updateCwdBadge();
     updateGatewayBadge();
     updateModelBadge();
+    virtForget();
     messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
+    scheduleNavRebuild();
     setStatsDisplay(null);
     renderPendingAttachments();
     highlightActiveSession();
@@ -2094,9 +2096,7 @@
         if (msg.sessionId === currentSessionId && appended.length > 0) {
           const welcome = messagesDiv.querySelector('.welcome-msg');
           if (welcome) welcome.remove();
-          const frag = document.createDocumentFragment();
-          appended.forEach((m) => frag.appendChild(buildMsgElement(m)));
-          messagesDiv.appendChild(frag);
+          virtAppendEls(appended.map((m) => buildMsgElement(m)));
           scrollToBottom();
           updateScrollbar();
         }
@@ -2151,16 +2151,16 @@
           if (msg.totalUsage) setStatsDisplay({ totalUsage: msg.totalUsage });
           const changesMessages = replacement.length > 0 || historyTotal !== previousTotal;
           if (changesMessages) {
-            const renderedMessages = Array.from(messagesDiv.children)
-              .filter((element) => element.classList.contains('msg'));
-            if (validRange && renderedMessages.length === previousTotal) {
+            const renderedCount = virtItemCount()
+              + ((virtStreamEl && virtStreamEl.parentNode === messagesDiv) ? 1 : 0);
+            if (validRange && renderedCount === previousTotal) {
               renderEpoch++;
-              for (let i = fromIndex; i < renderedMessages.length; i++) renderedMessages[i].remove();
               const welcome = messagesDiv.querySelector('.welcome-msg');
               if (welcome) welcome.remove();
-              const frag = document.createDocumentFragment();
-              replacement.forEach((message) => frag.appendChild(buildMsgElement(message)));
-              messagesDiv.appendChild(frag);
+              virtAdopt(replacement.map((message) => buildMsgElement(message)), {
+                replaceFrom: fromIndex,
+                pinTail: true,
+              });
               scrollToBottom();
               updateScrollbar();
             } else {
@@ -2462,7 +2462,7 @@
     bubble.appendChild(textDiv);
     bubble.appendChild(toolsDiv);
     ensureTypingIndicator(bubble);
-    messagesDiv.appendChild(msgEl);
+    virtAttachStream(msgEl);
     scrollToBottom();
   }
 
@@ -2529,6 +2529,8 @@
       // 本轮出现过 run_in_background：在气泡末尾补状态条 + 唤醒按钮（见 buildBackgroundNoteElement）
       appendBackgroundNote(streamEl.querySelector('.msg-bubble'), pendingBackgroundTasks);
     }
+    // 这一轮结束了，流式气泡变成普通消息，纳入虚拟化的高度缓存
+    virtAdoptStream();
 
     if (sessionId) currentSessionId = sessionId;
     pendingText = '';
@@ -3128,18 +3130,498 @@
     return el;
   }
 
+  // === 消息列表虚拟化 ===
+  // 长会话里聊天区一改宽度，每一条消息都要重新换行。实测 3382 条消息 / 9.3 万节点时，
+  // 「改宽 + 强制布局」一下是 118~165ms，紧接着的 PrePaint + Paint 又要 220~270ms，
+  // 合起来就是松手后那 400ms 的停顿，而且与会话长度成正比。
+  // 这里只把视口附近的消息挂在 DOM 上，其余摘出去、由上下两个 spacer 顶住它们的高度：
+  // 改宽时只有窗口里那几十条参与重排，同一实测口径下 135ms -> 2ms。
+  //
+  // 摘出去的消息不销毁，元素引用留在 virtItems 里（展开态、代码预览、搜索高亮、事件
+  // 监听都跟着节点走），滚回来直接挂回去，不重新解析 markdown。高度是在消息还挂在
+  // DOM 里的时候量的（加载收尾量一次、之后追加/挂回来时补量），所以 spacer 的高度、
+  // 滚动条长度、导航条刻度的落位都是真实值而不是估算值。
+  const VIRT_OVERSCAN_PX = 900;   // 视口上下各多挂这么多像素的消息
+  const VIRT_MIN_ITEMS = 24;      // 窗口至少这么多条，避免一条超长消息（长代码块）把窗口撑成一条
+  // 改宽之后要把窗口外那些消息的高度缓存按新宽度重算一遍。这批活不能一次干完：实测
+  // 一次挂 120 条来量，光布局就要 55~99ms，松手后每隔 130ms 顶着一次百毫秒长任务，
+  // 手停下来还在顿。改成「按时间预算切小段 + 段间留空隙」，单轮只占几毫秒，慢慢收敛。
+  const VIRT_SWEEP_SLICE = 6;     // 预算检查粒度：每量这么多条看一眼还剩多少时间
+  const VIRT_SWEEP_BUDGET_MS = 8; // 单轮空闲重算的时间预算，超了就把剩下的留给下一轮
+  const VIRT_SWEEP_GAP_MS = 120;  // 没有 requestIdleCallback 时的兜底间隔
+  const VIRT_SWEEP_IDLE_MS = 300; // requestIdleCallback 的最长等待：一直忙也得插进来推进一点
+  const virtIdle = typeof window.requestIdleCallback === 'function' ? window.requestIdleCallback.bind(window) : null;
+  const virtCancelIdle = typeof window.cancelIdleCallback === 'function' ? window.cancelIdleCallback.bind(window) : null;
+  let virtItems = [];             // [{ el, h, noAnim }]，顺序即会话顺序；h 是最近一次量到的高度
+  let virtPrefix = [0];           // virtPrefix[i] = 第 i 条顶部相对内容区和偏移（不含容器 padding）
+  let virtStart = 0;              // 当前挂在 DOM 里的窗口 [virtStart, virtEnd)
+  let virtEnd = 0;
+  let virtTopSpacer = null;
+  let virtBotSpacer = null;
+  let virtStreamEl = null;        // 流式气泡：始终挂在文档里（多处 getElementById('streaming-msg') 的守卫依赖它）
+  let virtGap = 12;               // .messages 的 row-gap，spacer 高度要跟它对齐
+  let virtPadTop = 16;
+  let virtEstH = 120;             // 还没量到高度的消息的临时估值（只在加载被打断时才会用到）
+  let virtRebalancing = false;    // 量高度会触发 ResizeObserver，防重入
+  let virtScrollRaf = 0;
+  let virtSweepTimer = 0;
+  let virtSweepIdle = false;
+  let virtSweepAt = 0;
+  let virtSweepCursor = 0;
+  let virtElIndex = new Map();    // 元素 -> 下标，搜索定位用
+
+  function virtGapPx() {
+    const g = parseFloat(getComputedStyle(messagesDiv).rowGap);
+    return Number.isFinite(g) ? g : 12;
+  }
+
+  function virtPadTopPx() {
+    const p = parseFloat(getComputedStyle(messagesDiv).paddingTop);
+    return Number.isFinite(p) ? p : 0;
+  }
+
+  function virtItemH(i) {
+    const h = virtItems[i].h;
+    return h > 0 ? h : virtEstH;
+  }
+
+  // 重建前缀：virtPrefix[i] 是第 i 条的顶部偏移（相对内容区，不含容器 padding），
+  // virtPrefix[n] 等于「全部内容高 + 一个 gap」。
+  function virtRebuildPrefix() {
+    const n = virtItems.length;
+    const p = new Array(n + 1);
+    p[0] = 0;
+    for (let i = 0; i < n; i++) p[i + 1] = p[i] + virtItemH(i) + virtGap;
+    virtPrefix = p;
+  }
+
+  function virtRebuildIndex() {
+    virtElIndex = new Map();
+    for (let i = 0; i < virtItems.length; i++) virtElIndex.set(virtItems[i].el, i);
+  }
+
+  // 第一个「顶部偏移 >= offset」的下标
+  function virtLowerBound(offset) {
+    let lo = 0;
+    let hi = virtItems.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (virtPrefix[mid] < offset) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  // 与 el.offsetTop / messagesDiv.scrollTop 同一坐标系（含容器 padding）
+  function virtOffset(i) {
+    return virtPadTop + virtPrefix[i];
+  }
+
+  function virtItemCount() {
+    return virtItems.length;
+  }
+
+  function virtEnsureSpacers() {
+    if (!virtTopSpacer) {
+      virtTopSpacer = document.createElement('div');
+      virtTopSpacer.className = 'virt-spacer';
+      virtTopSpacer.setAttribute('aria-hidden', 'true');
+    }
+    if (!virtBotSpacer) {
+      virtBotSpacer = document.createElement('div');
+      virtBotSpacer.className = 'virt-spacer';
+      virtBotSpacer.setAttribute('aria-hidden', 'true');
+    }
+    // flex 列容器里默认 flex-shrink: 1，空 spacer 的 min-height 又是 0，不锁住就会被压扁
+    virtTopSpacer.style.flex = '0 0 auto';
+    virtBotSpacer.style.flex = '0 0 auto';
+  }
+
+  function virtSetSpacer(spacer, height) {
+    if (height > 0.5) {
+      spacer.style.display = 'block';
+      spacer.style.height = height + 'px';
+    } else {
+      spacer.style.display = 'none';
+      spacer.style.height = '0px';
+    }
+  }
+
+  // 把 DOM 摆成「[topSpacer][窗口][botSpacer]」，两个 spacer 的高度顶住被摘掉的那些消息。
+  // 高度按 virtPrefix 算：spacer 覆盖 k 条未挂载的消息时高度 = Σh + gap*k - gap，
+  // 加上 spacer 自己两侧各一个 gap，总高度与「全挂载」时逐像素一致。
+  function virtPlaceWindow(s, e) {
+    virtEnsureSpacers();
+    const n = virtItems.length;
+    // 摘掉窗口外的。按实际挂在 DOM 上的子节点判定，而不是按 virtStart/virtEnd 记录的旧范围：
+    // virtForget() / 整树重建之后这两个下标不再代表「现在挂着哪些」，只按它们摘会漏掉整批。
+    for (const el of Array.from(messagesDiv.children)) {
+      if (!el.classList.contains('msg') || el === virtStreamEl) continue;
+      const idx = virtElIndex.get(el);
+      if (idx !== undefined && idx >= s && idx < e) continue;
+      el.remove();
+    }
+    virtSetSpacer(virtTopSpacer, s > 0 ? (virtPrefix[s] - virtGap) : 0);
+    virtSetSpacer(virtBotSpacer, e < n ? ((virtPrefix[n] - virtPrefix[e]) - virtGap) : 0);
+    const streamAttached = virtStreamEl && virtStreamEl.parentNode === messagesDiv;
+    if (virtBotSpacer.parentNode !== messagesDiv) {
+      messagesDiv.insertBefore(virtBotSpacer, streamAttached ? virtStreamEl : null);
+    }
+    let ref = virtBotSpacer;
+    for (let i = e - 1; i >= s; i--) {
+      const it = virtItems[i];
+      const el = it.el;
+      if (el.parentNode !== messagesDiv || el.nextSibling !== ref) messagesDiv.insertBefore(el, ref);
+      // 摘出去过的消息再挂回来时不重播 fadeIn：动画是跟着「元素第一次渲染」走的，
+      // 不掐掉的话每滚动一步，新进视口的消息都会再淡入一次。
+      if (it.h > 0 && !it.noAnim) { it.noAnim = true; el.style.animation = 'none'; }
+      ref = el;
+    }
+    if (virtTopSpacer.parentNode !== messagesDiv || virtTopSpacer.nextSibling !== ref) {
+      messagesDiv.insertBefore(virtTopSpacer, ref);
+    }
+    virtStart = s;
+    virtEnd = e;
+  }
+
+  // 只量这一批新挂上来的：窗口里已经在挂着的那些高度没变，重复读 offsetHeight 等于每帧白付一次强制布局
+  function virtMeasureItems(items) {
+    let changed = false;
+    let sum = 0;
+    let count = 0;
+    for (const it of items) {
+      const h = it.el.offsetHeight;
+      if (h > 0 && h !== it.h) { it.h = h; changed = true; }
+      if (it.h > 0) { sum += it.h; count += 1; }
+    }
+    if (count > 0) {
+      const avg = Math.round(sum / count);
+      if (avg > 0) virtEstH = Math.max(32, Math.min(600, avg));
+    }
+    return changed;
+  }
+
+  // 视口位置→窗口范围。pinTail 时窗口一定含最后一条（吸底那套依赖 scrollHeight 是真实值）。
+  function virtRange(scrollTop, viewH, pinTail) {
+    const n = virtItems.length;
+    if (pinTail) {
+      let s = virtLowerBound(Math.max(0, virtPrefix[n] - (viewH + VIRT_OVERSCAN_PX)));
+      if (n - s < VIRT_MIN_ITEMS) s = Math.max(0, n - VIRT_MIN_ITEMS);
+      return [s, n];
+    }
+    const top = Math.max(0, scrollTop - virtPadTop);
+    let s = virtLowerBound(Math.max(0, top - VIRT_OVERSCAN_PX));
+    let e = virtLowerBound(top + viewH + VIRT_OVERSCAN_PX) + 1;
+    if (e > n) e = n;
+    if (e - s < VIRT_MIN_ITEMS) {
+      s = Math.max(0, Math.min(s, n - VIRT_MIN_ITEMS));
+      e = Math.min(n, s + VIRT_MIN_ITEMS);
+    }
+    return [s, e];
+  }
+
+  // 核心：按当前滚动位置收窗口、挂消息、重算 spacer。
+  // options.around      —— 以这条消息为中心收窗口（跳转用，它可能离视口很远）
+  // options.pinTail     —— 强制把窗口钉在末尾（吸底）
+  function virtRebalance(options = {}) {
+    if (virtRebalancing) return;
+    const n = virtItems.length;
+    if (n === 0) {
+      if (virtTopSpacer && virtTopSpacer.parentNode) virtTopSpacer.remove();
+      if (virtBotSpacer && virtBotSpacer.parentNode) virtBotSpacer.remove();
+      virtStart = 0;
+      virtEnd = 0;
+      return;
+    }
+    virtRebalancing = true;
+    try {
+      virtGap = virtGapPx();
+      virtPadTop = virtPadTopPx();
+      virtRebuildPrefix();
+      const anchorEl = virtStart < virtEnd ? virtItems[virtStart].el : null;
+      const anchorRel = (anchorEl && anchorEl.parentNode === messagesDiv)
+        ? anchorEl.offsetTop - messagesDiv.scrollTop : null;
+      const viewH = messagesDiv.clientHeight;
+      const pinTail = !!(options.pinTail || stickToBottom);
+      let s;
+      let e;
+      if (typeof options.around === 'number') {
+        s = Math.max(0, options.around - VIRT_MIN_ITEMS);
+        e = Math.min(n, options.around + VIRT_MIN_ITEMS);
+      } else {
+        const range = virtRange(messagesDiv.scrollTop, viewH, pinTail);
+        s = range[0];
+        e = range[1];
+      }
+      virtPlaceWindow(s, e);
+      // 量这一窗：新挂上的要量，一直挂着的也可能刚被展开折叠块 / 切了代码预览而变高。
+      // 第一次读 offsetHeight 的强制布局本来就要付（下面的锚点也要读 offsetTop）。
+      const changed = virtMeasureItems(virtItems.slice(s, e));
+      if (changed) {
+        virtRebuildPrefix();
+        virtPlaceWindow(s, e);
+      }
+      if (pinTail) {
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      } else if (anchorEl && anchorRel !== null && anchorEl.parentNode === messagesDiv) {
+        // 窗口里那些刚量到的高度一变，可见区上面的总高就变了，按锚点把视口钉回原处
+        const preferred = anchorEl.offsetTop - anchorRel;
+        if (Math.abs(preferred - messagesDiv.scrollTop) > 0.5) messagesDiv.scrollTop = preferred;
+      }
+    } finally {
+      virtRebalancing = false;
+    }
+  }
+
+  // 滚动时按 rAF 收一次窗口：拖动列宽期间聊天区宽度被 padding 钉住，不用跟着收
+  function virtNotifyScroll() {
+    if (virtScrollRaf) return;
+    virtScrollRaf = requestAnimationFrame(() => {
+      virtScrollRaf = 0;
+      if (document.body.classList.contains('sidebar-resizing')) return;
+      virtRebalance();
+    });
+  }
+
+  // 改宽之后窗口里那些消息的高度全变了，摘出去的那些还是旧宽度的值。可见窗口立刻重量，
+  // 其余的分批在空闲时间重量，免得滚动条长度一直按旧宽度算。
+  function virtScheduleSweep() {
+    virtSweepAt = renderEpoch;
+    virtQueueSweepStep(400);
+  }
+
+  // 空闲重算的交班：有 requestIdleCallback 就贴着浏览器的空闲时间跑（松手后几秒钟就能收敛完，
+  // 中间一帧都不抢），没有（Safari）就用 setTimeout 兜底。
+  function virtQueueSweepStep(delayMs) {
+    if (virtSweepTimer) {
+      if (virtSweepIdle) virtCancelIdle(virtSweepTimer);
+      else clearTimeout(virtSweepTimer);
+      virtSweepTimer = 0;
+    }
+    if (virtIdle) {
+      virtSweepIdle = true;
+      virtSweepTimer = virtIdle(virtSweepSteps, { timeout: Math.max(delayMs, VIRT_SWEEP_IDLE_MS) });
+    } else {
+      virtSweepIdle = false;
+      virtSweepTimer = setTimeout(virtSweepSteps, delayMs);
+    }
+  }
+
+  function virtSweepSteps() {
+    virtSweepTimer = 0;
+    if (virtSweepAt !== renderEpoch || virtItems.length === 0) return;
+    if (document.body.classList.contains('sidebar-resizing') || document.hidden) {
+      virtQueueSweepStep(400);
+      return;
+    }
+    // 从前往后扫，跳过当前挂着的窗口（它们的值是新的）
+    const batch = [];
+    let i = virtSweepCursor;
+    // 挑一批候选出来，真正量多少由 virtMeasureBatch 按预算决定
+    while (i < virtItems.length && batch.length < VIRT_SWEEP_SLICE * 8) {
+      if (i >= virtStart && i < virtEnd) { i = virtEnd; continue; }
+      batch.push(virtItems[i]);
+      i += 1;
+    }
+    const done = batch.length > 0 ? virtMeasureBatch(batch, VIRT_SWEEP_BUDGET_MS) : 0;
+    virtSweepCursor = i - (batch.length - done);
+    if (virtSweepCursor < virtItems.length) virtQueueSweepStep(VIRT_SWEEP_GAP_MS);
+    else virtSweepCursor = 0;
+  }
+
+  // 把一批已经建好但当前没挂载的消息临时挂到窗口上方量一遍，再摘掉：contain: layout 让每条
+  // 消息自己成一团，量它们不会牵动可见窗口，视口位置也不会变。
+  // 分小段推进、每段量完看一眼时间预算，超预算就停下，返回实际量了多少条（剩下的下一轮再来）：
+  // 量一条删一条会让每次 remove 都让布局失效、下一次读 offsetHeight 又得重排一遍，所以每段
+  // 都是「先全部读高度、再统一摘掉」，摘除期间不读布局，浏览器能把整段合并成一次。
+  function virtMeasureBatch(items, budgetMs) {
+    if (items.length === 0) return 0;
+    const deadline = budgetMs > 0 ? performance.now() + budgetMs : Infinity;
+    let done = 0;
+    while (done < items.length) {
+      const slice = items.length - done > VIRT_SWEEP_SLICE ? items.slice(done, done + VIRT_SWEEP_SLICE) : items.slice(done);
+      const anchorEl = virtStart < virtEnd ? virtItems[virtStart].el : null;
+      const anchorRel = (anchorEl && anchorEl.parentNode === messagesDiv)
+        ? anchorEl.offsetTop - messagesDiv.scrollTop : null;
+      const frag = document.createDocumentFragment();
+      for (const it of slice) frag.appendChild(it.el);
+      messagesDiv.insertBefore(frag, virtTopSpacer.parentNode === messagesDiv ? virtTopSpacer : null);
+      const heights = new Array(slice.length);
+      for (let k = 0; k < slice.length; k++) heights[k] = slice[k].el.offsetHeight;
+      let sliceChanged = false;
+      for (let k = 0; k < slice.length; k++) {
+        const it = slice[k];
+        const h = heights[k];
+        if (h > 0 && h !== it.h) { it.h = h; sliceChanged = true; }
+        if (it.el !== virtStreamEl) it.el.remove();
+      }
+      done += slice.length;
+      if (sliceChanged) {
+        virtRebuildPrefix();
+        virtPlaceWindow(virtStart, virtEnd);
+        if (anchorEl && anchorRel !== null && anchorEl.parentNode === messagesDiv) {
+          messagesDiv.scrollTop = anchorEl.offsetTop - anchorRel;
+        }
+      }
+      if (performance.now() >= deadline) break;
+    }
+    return done;
+  }
+
+  function virtForget() {
+    virtItems = [];
+    virtPrefix = [0];
+    virtStart = 0;
+    virtEnd = 0;
+    virtStreamEl = null;
+    virtElIndex = new Map();
+    virtSweepAt = -1;
+    virtSweepCursor = 0;
+    if (virtTopSpacer && virtTopSpacer.parentNode) virtTopSpacer.remove();
+    if (virtBotSpacer && virtBotSpacer.parentNode) virtBotSpacer.remove();
+    virtTopSpacer = null;
+    virtBotSpacer = null;
+  }
+
+  // renderMessages / prependHistoryMessages 把元素建好插进 DOM 之后交给这里接管：
+  // 量高度、挂上窗口、其余摘出去。front=true 表示这批是插在最前面的（更早的历史）。
+  function virtAdopt(els, options = {}) {
+    const plain = [];
+    for (const el of els) {
+      if (!el) continue;
+      if (el === virtStreamEl || el.classList.contains('welcome-msg')) continue;
+      plain.push(el);
+    }
+    if (plain.length === 0) return;
+    const items = plain.map((el) => ({ el, h: 0, noAnim: false }));
+    // 量高度必须在文档里：调用方没插的（比如 imported_messages_replaced 的新）先挂到末尾
+    const fresh = plain.filter((el) => el.parentNode !== messagesDiv);
+    if (fresh.length > 0) {
+      virtEnsureSpacers();
+      const ref = (virtStreamEl && virtStreamEl.parentNode === messagesDiv)
+        ? virtStreamEl
+        : (virtBotSpacer.parentNode === messagesDiv ? virtBotSpacer : null);
+      const holder = document.createDocumentFragment();
+      for (const el of fresh) holder.appendChild(el);
+      messagesDiv.insertBefore(holder, ref);
+    }
+    virtMeasureItems(items);
+    if (options.front) virtItems = items.concat(virtItems);
+    else if (options.replaceFrom !== undefined) {
+      const from = Math.max(0, options.replaceFrom);
+      const dropped = virtItems.slice(from);
+      for (const it of dropped) { if (it.el !== virtStreamEl && it.el.parentNode) it.el.remove(); }
+      virtItems = virtItems.slice(0, from).concat(items);
+    } else virtItems = virtItems.concat(items);
+    virtGap = virtGapPx();
+    virtPadTop = virtPadTopPx();
+    virtRebuildPrefix();
+    virtRebuildIndex();
+    virtRebalance({ pinTail: options.pinTail === true });
+    scheduleNavRebuild();
+    scheduleSearchRescan();
+  }
+
+  // 加载收尾：整棵消息树都在 DOM 里，一次量完再收窗口
+  function virtAdoptAll() {
+    const els = Array.from(messagesDiv.children).filter((el) => el.classList.contains('msg'));
+    if (els.length === 0) return;
+    virtForget();
+    const items = els.map((el) => ({ el, h: 0, noAnim: false }));
+    virtItems = items;
+    virtMeasureItems(items);
+    virtGap = virtGapPx();
+    virtPadTop = virtPadTopPx();
+    virtRebuildPrefix();
+    virtRebuildIndex();
+    virtRebalance({ pinTail: true });
+    scheduleNavRebuild();
+  }
+
+  function virtAppendEls(els) {
+    const plain = els.filter((el) => el && el !== virtStreamEl && !el.classList.contains('welcome-msg'));
+    if (plain.length === 0) return;
+    const items = plain.map((el) => ({ el, h: 0, noAnim: false }));
+    // 先挂下来量高度（新消息按定义在最后，视觉上本来就要出现在底部）
+    const ref = (virtStreamEl && virtStreamEl.parentNode === messagesDiv) ? virtStreamEl : null;
+    const holder = document.createDocumentFragment();
+    for (const it of items) holder.appendChild(it.el);
+    messagesDiv.insertBefore(holder, ref);
+    virtMeasureItems(items);
+    virtItems = virtItems.concat(items);
+    virtGap = virtGapPx();
+    virtPadTop = virtPadTopPx();
+    virtRebuildPrefix();
+    virtRebuildIndex();
+    virtRebalance();
+    scheduleNavRebuild();
+    scheduleSearchRescan();
+  }
+
+  // 流式气泡：挂进列表末尾（在 botSpacer 之后），并始终留在文档里
+  function virtAttachStream(el) {
+    virtEnsureSpacers();
+    if (virtBotSpacer.parentNode !== messagesDiv) messagesDiv.appendChild(virtBotSpacer);
+    virtStreamEl = el;
+    messagesDiv.appendChild(el);
+  }
+
+  // 一轮跑完：流式气泡变成普通消息，纳入高度缓存
+  function virtAdoptStream() {
+    const el = virtStreamEl;
+    if (!el) return;
+    virtStreamEl = null;
+    if (el.parentNode !== messagesDiv) el.remove();
+    virtAdopt([el]);
+  }
+
+  function virtIndexOfNode(node) {
+    let p = node;
+    while (p && p !== messagesDiv) {
+      const idx = virtElIndex.get(p);
+      if (idx !== undefined) return idx;
+      p = p.parentNode;
+    }
+    return -1;
+  }
+
+  function virtEnsureAttached(idx) {
+    if (idx < 0 || idx >= virtItems.length) return false;
+    if (virtItems[idx].el.parentNode === messagesDiv) return true;
+    virtRebalance({ around: idx });
+    return virtItems[idx].el.parentNode === messagesDiv;
+  }
+
+  // 跳到某条消息：先把窗口挪过去（真实落位才拿得到），再按它的 offsetTop 定 scrollTop
+  function virtScrollToIndex(idx, options = {}) {
+    if (!virtEnsureAttached(idx)) return;
+    const el = virtItems[idx].el;
+    const top = options.topOffset || 0;
+    messagesDiv.scrollTop = Math.max(0, el.offsetTop - top);
+    virtRebalance();
+  }
+
+  function virtAllElements() {
+    const out = virtItems.map((it) => it.el);
+    if (virtStreamEl) out.push(virtStreamEl);
+    return out;
+  }
+
   function renderMessages(messages, options = {}) {
     renderEpoch++;
     const epoch = renderEpoch;
+    virtForget();
     messagesDiv.innerHTML = '';
     if (messages.length === 0) {
       messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
+      scheduleNavRebuild();
       return;
     }
     if (options.immediate) {
       const frag = document.createDocumentFragment();
       messages.forEach((message) => frag.appendChild(buildMsgElement(message)));
       messagesDiv.appendChild(frag);
+      virtAdoptAll();
       scrollToBottom(true);
       return;
     }
@@ -3161,6 +3643,7 @@
     const frag0 = document.createDocumentFragment();
     for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i]));
     messagesDiv.appendChild(frag0);
+    virtAdoptAll();
     scrollToBottom(true);
 
     // Render remaining batches asynchronously, prepending each
@@ -3171,13 +3654,17 @@
       delay += 16;
       setTimeout(() => {
         if (renderEpoch !== epoch) return; // session switched, abort stale render
-        const prevHeight = messagesDiv.scrollHeight;
-        const prevScrollTop = messagesDiv.scrollTop;
         const frag = document.createDocumentFragment();
-        for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i]));
-        messagesDiv.insertBefore(frag, messagesDiv.firstChild);
-        // Compensate scrollTop so visible area stays unchanged
-        messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
+        const els = [];
+        for (let i = start; i < end; i++) {
+          const el = buildMsgElement(messages[i]);
+          els.push(el);
+          frag.appendChild(el);
+        }
+        // 插在最前面（更早的历史），交给虚拟化接管：量高度 -> 收窗口 -> 按锚点把视口钉回原处
+        messagesDiv.insertBefore(frag, (virtTopSpacer && virtTopSpacer.parentNode === messagesDiv)
+          ? virtTopSpacer : messagesDiv.firstChild);
+        virtAdopt(els, { front: true, pinTail: false });
         updateScrollbar();
         scheduleSearchRescan();
       }, delay);
@@ -3191,17 +3678,26 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const frag = document.createDocumentFragment();
-    messages.forEach((m) => frag.appendChild(buildMsgElement(m)));
+    const els = [];
+    messages.forEach((m) => {
+      const el = buildMsgElement(m);
+      els.push(el);
+      frag.appendChild(el);
+    });
+    const headRef = (virtTopSpacer && virtTopSpacer.parentNode === messagesDiv)
+      ? virtTopSpacer : messagesDiv.firstChild;
     if (!preserveScroll) {
-      messagesDiv.insertBefore(frag, messagesDiv.firstChild);
+      messagesDiv.insertBefore(frag, headRef);
+      virtAdopt(els, { front: true, pinTail: true });
       if (!skipScrollbar) updateScrollbar();
       scheduleSearchRescan();
       return;
     }
     const prevHeight = messagesDiv.scrollHeight;
     const prevScrollTop = messagesDiv.scrollTop;
-    messagesDiv.insertBefore(frag, messagesDiv.firstChild);
+    messagesDiv.insertBefore(frag, headRef);
     messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
+    virtAdopt(els, { front: true, pinTail: false });
     if (!skipScrollbar) updateScrollbar();
     scheduleSearchRescan();
   }
@@ -3214,19 +3710,25 @@
   const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search, .msg-time, .msg-actions, .msg-bg-note';
 
   function collectSearchTextNodes() {
-    const walker = document.createTreeWalker(messagesDiv, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-        const parent = node.parentElement;
-        if (!parent) return NodeFilter.FILTER_REJECT;
-        // 语言标签、Copy/Preview 按钮、气泡时间都是注入的 UI，不是对话内容
-        if (parent.closest(SEARCH_SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      },
-    });
     const nodes = [];
-    let node;
-    while ((node = walker.nextNode())) nodes.push(node);
+    // 虚拟化之后消息不一定挂在 DOM 里，所以逐条消息遍历：被摘出去的那些也在 virtItems 里，
+    // 整段会话都能搜到（只切分/还原它们自己的文本节点，不需要先把它们挂回文档）。
+    const roots = virtAllElements();
+    const list = roots.length > 0 ? roots : [messagesDiv];
+    for (const root of list) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+          const parent = node.parentElement;
+          if (!parent) return NodeFilter.FILTER_REJECT;
+          // 语言标签、Copy/Preview 按钮、气泡时间都是注入的 UI，不是对话内容
+          if (parent.closest(SEARCH_SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      let node;
+      while ((node = walker.nextNode())) nodes.push(node);
+    }
     return nodes;
   }
 
@@ -3257,12 +3759,16 @@
 
   function clearSearchHighlights() {
     const parents = new Set();
-    messagesDiv.querySelectorAll('mark.search-hit').forEach((mark) => {
-      const parent = mark.parentNode;
-      if (!parent) return;
-      parent.replaceChild(document.createTextNode(mark.textContent), mark);
-      parents.add(parent);
-    });
+    const roots = virtAllElements();
+    const list = roots.length > 0 ? roots : [messagesDiv];
+    for (const root of list) {
+      root.querySelectorAll('mark.search-hit').forEach((mark) => {
+        const parent = mark.parentNode;
+        if (!parent) return;
+        parent.replaceChild(document.createTextNode(mark.textContent), mark);
+        parents.add(parent);
+      });
+    }
     // 合回单个文本节点，否则反复搜索会把同一段文字切得越来越碎，跨节点的词再也搜不到
     parents.forEach((parent) => parent.normalize());
     searchHits = [];
@@ -3298,7 +3804,14 @@
     const mark = searchHits[next];
     mark.classList.add('current');
     if (options.scroll !== false) {
+      // 跳过去之前先退出吸底：否则 virtEnsureAttached / virtRebalance 会把窗口钉回末尾，
+      // 命中的那条转眼又被摘出去（rect 全变 0），滚动位置也就落不到它身上。
+      stickToBottom = false;
+      // 命中可能落在被摘出去的消息里：先把它挂回来（窗口挪过去），rect 才有意义
+      const hitIdx = virtIndexOfNode(mark);
+      if (hitIdx >= 0) virtEnsureAttached(hitIdx);
       expandSearchAncestors(mark);                     // 先展开，rect 才有效
+      virtRebalance();                                 // 展开会改变这条的高度，先修一遍缓存
       // 只动消息容器的 scrollTop：scrollIntoView 会连带滚动 window 和侧栏
       const wrapRect = messagesDiv.getBoundingClientRect();
       const hitRect = mark.getBoundingClientRect();
@@ -3828,9 +4341,7 @@
   function insertBeforeStreaming(el) {
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
-    const streamEl = document.getElementById('streaming-msg');
-    if (streamEl && streamEl.parentNode === messagesDiv) messagesDiv.insertBefore(el, streamEl);
-    else messagesDiv.appendChild(el);
+    virtAppendEls([el]);
     scrollToBottom();
   }
 
@@ -3842,7 +4353,7 @@
     const div = document.createElement('div');
     div.className = 'msg system';
     div.innerHTML = `<div class="msg-bubble" style="border-color:var(--danger);color:var(--danger)">⚠ ${escapeHtml(message)}</div>`;
-    messagesDiv.appendChild(div);
+    virtAppendEls([div]);
     scrollToBottom();
   }
 
@@ -3861,6 +4372,9 @@
     if (scrollBottomRaf) return;
     scrollBottomRaf = requestAnimationFrame(() => {
       scrollBottomRaf = 0;
+      // 先把尾部窗口挂上再读 scrollHeight：被摘出去的消息高度由 spacer 顶着，
+      // 但最后那几条的真实高度要它们在窗口里才算数，否则吸底会差几像素
+      virtRebalance({ pinTail: true });
       messagesDiv.scrollTop = messagesDiv.scrollHeight;
       updateScrollbar();
     });
@@ -3924,6 +4438,8 @@
   messagesDiv.addEventListener('scroll', () => {
     const { scrollTop, scrollHeight, clientHeight } = messagesDiv;
     stickToBottom = scrollHeight - scrollTop - clientHeight <= JUMP_EDGE_TOLERANCE;
+    // 滚到哪儿就把哪附近的消息挂上、其余摘走（rAF 合并，拖动列宽期间不跟着搬）
+    virtNotifyScroll();
     updateScrollbar();
     // 移动端：滚动时短暂显示滑块，停止后淡出
     scrollbarEl.classList.add('scrolling');
@@ -3932,7 +4448,18 @@
       if (!isDragging) scrollbarEl.classList.remove('scrolling');
     }, 1200);
   }, { passive: true });
-  new ResizeObserver(updateScrollbar).observe(messagesDiv);
+  let virtObsW = messagesDiv.clientWidth;
+  new ResizeObserver(() => {
+    updateScrollbar();
+    // 只有宽度变了才是「消息要重新换行」：可见窗口立刻按新宽度重量，其余交付空闲时批量重量
+    // （容器高度在流式输出时每帧都在变，那种情况交给 scrollToBottom 处理，不必重量）
+    const w = messagesDiv.clientWidth;
+    if (w === virtObsW) return;
+    virtObsW = w;
+    if (document.body.classList.contains('sidebar-resizing')) return;
+    virtRebalance();
+    virtScheduleSweep();
+  }).observe(messagesDiv);
 
   // Drag logic
   let dragStartY = 0, dragStartScrollTop = 0, isDragging = false;
@@ -3979,7 +4506,7 @@
   const navTipEl = document.getElementById('msg-nav-tip');
   const NAV_TICK_MIN_H = 4;
   const NAV_TICK_MAX_H = 10;
-  let navTicks = [];          // [{ el, msg, top, y, h }]，top 是缓存的 offsetTop，y/h 是已写入的落位
+  let navTicks = [];          // [{ el, idx, top, y, h }]，idx 是虚拟化里的消息下标，top 是缓存的落位
   let navScrollHeight = -1;   // 上次布局时的内容高度与轨道高度，任一变化才重排
   let navTrackHeight = -1;
   let navRebuildTimer = 0;
@@ -4000,9 +4527,9 @@
     if (scrollH <= 0 || trackH <= 0) return;
     // 提问密集时收窄命中区，避免相邻横条互相压住 hover
     const tickH = Math.max(NAV_TICK_MIN_H, Math.min(NAV_TICK_MAX_H, trackH / navTicks.length));
-    // 先批量读 offsetTop 再批量写 style：读写交替会让每条横条各触发一次强制重排，
-    // 流式生成时 scrollHeight 每帧都在变，长会话足以卡住。
-    for (const t of navTicks) t.top = t.msg.offsetTop;
+    // 落位取虚拟化的高度缓存（消息挂在 DOM 里时量的真实高度），被摘出去的消息也拿得到；
+    // 先批量算完再批量写 style，避免读写交替每条横条各触发一次强制重排。
+    for (const t of navTicks) t.top = virtOffset(t.idx);
     // 写之前先比缓存：拖动/流式时 scrollHeight 每帧都在变，但 1px 以内的落位差肉眼
     // 看不出来，量化到 0.5px 后绝大多数横条可以直接跳过写 style。
     for (const t of navTicks) {
@@ -4047,9 +4574,13 @@
 
   function rebuildMsgNav() {
     if (!navEl) return;
-    const msgs = Array.from(messagesDiv.querySelectorAll('.msg.user'));
+    const idxs = [];
+    for (let i = 0; i < virtItems.length; i++) {
+      const el = virtItems[i].el;
+      if (el.classList.contains('msg') && el.classList.contains('user')) idxs.push(i);
+    }
     // 条数和节点都没变时只重排，省掉流式追加期间的反复重建
-    if (msgs.length === navTicks.length && msgs.every((m, i) => navTicks[i].msg === m)) {
+    if (idxs.length === navTicks.length && idxs.every((idx, i) => navTicks[i].idx === idx)) {
       navScrollHeight = -1;
       updateMsgNav();
       return;
@@ -4058,15 +4589,24 @@
     navEl.innerHTML = '';
     // 刻度元素全部重建，高亮记录跟着失效
     navActiveIndex = -1;
-    navTicks = msgs.map((msg, i) => {
+    navTicks = idxs.map((idx, i) => {
       const el = document.createElement('div');
       el.className = 'msg-nav-tick';
       el.dataset.idx = String(i + 1);
       navEl.appendChild(el);
-      return { el, msg, top: 0 };
+      return { el, idx, top: 0 };
     });
     navScrollHeight = -1;
     updateMsgNav();
+  }
+
+  // 消息增删后重排刻度（虚拟化收窗口只搬节点、不改条数，不再走 MutationObserver）
+  function scheduleNavRebuild() {
+    if (!navEl || navRebuildTimer) return;
+    navRebuildTimer = requestAnimationFrame(() => {
+      navRebuildTimer = 0;
+      rebuildMsgNav();
+    });
   }
 
   function hideMsgNavTip() {
@@ -4082,7 +4622,7 @@
     idx.className = 'msg-nav-tip-idx';
     idx.textContent = '#' + tick.dataset.idx;
     navTipEl.appendChild(idx);
-    navTipEl.appendChild(document.createTextNode(msgNavLabel(entry.msg)));
+    navTipEl.appendChild(document.createTextNode(msgNavLabel(virtItems[entry.idx].el)));
     navTipEl.hidden = false;
     // 垂直跟随横条，并夹在消息区内，避免首尾两端的提示被截掉
     const center = navEl.offsetTop + tick.offsetTop + tick.offsetHeight / 2;
@@ -4102,29 +4642,17 @@
     if (!tick) return;
     const entry = navTicks.find((t) => t.el === tick);
     if (!entry) return;
-    // 与会话内搜索一致：只动 messagesDiv.scrollTop，scrollIntoView 会连带滚动 window 和侧栏
-    const wrapRect = messagesDiv.getBoundingClientRect();
-    const msgRect = entry.msg.getBoundingClientRect();
-    messagesDiv.scrollTop += msgRect.top - wrapRect.top - 12;
     // scroll 事件要到下一帧才会重算，这中间若有新消息到达，scrollToBottom 会看到
     // 旧的 stickToBottom 把人拉回底部，所以这里同步置位
     stickToBottom = false;
+    // 目标可能在窗口外：先把它挂上再按真实落位定 scrollTop（与会话内搜索同一口径）
+    virtScrollToIndex(entry.idx, { topOffset: 12 });
     updateScrollbar();
-    entry.msg.classList.remove('nav-flash');
-    void entry.msg.offsetWidth;   // 重启动画，连点同一条也能看到落点
-    entry.msg.classList.add('nav-flash');
+    const msgEl = virtItems[entry.idx].el;
+    msgEl.classList.remove('nav-flash');
+    void msgEl.offsetWidth;   // 重启动画，连点同一条也能看到落点
+    msgEl.classList.add('nav-flash');
   });
-
-  // 只观察直接子节点：消息增删才需要重建，流式更新改的是气泡内部，不会触发
-  if (navEl) {
-    new MutationObserver(() => {
-      if (navRebuildTimer) return;
-      navRebuildTimer = requestAnimationFrame(() => {
-        navRebuildTimer = 0;
-        rebuildMsgNav();
-      });
-    }).observe(messagesDiv, { childList: true });
-  }
 
   rebuildMsgNav();
   updateScrollbar();
@@ -5165,7 +5693,7 @@
       if (/^\/(?:github|cf|ssh|loop)(?:\s|$)/i.test(text)) {
         const cmdWelcome = messagesDiv.querySelector('.welcome-msg');
         if (cmdWelcome) cmdWelcome.remove();
-        messagesDiv.appendChild(createMsgElement('user', text, [], Date.now()));
+        virtAppendEls([createMsgElement('user', text, [], Date.now())]);
         scrollToBottom(true);
       }
       send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
@@ -5178,7 +5706,7 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const attachments = pendingAttachments.map((attachment) => ({ ...attachment }));
-    messagesDiv.appendChild(createMsgElement('user', text, attachments, Date.now()));
+    virtAppendEls([createMsgElement('user', text, attachments, Date.now())]);
     scrollToBottom(true);
 
     send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });

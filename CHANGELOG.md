@@ -8,6 +8,51 @@
 
 ---
 
+## 分叉 v1.5.38
+
+### 修改
+
+上一笔把拖动全程做到了满帧，但用户实测「拖动完成后的明显卡顿」还在：松手那一帧要按新宽度把 3648 条消息全部重新换行。把这一笔的钱拆开量（真实会话 `sessions/32865b58-…`，3648 条消息 / 9.3 万节点，真 `marked` + `DOMPurify`，Chromium 1280×800）：松手同步段 0.2ms、随后的强制布局 118~135ms、PrePaint + Paint 220~270ms，合计 380~450ms，且**与会话长度成正比**。既然「每条消息都得按新宽度重新排一遍」这件事躲不掉，就让需要重排的消息只剩下视口里的那几十条——**消息列表虚拟化**（[public/app.js:3133](/home/huxiaojie/Tools/cc-web-my/public/app.js:3133)）。
+
+1. **窗口 + 上下 spacer**（[public/app.js:3253](/home/huxiaojie/Tools/cc-web-my/public/app.js:3253)）。DOM 形状永远是 `[topSpacer][视口 ±900px、至少 24 条的消息][botSpacer][流式气泡]`，被摘掉的那些消息的高度由两个 spacer 顶住，spacer 高度按高度缓存的前缀和算：`top = Σ_{j<s}h[j] + gap·s − gap`、`bot = Σ_{j≥e}h[j] + gap·(n−e) − gap`。含 spacer 自己两侧的 `row-gap` 在内，总高度与「全部挂载」时逐像素一致（`gap` 和容器 `padding-top` 都是运行时从 computed style 读的，没写死）。spacer 必须 `flex: 0 0 auto`——`.messages` 是 flex 列容器，空 div 的 `min-height` 是 0，不锁住会被压扁。
+2. **摘出去的消息不销毁**（[public/app.js:3133](/home/huxiaojie/Tools/cc-web-my/public/app.js:3133)）。元素引用留在 `virtItems` 里，展开态、代码预览、搜索高亮 `<mark>`、事件监听都跟着节点走，滚回来直接挂回去，不重新解析 markdown。高度是在消息**还挂在 DOM 里**的时候量的（加载收尾量一次、之后追加 / 滚回来时补量），所以 spacer 高度、滚动条长度、导航刻度落位都是真实值而不是估算值。摘出去又挂回来的元素会把 `style.animation` 掐成 `none`，免得每滚动一步新进视口的消息都再淡入一次。
+3. **重排后按锚点把视口钉回原处**（[public/app.js:3327](/home/huxiaojie/Tools/cc-web-my/public/app.js:3327)）。收窗口前先记下窗口第一条的 `offsetTop − scrollTop`，量完（高度变了）再按这个锚点写回 `scrollTop`；`stickToBottom` 时改钉 `pinTail`（窗口一定含最后一条，吸底依赖的 `scrollHeight` 才是真实值）。
+4. **改宽后的补量放进空闲时间**（[public/app.js:3411](/home/huxiaojie/Tools/cc-web-my/public/app.js:3411)、[public/app.js:3438](/home/huxiaojie/Tools/cc-web-my/public/app.js:3438)）。可见窗口立刻按新宽度重量；窗口外那些的高度缓存还是旧宽度的值（滚动条长度会偏），交给 `requestIdleCallback` 在空闲时按「8ms 预算 + 每 6 条看一眼时间」分小段补量，Safari 没有 rIC 时退回 120ms 间隔的 `setTimeout`。
+5. **搜索 / 导航 / 流式跟着改口径**。会话内搜索改为遍历 `virtItems` 里全部元素（[public/app.js:3713](/home/huxiaojie/Tools/cc-web-my/public/app.js:3713)），命中的消息被摘出去时先把它挂回来再量 `rect`（[public/app.js:3799](/home/huxiaojie/Tools/cc-web-my/public/app.js:3799)）；导航刻度改用 `virtItems` 下标 + `virtOffset()`，去掉原来那条 MutationObserver，改由 `scheduleNavRebuild()` 在增删消息后重排（[public/app.js:4576](/home/huxiaojie/Tools/cc-web-my/public/app.js:4576)）；流式气泡始终留在文档里（代码里多处 `getElementById('streaming-msg')` 的守卫依赖它），一轮跑完才纳入高度缓存。
+
+### 取舍
+
+- 窗口外的消息不在 DOM 里：浏览器原生 Ctrl+F、开发者工具的元素搜索找不到它们（自建搜索已覆盖全量）；依赖「所有消息都在文档里」的第三方脚本也会看不到。
+- 滑动窗口意味着 `scrollHeight` 由「实量高度取整后的和」拼出来，与不虚拟化的真实值差 0.2%~0.8%（`offsetHeight` 是整数；3648 条累积起来约 1~4k px）。滚动仍按锚点自校正，导航 / 搜索跳转都会先把目标挂回文档再按真实 `offsetTop` 落位，所以偏的只是滚动条长度的零点几个百分点。
+- 松手后仍要补量窗口外的高度，`requestIdleCallback` 路径实测约 5s 收敛完（每次回调只占几毫秒、不产生长任务），Safari 的 `setTimeout` 路径慢一些（约 1 分钟），期间滚动条长度会慢慢变准。
+- 这一笔只动 `public/app.js`（外加版本号与本节记账），没有新增 CSS；spacer 的样式全部写在行内。
+
+### 验证
+
+- `node --check public/app.js` 通过。`node scripts/regression.js` 这次卡在 `Codex /compact` 那条 WS 时序用例上超时；把改动 `git stash` 掉、在**未改动的 HEAD** 上重跑，同一位置同样超时（这套时序用例在机器负载高时偶发，脚本遇错即停，后面的用例没跑到），已确认与本次改动无关。这一笔只碰前端，服务端行为未动。
+- jsdom 25 条、Playwright Chromium / Firefox 各 45 条、拖动期间流式 4 条旧断言全 PASS，未回归。
+- 新增虚拟化功能回归 25 条（`~/work_dir/tmp/20261015-virtual-scroll/func-check2.js`，真实会话 + 真 `marked`/`DOMPurify`）全 PASS，覆盖：加载后停在底部且只挂一屏多的消息、流式气泡挂在列表里 / 增量渲染 / 跑完归位成最后一条 / 仍吸底、`system_message` 与 `imported_messages_replaced` 就地替换（走的是替换分支而不是整会话重开）、用户发新消息、导航刻度跳转、会话内搜索（命中落在被摘出去的消息里 → 挂回来 → 滚进视口，连按「下一个」3 步都成立）、滚回底部。
+- **虚拟化前后同一会话、同一列宽的总高对比**（列宽 520px）：不虚拟化 581381px，虚拟化 582773px（+0.24%）；把列宽从 900px 拖到 520px 后收敛到 586039px（+0.80%）。
+- 性能（同一条真实会话，同 1.2s 合成拖动，真 `marked` + `DOMPurify`）：
+
+  | 场景 | 本笔之前 | 本笔 |
+  |---|---|---|
+  | 加载完成后 `#messages` 里挂着的消息 | 3648 条 / 整页 100098 节点 | **24 条 / 920 节点** |
+  | 松手：同步段 | 0.2ms | 0.1~0.6ms |
+  | 松手：强制布局（按新宽度重排聊天区） | 118~135ms | **0.6~6.8ms** |
+  | 松手后长时间里的 50ms 以上长任务 | 每约 130ms 一次，55~99ms（改宽后的补量一次挂 120 条） | **0 个**（观察窗口 155s） |
+  | 长会话里持续滚动 1.5s 的帧率（帧间隔中位） | 24.8 fps（40.2ms） | **60.3 fps（16.7ms，p90 16.9ms）** |
+  | 同上，这一窗口里 50ms 以上的长任务 | 2 个 / 合计 114ms | **0 个** |
+  | agent 流式输出中不拖动，1.5s 的帧率（帧间隔中位） | 47.4 fps（p90 42.7ms、max 51.3ms） | **60.0 fps（p90 18.2ms、max 29.4ms）** |
+
+- v1.5.37 记的那笔「流式期间每帧 20~30ms 花在『内容变高 → 吸底滚动 → 视口新暴露区域绘制』、1.5s 内累计 300~500ms 长任务」这一笔基本吃掉了：那套成本的规模取决于文档里的消息数，而虚拟化之后文档里只剩几十条。上面第 5、6 行是同一口径的前后对照（47.4 fps / p90 42.7ms → 60.0 fps / p90 18.2ms）。
+- 仍未解决（另记账）：
+  - 流式输出中松手仍有一次 22~37ms 的同步段——那是拖动期间攒下的流式文本在松手时补渲染一次，与列表长度无关；真实使用中增量渲染只重渲未完成的尾巴，比探针里 40ms 灌一大段的合成场景轻。
+  - 会话首次加载没变快：分块渲染仍然要把 3648 条消息各建一次元素（markdown 解析 + 建 DOM 是 O(n) 的活），虚拟化省掉的是「它们一直留在文档里」之后的排版 / 绘制 / 滚动扫描，不是创建。
+- 纯前端改动，**不需要重启 cc-web 服务进程**；`public/index.html` 的两个 `?v=` 由 `my.49` 打到 `my.50`。
+
+---
+
 ## 分叉 v1.5.37
 
 ### 修改
