@@ -8,6 +8,52 @@
 
 ---
 
+## 分叉 v1.5.40
+
+### 修改
+
+长会话里「从底部往上翻」会被吸底逻辑整格吃回去。用户报的是 `sessions/32865b58-…`（4059 条 / 4.1MB，cc-web 会话 `32865b58-d063-4937-a39a-1695ed332027`）「从底部往上翻有短暂卡顿」，实测下来是两件事叠在一起：上翻滚不动（每滚一格都被写回底部），以及滚动事件 → rAF → `virtRebalance()` 每帧改写 spacer 带来的每帧重排 / 重绘。这一笔修的是前者，后者随之前者一起消失（不再每帧有「钉回底部」这次回写，就没有这次强制布局）。
+
+根因是吸底判定只看「当前距底多少」：
+
+```js
+stickToBottom = scrollHeight - scrollTop - clientHeight <= JUMP_EDGE_TOLERANCE;   // 24px
+```
+
+滚轮 / 触控板一格会被浏览器拆成多帧、单帧位移常常不到 24px，于是**从底部起手**的上翻在头几帧里 `stickToBottom` 仍是 `true`，`virtRebalance()` 的 `pinTail`（[public/app.js:3382](/home/huxiaojie/Tools/cc-web-my/public/app.js:3382)）就把 `scrollTop` 写回 `scrollHeight`——用户的上翻一步也没走成。
+
+1. **解除吸底改看方向，不再只看距离**（[public/app.js:4484](/home/huxiaojie/Tools/cc-web-my/public/app.js:4484)）。新增 `virtScrollMark`：应用自己每次回写 `scrollTop`（钉底、按锚点校正、跳转、prepend 保位）都同步记下（[public/app.js:3185](/home/huxiaojie/Tools/cc-web-my/public/app.js:3185)、[public/app.js:3383](/home/huxiaojie/Tools/cc-web-my/public/app.js:3383)），用户滚动不会动它；`scroll` 里 `scrollTop` 比这个标记小就说明这一帧是用户往上推的，立刻退出吸底。反向也一样：阅读态里用户把视口推回底部（`scrollTop` 变大且贴底）就交还吸底，跟随自动恢复。
+2. **输入手势当场登记上翻意图**（[public/app.js:4424](/home/huxiaojie/Tools/cc-web-my/public/app.js:4424)、[public/app.js:4505](/home/huxiaojie/Tools/cc-web-my/public/app.js:4505)）。`wheel` / `touchstart` / `touchmove` / 拖滑块（[public/app.js:4554](/home/huxiaojie/Tools/cc-web-my/public/app.js:4554)）置 `userReadingUp` 并同步清 `stickToBottom`。光靠 `scroll` 事件推方向有个竞态：补历史的分块由定时任务送达，定时任务可能抢在该帧 `scroll` 事件派发之前跑完，那时 `stickToBottom` 还是旧值，`pinTail` 照样把人钉回底部、顺带把标记也刷成底部位置。输入事件早于定时任务，没有这个口子。
+3. **补历史期间不再按过期的吸底钉底**（[public/app.js:2069](/home/huxiaojie/Tools/cc-web-my/public/app.js:2069)）。`session_history_chunk` 的 `preserveScroll` 由 `!blocking` 改成 `!blocking || !stickToBottom`：用户在读历史时，新到的一块走「保住当前滚动位置」那条路，而不是钉到底。
+4. **加载收尾不强制落底**（[public/app.js:1539](/home/huxiaojie/Tools/cc-web-my/public/app.js:1539)）。`finishSessionSwitch` 原来走 `scrollToBottom(true)`，最后一块历史到齐时无条件把人拽回底部；改成 `scrollToBottom()`，没往上翻过的人口径不变（仍是落底）。
+5. 打开会话、发消息、点「回到底部」这些必须落底的场景仍走 `scrollToBottom(true)`，并在那里清掉阅读态（[public/app.js:4397](/home/huxiaojie/Tools/cc-web-my/public/app.js:4397)）；导航刻度 / 搜索跳转落到历史处时一并置为阅读态（[public/app.js:3835](/home/huxiaojie/Tools/cc-web-my/public/app.js:3835)、[public/app.js:4718](/home/huxiaojie/Tools/cc-web-my/public/app.js:4718)）。
+
+### 取舍
+
+- 阅读态里不再跟随流式输出（原本由「距底 24px」这个随时会被重算的标志决定，现在由用户手势决定）：要恢复跟随，用手指 / 滚轮 / 拖滑块把视口推回底部即可，发消息、点「回到底部」也都会恢复。
+- 上翻是按「手势方向」判的：如果用户上翻时视口本来就在顶部（没有可翻的余量），也会进入阅读态，效果与之前一样（本来就没在吸底）。
+
+### 验证
+
+- `node --check public/app.js` 通过；纯前端改动，**不需要重启 cc-web 服务进程**；`public/index.html` 的两个 `?v=` 由 `my.53` 打到 `my.54`。
+- 探针都在 `~/work_dir/tmp/20261015-scrollup-jank/`，对照组 `public-before/` 是 `git show HEAD:public/app.js` 的 HEAD 版本（同一套 HTML/CSS，只换 app.js）。
+- **单格上滚**（CDP 真滚轮，从最底部起手，600ms 后离底多少，`wheel.js` `ONESHOT=1`，各测 3 次结果一致）：
+
+  | 一格位移 | 本笔之前 | 本笔 |
+  |---|---|---|
+  | -20px | 0px（整格作废） | **20px** |
+  | -100px | 0px（整格作废） | **100px** |
+  | -200px | 166px | **200px** |
+
+- **连续上滚 40 格**（`wheel.js`，意图位移 vs 实际离底）：-20px×40 由 800px 意图 → 0px（生效 0%）变成 768px（96%）；-100px×40 由 3779px（94%）变成 3886px（97%）。
+- **加载中上翻**（`blockflow-real.js`，点会话走 blocking 加载 + 真滚轮 40px/次）：两个版本在这条路径上的滚轮都被加载遮罩挡住（遮罩可见 163/253 帧、消失于 7.5s，之后才开始收得到 `wheel`），所以只有对照组在遮罩消失后重新被钉底——本笔之前最大离底 24px、结束离底 0px、7 帧被钉回；本笔最大离底 = 结束离底 1400px、被钉回 0 帧。
+- **补历史期间的小幅上翻**（非阻塞补历史、无遮罩，`blockflow-real.js MODE=bg GAP=150 STEP=20 WHEEL_COUNT=6`：滚 6 格共 120px 后停手，看后续 169 块历史到齐期间视口会不会被拽回）：本笔之前最大离底 20px、结束离底 0px、**307/326 帧被钉回底部**；本笔最大离底 95px、结束离底 77px、被钉回 0 帧。
+- **吸底回路回归**（`rearm.js` 5 条）：加载完成停在底部、上翻一格确实离开底部、阅读态里流式增量不把人拽回底部、滚回底部、回到最底后新流式增量重新跟上——本笔全 PASS，对照组第 2 条 FAIL（离开底部失败，离底 0px）。
+- 虚拟化功能回归 25 条（`~/work_dir/tmp/20261015-virtual-scroll/func-check2.js`，真实会话 + 真 `marked`/`DOMPurify`）全 PASS、无控制台错误，覆盖加载后停底、流式吸底与归位、`system_message` / `imported_messages_replaced` 就地替换、用户发新消息、导航跳转、会话内搜索、滚回底部。
+- 稳态帧率没退化（`browse-fps.js`，同一条会话 4059 条）：持续滚动 1.5s 由 61.0 fps → 61.2 fps，流式中不拖动 60.0 fps → 60.0 fps，导航 / 搜索跳转同步段 19.1ms → 14.9ms。新增的 `wheel` / `touch` 监听都在输入路径上、`passive: true`，不进每帧热路径。
+
+---
+
 ## 分叉 v1.5.39
 
 ### 修改

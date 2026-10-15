@@ -183,6 +183,11 @@
   // （见 messagesDiv 的 scroll 监听）：内容增高本身不触发 scroll 事件，所以上翻
   // 阅读期间该标志保持 false，新的 delta / tool 卡片不会把视口拽回底部。
   let stickToBottom = true;
+  // 用户是否正在「往上翻阅读」。由输入事件（滚轮 / 触控板 / 手指 / 拖滑块）当场置位，
+  // 不靠 scroll 事件推断：补历史的那批定时任务可能抢在滚动事件派发之前跑完，那时
+  // stickToBottom 还是 true，会把视口钉回底部（4059 条的会话实测 269/278 帧被钉回）。
+  // 输入事件早于定时任务，没有这个竞态。
+  let userReadingUp = false;
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -1529,7 +1534,9 @@
 
   function finishSessionSwitch(sessionId) {
     if (isBlockingSessionLoad(sessionId)) {
-      scrollToBottom(true);
+      // 非 force 的 scrollToBottom 会先看 stickToBottom：加载期间用户自己往上翻过就不再强制
+      // 落底，否则每打开一个长会话，最后一块历史到齐时都会把人从正在读的地方拽回底部
+      scrollToBottom();
       requestAnimationFrame(() => clearSessionLoading(sessionId));
       return;
     }
@@ -2056,7 +2063,10 @@
             activeSessionLoad.snapshot.messages = cloneMessages(msg.messages || []).concat(activeSessionLoad.snapshot.messages);
           }
           prependHistoryMessages(msg.messages || [], {
-            preserveScroll: !blocking,
+            // 阻塞加载期间默认把视口钉在底部（首屏落底口径不变）；用户自己往上翻过（吸底已解除）
+            // 时改走「保留滚动位置」那条路，否则每一块历史到齐都会把他拽回底部——4059 条的会话
+            // 是 169 块
+            preserveScroll: !blocking || !stickToBottom,
             skipScrollbar: blocking,
           });
           if (!msg.remaining) {
@@ -3169,6 +3179,14 @@
   let virtSweepAt = 0;
   let virtSweepCursor = 0;
   let virtElIndex = new Map();    // 元素 -> 下标，搜索定位用
+  // 应用自己最近一次把 scrollTop 写在了哪。用来把「用户往上翻」和「我们自己钉底 / 按锚点校正」
+  // 分开：只在应用自己的回写点调用 virtMarkScroll()，用户滚动（滚轮 / 触控板 / 拖滑块 / 键盘）
+  // 不会动它，于是 scroll 事件里比对它就能判断出这一帧是不是被用户往上推了。
+  let virtScrollMark = 0;
+
+  function virtMarkScroll() {
+    virtScrollMark = messagesDiv.scrollTop;
+  }
 
   function virtGapPx() {
     const g = parseFloat(getComputedStyle(messagesDiv).rowGap);
@@ -3363,10 +3381,14 @@
       }
       if (pinTail) {
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        virtMarkScroll();
       } else if (anchorEl && anchorRel !== null && anchorEl.parentNode === messagesDiv) {
         // 窗口里那些刚量到的高度一变，可见区上面的总高就变了，按锚点把视口钉回原处
         const preferred = anchorEl.offsetTop - anchorRel;
-        if (Math.abs(preferred - messagesDiv.scrollTop) > 0.5) messagesDiv.scrollTop = preferred;
+        if (Math.abs(preferred - messagesDiv.scrollTop) > 0.5) {
+          messagesDiv.scrollTop = preferred;
+          virtMarkScroll();
+        }
       }
     } finally {
       virtRebalancing = false;
@@ -3461,6 +3483,7 @@
         virtPlaceWindow(virtStart, virtEnd);
         if (anchorEl && anchorRel !== null && anchorEl.parentNode === messagesDiv) {
           messagesDiv.scrollTop = anchorEl.offsetTop - anchorRel;
+          virtMarkScroll();
         }
       }
       if (performance.now() >= deadline) break;
@@ -3598,6 +3621,7 @@
     const el = virtItems[idx].el;
     const top = options.topOffset || 0;
     messagesDiv.scrollTop = Math.max(0, el.offsetTop - top);
+    virtMarkScroll();
     virtRebalance();
   }
 
@@ -3697,6 +3721,7 @@
     const prevScrollTop = messagesDiv.scrollTop;
     messagesDiv.insertBefore(frag, headRef);
     messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
+    virtMarkScroll();
     virtAdopt(els, { front: true, pinTail: false });
     if (!skipScrollbar) updateScrollbar();
     scheduleSearchRescan();
@@ -3807,6 +3832,7 @@
       // 跳过去之前先退出吸底：否则 virtEnsureAttached / virtRebalance 会把窗口钉回末尾，
       // 命中的那条转眼又被摘出去（rect 全变 0），滚动位置也就落不到它身上。
       stickToBottom = false;
+      userReadingUp = true;   // 降落到历史命中处属于「上翻阅读」，别让随后的滚动事件把吸底又打开
       // 命中可能落在被摘出去的消息里：先把它挂回来（窗口挪过去），rect 才有意义
       const hitIdx = virtIndexOfNode(mark);
       if (hitIdx >= 0) virtEnsureAttached(hitIdx);
@@ -3816,6 +3842,7 @@
       const wrapRect = messagesDiv.getBoundingClientRect();
       const hitRect = mark.getBoundingClientRect();
       messagesDiv.scrollTop += (hitRect.top + hitRect.height / 2) - (wrapRect.top + wrapRect.height / 2);
+      virtMarkScroll();   // 程序化定位：连同上面的 reading 标志一起，别让这次位移被当成用户往下滚
       updateScrollbar();
     }
     updateSearchCount();
@@ -4367,6 +4394,7 @@
       return;
     }
     stickToBottom = true;
+    userReadingUp = false;
     // 去重守卫：隐藏标签里 rAF 完全暂停，无守卫时回调会一路堆积，切回标签的
     // 第一帧集中执行，每个都做两次强制同步布局，长会话直接冻结数秒。
     if (scrollBottomRaf) return;
@@ -4376,6 +4404,7 @@
       // 但最后那几条的真实高度要它们在窗口里才算数，否则吸底会差几像素
       virtRebalance({ pinTail: true });
       messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      virtMarkScroll();
       updateScrollbar();
     });
   }
@@ -4389,6 +4418,14 @@
   const jumpTopEl = document.getElementById('scroll-jump-top');
   const jumpBottomEl = document.getElementById('scroll-jump-bottom');
   const JUMP_EDGE_TOLERANCE = 24; // 距边缘多少像素内视作已到顶/到底
+
+  // 滚动手势统一从这里过一遍：deltaY < 0（往上翻）当场退出吸底并进入上翻阅读态。
+  // 恢复吸底交给 scroll 监听——用户在阅读态里往下滚回底部时自动交还。
+  function noteUserScrollIntent(deltaY) {
+    if (deltaY >= 0) return;
+    userReadingUp = true;
+    stickToBottom = false;
+  }
 
   // 会话内容不足两屏时不出现，避免短对话里干扰
   function updateJumpButtons() {
@@ -4407,11 +4444,14 @@
 
   jumpTopEl?.addEventListener('click', () => {
     messagesDiv.scrollTop = 0;
+    virtMarkScroll();
     updateScrollbar();
   });
   jumpBottomEl?.addEventListener('click', () => {
     stickToBottom = true;
+    userReadingUp = false;
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    virtMarkScroll();
     updateScrollbar();
   });
 
@@ -4437,7 +4477,18 @@
 
   messagesDiv.addEventListener('scroll', () => {
     const { scrollTop, scrollHeight, clientHeight } = messagesDiv;
-    stickToBottom = scrollHeight - scrollTop - clientHeight <= JUMP_EDGE_TOLERANCE;
+    // 距底 24px 以内才算「贴底」，但这一帧若是用户往上翻出来的（scrollTop 比应用自己上次写下
+    // 的值更小），立刻解除吸底。滚轮 / 触控板一格会被浏览器拆成多帧、单帧位移常常不到这 24px，
+    // 只按当前距离重算会把从底部起手的上翻一步吃回去（实测单格 -20px / -100px 整格作废、离底仍
+    // 是 0px）：判了方向之后，上翻第一帧就退出吸底，用户滚回底部时再自动恢复跟随。
+    const atBottomEdge = scrollHeight - scrollTop - clientHeight <= JUMP_EDGE_TOLERANCE;
+    // 应用自己的回写都会同步 virtScrollMark，所以「这一帧 scrollTop 变大了」只可能是用户
+    // （或浏览器）往下推的：阅读态里用户主动滚回底部就交还吸底，不必等他再滚一格。
+    if (userReadingUp && atBottomEdge && scrollTop > virtScrollMark + 0.5) userReadingUp = false;
+    stickToBottom = !userReadingUp
+      && scrollTop >= virtScrollMark - 0.5
+      && atBottomEdge;
+    virtScrollMark = scrollTop;
     // 滚到哪儿就把哪附近的消息挂上、其余摘走（rAF 合并，拖动列宽期间不跟着搬）
     virtNotifyScroll();
     updateScrollbar();
@@ -4447,6 +4498,23 @@
     scrollbarEl._hideTimer = setTimeout(() => {
       if (!isDragging) scrollbarEl.classList.remove('scrolling');
     }, 1200);
+  }, { passive: true });
+
+  // 输入手势先于滚动事件到达，也先于补历史的定时任务：上翻意图当场登记，定时任务里那一次
+  // virtAdopt / virtRebalance 就不会再按过期的 stickToBottom 把视口钉回底部。
+  messagesDiv.addEventListener('wheel', (e) => {
+    noteUserScrollIntent(e.deltaY);
+  }, { passive: true });
+  let touchLastY = 0;   // 手指下移 = 内容往上翻，方向与 deltaY 相反
+  messagesDiv.addEventListener('touchstart', (e) => {
+    touchLastY = e.touches[0].clientY;
+  }, { passive: true });
+  messagesDiv.addEventListener('touchmove', (e) => {
+    const y = e.touches[0].clientY;
+    const dy = y - touchLastY;
+    touchLastY = y;
+    if (Math.abs(dy) < 2) return;   // 触摸抖动不算手势
+    noteUserScrollIntent(-dy);
   }, { passive: true });
   let virtObsW = messagesDiv.clientWidth;
   new ResizeObserver(() => {
@@ -4482,6 +4550,8 @@
     const thumbH = Math.max(30, trackH * clientHeight / scrollHeight);
     const ratio = (scrollHeight - clientHeight) / (trackH - thumbH);
     messagesDiv.scrollTop = dragStartScrollTop + dy * ratio;
+    // 拖滑块也是用户手势：往下拖相当于往下滚（deltaY > 0），往上拖当场退出吸底
+    noteUserScrollIntent(dy);
     e.preventDefault();
   }
 
@@ -4645,6 +4715,7 @@
     // scroll 事件要到下一帧才会重算，这中间若有新消息到达，scrollToBottom 会看到
     // 旧的 stickToBottom 把人拉回底部，所以这里同步置位
     stickToBottom = false;
+    userReadingUp = true;
     // 目标可能在窗口外：先把它挂上再按真实落位定 scrollTop（与会话内搜索同一口径）
     virtScrollToIndex(entry.idx, { topOffset: 12 });
     updateScrollbar();
