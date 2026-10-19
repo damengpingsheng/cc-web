@@ -15,7 +15,7 @@
       document.documentElement.dataset.theme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="style.css?v=1.5.1-my.54">
+  <link rel="stylesheet" href="style.css?v=1.5.1-my.56">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
 </head>
 <body>
@@ -101,6 +101,10 @@
           <svg class="msg-search-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.8" cy="6.8" r="4.3"/><path d="M10 10l3.6 3.6"/></svg>
           <input id="msg-search-input" type="text" placeholder="搜索本会话" autocomplete="off" spellcheck="false" aria-label="搜索当前会话消息">
           <span id="msg-search-count" class="msg-search-count"></span>
+          <label class="msg-search-scope" title="包含工具调用和导入的本地命令">
+            <input id="msg-search-include-tools" type="checkbox" checked>
+            <span>含工具</span>
+          </label>
           <button type="button" id="msg-search-prev" class="msg-search-btn" title="上一个 (Shift+Enter)" aria-label="上一个匹配">‹</button>
           <button type="button" id="msg-search-next" class="msg-search-btn" title="下一个 (Enter)" aria-label="下一个匹配">›</button>
           <button type="button" id="msg-search-close" class="msg-search-btn" title="关闭 (Esc)" aria-label="关闭搜索">✕</button>
@@ -174,6 +178,6 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.11/purify.min.js"></script>
-  <script src="app.js?v=1.5.1-my.54"></script>
+  <script src="app.js?v=1.5.1-my.56"></script>
 </body>
 </html>

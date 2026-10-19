@@ -232,6 +232,7 @@
   const searchBar = $('#msg-search');
   const searchInput = $('#msg-search-input');
   const searchCount = $('#msg-search-count');
+  const searchIncludeTools = $('#msg-search-include-tools');
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -3328,7 +3329,9 @@
       return [s, n];
     }
     const top = Math.max(0, scrollTop - virtPadTop);
-    let s = virtLowerBound(Math.max(0, top - VIRT_OVERSCAN_PX));
+    // 超长消息可能比 overscan 还高：滚动位置落在它内部时，lowerBound 会返回下一条，
+    // 导致正在看的这条反而被摘掉。向前多留一条，保证 offset 所在消息留在窗口里。
+    let s = Math.max(0, virtLowerBound(Math.max(0, top - VIRT_OVERSCAN_PX)) - 1);
     let e = virtLowerBound(top + viewH + VIRT_OVERSCAN_PX) + 1;
     if (e > n) e = n;
     if (e - s < VIRT_MIN_ITEMS) {
@@ -3733,6 +3736,7 @@
   // 只切分/还原文本节点，绝不碰 innerHTML —— 否则 decorateCodeBlocks 注入的
   // Copy / Preview 按钮的事件监听会被一起打掉。
   const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search, .msg-time, .msg-actions, .msg-bg-note';
+  const SEARCH_TOOLS_SELECTOR = '.msg-tools, .tool-call, .tool-group, .local-command';
 
   function collectSearchTextNodes() {
     const nodes = [];
@@ -3748,6 +3752,9 @@
           if (!parent) return NodeFilter.FILTER_REJECT;
           // 语言标签、Copy/Preview 按钮、气泡时间都是注入的 UI，不是对话内容
           if (parent.closest(SEARCH_SKIP_SELECTOR)) return NodeFilter.FILTER_REJECT;
+          if (searchIncludeTools && !searchIncludeTools.checked && parent.closest(SEARCH_TOOLS_SELECTOR)) {
+            return NodeFilter.FILTER_REJECT;
+          }
           return NodeFilter.FILTER_ACCEPT;
         },
       });
@@ -3837,7 +3844,8 @@
       const hitIdx = virtIndexOfNode(mark);
       if (hitIdx >= 0) virtEnsureAttached(hitIdx);
       expandSearchAncestors(mark);                     // 先展开，rect 才有效
-      virtRebalance();                                 // 展开会改变这条的高度，先修一遍缓存
+      // 展开会改变这条的高度；围绕目标重排，别把它重新摘掉。虚拟化索引外（流式气泡）按原逻辑处理。
+      virtRebalance(hitIdx >= 0 ? { around: hitIdx } : {});
       // 只动消息容器的 scrollTop：scrollIntoView 会连带滚动 window 和侧栏
       const wrapRect = messagesDiv.getBoundingClientRect();
       const hitRect = mark.getBoundingClientRect();
@@ -3916,11 +3924,11 @@
     // 命中上千个时「清高亮 + 重扫 + 重建 <mark>」一圈实测约 65ms（其中样式与布局约 45ms），
     // 逐键跑会让输入明显掉帧，所以输入防抖：停手 120ms 再搜一次。
     // 跳转前必须先把待执行的那次结算掉，否则会拿着上一个词的命中列表跳。
-    const flushSearchInput = () => {
+    const flushSearchInput = (options = {}) => {
       if (!searchInputTimer) return;
       clearTimeout(searchInputTimer);
       searchInputTimer = null;
-      runSearch(searchInput.value);
+      runSearch(searchInput.value, options);
     };
     searchInput.addEventListener('input', () => {
       clearTimeout(searchInputTimer);
@@ -3929,6 +3937,12 @@
         runSearch(searchInput.value);
       }, SEARCH_INPUT_DEBOUNCE);
     });
+    if (searchIncludeTools) {
+      searchIncludeTools.addEventListener('change', () => {
+        if (searchInputTimer) flushSearchInput({ keepPosition: true });
+        else runSearch(searchInput.value, { keepPosition: true });
+      });
+    }
     searchInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();

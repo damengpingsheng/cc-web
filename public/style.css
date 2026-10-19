@@ -1489,7 +1489,7 @@ body.session-loading-active {
   stroke-width: 1.6;
   stroke-linecap: round;
 }
-.msg-search input {
+.msg-search input[type="text"] {
   width: 190px;
   border: none;
   outline: none;
@@ -1499,7 +1499,7 @@ body.session-loading-active {
   font-size: 13px;
   padding: 2px 0;
 }
-.msg-search input::placeholder { color: var(--text-muted); }
+.msg-search input[type="text"]::placeholder { color: var(--text-muted); }
 .msg-search-count {
   flex-shrink: 0;
   min-width: 34px;
@@ -1509,6 +1509,24 @@ body.session-loading-active {
   font-variant-numeric: tabular-nums;
 }
 .msg-search-count.empty { color: var(--danger); }
+.msg-search-scope {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.msg-search input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
 .msg-search-btn {
   width: 24px;
   height: 24px;
@@ -1557,7 +1575,8 @@ mark.search-hit.current {
 /* 窄屏让出跳转按钮与滚动条的位置 */
 @media (max-width: 560px) {
   .msg-search { left: 12px; right: 12px; }
-  .msg-search input { width: auto; flex: 1; min-width: 0; }
+  .msg-search input[type="text"] { width: auto; flex: 1; min-width: 0; }
+  .msg-search-scope span { display: none; }
 }
 
 .welcome-msg {
