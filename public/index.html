@@ -15,7 +15,7 @@
       document.documentElement.dataset.theme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="style.css?v=1.5.1-my.56">
+  <link rel="stylesheet" href="style.css?v=1.5.1-my.57">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
 </head>
 <body>
@@ -105,6 +105,14 @@
             <input id="msg-search-include-tools" type="checkbox" checked>
             <span>含工具</span>
           </label>
+          <label class="msg-search-scope" title="区分大小写">
+            <input id="msg-search-case-sensitive" type="checkbox">
+            <span>区分大小写</span>
+          </label>
+          <label class="msg-search-scope" title="仅匹配完整的单词或短语">
+            <input id="msg-search-whole-word" type="checkbox">
+            <span>全词</span>
+          </label>
           <button type="button" id="msg-search-prev" class="msg-search-btn" title="上一个 (Shift+Enter)" aria-label="上一个匹配">‹</button>
           <button type="button" id="msg-search-next" class="msg-search-btn" title="下一个 (Enter)" aria-label="下一个匹配">›</button>
           <button type="button" id="msg-search-close" class="msg-search-btn" title="关闭 (Esc)" aria-label="关闭搜索">✕</button>
@@ -178,6 +186,6 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.11/purify.min.js"></script>
-  <script src="app.js?v=1.5.1-my.56"></script>
+  <script src="app.js?v=1.5.1-my.57"></script>
 </body>
 </html>

@@ -233,6 +233,8 @@
   const searchInput = $('#msg-search-input');
   const searchCount = $('#msg-search-count');
   const searchIncludeTools = $('#msg-search-include-tools');
+  const searchCaseSensitive = $('#msg-search-case-sensitive');
+  const searchWholeWord = $('#msg-search-whole-word');
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -3737,6 +3739,7 @@
   // Copy / Preview 按钮的事件监听会被一起打掉。
   const SEARCH_SKIP_SELECTOR = '.code-block-header, .msg-search, .msg-time, .msg-actions, .msg-bg-note';
   const SEARCH_TOOLS_SELECTOR = '.msg-tools, .tool-call, .tool-group, .local-command';
+  const SEARCH_WORD_CHAR_RE = /^[\p{L}\p{N}_]$/u;
 
   function collectSearchTextNodes() {
     const nodes = [];
@@ -3764,25 +3767,72 @@
     return nodes;
   }
 
+  function escapeSearchRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function isSearchWordCharacter(char) {
+    return !!char && SEARCH_WORD_CHAR_RE.test(char);
+  }
+
+  function previousSearchCharacter(text, index) {
+    if (index <= 0) return '';
+    const previous = text.charCodeAt(index - 1);
+    if (previous >= 0xDC00 && previous <= 0xDFFF && index >= 2) {
+      const beforePrevious = text.charCodeAt(index - 2);
+      if (beforePrevious >= 0xD800 && beforePrevious <= 0xDBFF) return text.slice(index - 2, index);
+    }
+    return text.charAt(index - 1);
+  }
+
+  function followingSearchCharacter(text, index) {
+    if (index >= text.length) return '';
+    return String.fromCodePoint(text.codePointAt(index));
+  }
+
+  // 只在查询首尾本身是单词字符时检查边界；多词查询按一个完整短语匹配。
+  function createSearchMatcher(term, options = {}) {
+    const pattern = new RegExp(escapeSearchRegExp(term), `g${options.caseSensitive ? '' : 'i'}u`);
+    const termChars = Array.from(term);
+    const requireLeftBoundary = options.wholeWord && isSearchWordCharacter(termChars[0]);
+    const requireRightBoundary = options.wholeWord && isSearchWordCharacter(termChars[termChars.length - 1]);
+    return {
+      next(text, from) {
+        pattern.lastIndex = from;
+        let match;
+        while ((match = pattern.exec(text))) {
+          const index = match.index;
+          const end = index + match[0].length;
+          const leftOk = !requireLeftBoundary || !isSearchWordCharacter(previousSearchCharacter(text, index));
+          const rightOk = !requireRightBoundary || !isSearchWordCharacter(followingSearchCharacter(text, end));
+          if (leftOk && rightOk) return { index, length: match[0].length };
+          pattern.lastIndex = end;
+        }
+        return null;
+      },
+    };
+  }
+
   // 把一个文本节点里的全部匹配换成 <mark>，返回新建的 mark（按出现顺序）。
   // limit 是剩余配额：一条长消息里单个文本节点就可能有上千次匹配，只在节点粒度截断拦不住。
-  function highlightTextNode(node, needle, limit) {
+  function highlightTextNode(node, matcher, limit) {
     const text = node.nodeValue;
-    const lower = text.toLowerCase();
-    let idx = lower.indexOf(needle);
-    if (idx < 0) return [];
+    let match = matcher.next(text, 0);
+    if (!match) return [];
     const marks = [];
     const frag = document.createDocumentFragment();
     let from = 0;
-    while (idx >= 0 && marks.length < limit) {
+    while (match && marks.length < limit) {
+      const idx = match.index;
+      const end = idx + match.length;
       if (idx > from) frag.appendChild(document.createTextNode(text.slice(from, idx)));
       const mark = document.createElement('mark');
       mark.className = 'search-hit';
-      mark.textContent = text.slice(idx, idx + needle.length);
+      mark.textContent = text.slice(idx, end);
       frag.appendChild(mark);
       marks.push(mark);
-      from = idx + needle.length;
-      idx = lower.indexOf(needle, from);
+      from = end;
+      match = matcher.next(text, from);
     }
     if (from < text.length) frag.appendChild(document.createTextNode(text.slice(from)));
     node.parentNode.replaceChild(frag, node);
@@ -3873,14 +3923,18 @@
     const anchor = options.keepPosition ? currentHitAnchor() : null;
     clearSearchHighlights();
     searchTerm = term;
-    const needle = term.trim().toLowerCase();
+    const needle = term.trim();
     if (!needle) {
       updateSearchCount();
       return;
     }
+    const matcher = createSearchMatcher(needle, {
+      caseSensitive: !!searchCaseSensitive?.checked,
+      wholeWord: !!searchWholeWord?.checked,
+    });
     const nodes = collectSearchTextNodes();
     for (const node of nodes) {
-      const marks = highlightTextNode(node, needle, SEARCH_HIT_CAP - searchHits.length);
+      const marks = highlightTextNode(node, matcher, SEARCH_HIT_CAP - searchHits.length);
       for (const mark of marks) searchHits.push(mark);
       if (searchHits.length >= SEARCH_HIT_CAP) break;   // 单字符搜索能命中上万次，截断兜底
     }
@@ -3937,12 +3991,13 @@
         runSearch(searchInput.value);
       }, SEARCH_INPUT_DEBOUNCE);
     });
-    if (searchIncludeTools) {
-      searchIncludeTools.addEventListener('change', () => {
-        if (searchInputTimer) flushSearchInput({ keepPosition: true });
-        else runSearch(searchInput.value, { keepPosition: true });
-      });
-    }
+    const rerunSearchWithKeptPosition = () => {
+      if (searchInputTimer) flushSearchInput({ keepPosition: true });
+      else runSearch(searchInput.value, { keepPosition: true });
+    };
+    if (searchIncludeTools) searchIncludeTools.addEventListener('change', rerunSearchWithKeptPosition);
+    if (searchCaseSensitive) searchCaseSensitive.addEventListener('change', rerunSearchWithKeptPosition);
+    if (searchWholeWord) searchWholeWord.addEventListener('change', rerunSearchWithKeptPosition);
     searchInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
