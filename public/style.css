@@ -1699,6 +1699,11 @@ mark.search-hit.current {
 
 /* 悬停操作条：复制（user 消息另有编辑）。默认透明且不接收点击，悬停/聚焦时显现。 */
 .msg-actions {
+  /* 长回复悬停时，操作条沿消息滚到聊天区底部并停住；短回复仍落在自己的底边。
+     用 sticky 而不是 fixed，滚动范围仍受这条消息约束，也不会盖住输入区。 */
+  position: sticky;
+  bottom: 8px;
+  z-index: 2;
   align-self: flex-end;
   display: flex;
   gap: 4px;

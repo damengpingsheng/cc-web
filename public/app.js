@@ -2713,6 +2713,7 @@
   // 纯装饰，语义由按钮的 title / aria-label 承担。
   const MSG_ICON_COPY = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
   const MSG_ICON_EDIT = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>';
+  const MSG_ICON_FOLD = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 14 5-5 5 5"></path><path d="m7 19 5-5 5 5"></path></svg>';
   const MSG_ICON_CHECK = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>';
 
   // 气泡外侧的悬停操作条（复制，user 消息额外有编辑）。复制取原始文本
@@ -2760,6 +2761,23 @@
         msgInput.setSelectionRange(end, end);
       });
       actions.appendChild(editBtn);
+    }
+
+    if (role === 'assistant') {
+      const foldBtn = document.createElement('button');
+      foldBtn.type = 'button';
+      foldBtn.className = 'msg-action-btn msg-tool-fold-btn';
+      foldBtn.innerHTML = MSG_ICON_FOLD;
+      foldBtn.hidden = true;
+      foldBtn.title = '收起已完成的工具调用';
+      foldBtn.setAttribute('aria-label', foldBtn.title);
+      foldBtn.addEventListener('click', () => {
+        if (foldCompletedToolCalls(div)) {
+          // 分组会显著缩短这条消息，虚拟窗口里同步重量并保持当前锚点。
+          if (typeof virtRebalance === 'function') virtRebalance();
+        }
+      });
+      actions.appendChild(foldBtn);
     }
 
     div.insertBefore(actions, beforeEl || null);
@@ -3135,6 +3153,7 @@
           }
         }
       }
+      syncToolFoldAction(el);
     }
     // 后台任务状态条：口径与实时收尾一致，刷新 / 切回会话后仍然在
     if (m.role === 'assistant') {
@@ -4315,6 +4334,7 @@
       _refreshGroupSummary(group);
     }
     toolsDiv.appendChild(details);
+    syncToolFoldAction(streamEl);
     scrollToBottom();
   }
 
@@ -4323,6 +4343,59 @@
     const count = inner ? inner.childElementCount : 0;
     const summary = group.querySelector('.tool-group-summary');
     if (summary) summary.textContent = `展开 ${count} 个工具调用`;
+  }
+
+  function isCompletedToolCall(card) {
+    const state = card.querySelector(':scope > summary .tool-call-state');
+    return !!state && !state.classList.contains('running');
+  }
+
+  function getCompletedToolCalls(bubble) {
+    if (!bubble) return [];
+    return Array.from(bubble.querySelectorAll('.tool-call')).filter(isCompletedToolCall);
+  }
+
+  function syncToolFoldAction(msgEl) {
+    const btn = msgEl?.querySelector(':scope > .msg-actions > .msg-tool-fold-btn');
+    if (!btn) return;
+    const count = getCompletedToolCalls(msgEl.querySelector(':scope > .msg-bubble')).length;
+    btn.hidden = count === 0;
+    btn.title = count > 0 ? `收起 ${count} 个已完成的工具调用` : '收起已完成的工具调用';
+    btn.setAttribute('aria-label', btn.title);
+  }
+
+  // 单条回复只保留一个最上级工具组。已完成的卡片收进去，仍在运行的留在组外，
+  // 避免一键收起把用户正在观察的实时输出一起藏掉。
+  function foldCompletedToolCalls(msgEl) {
+    const bubble = msgEl?.querySelector(':scope > .msg-bubble');
+    const completed = getCompletedToolCalls(bubble);
+    if (completed.length === 0) return false;
+    const toolsDiv = bubble.querySelector(':scope > .msg-tools') || bubble;
+    let group = toolsDiv.querySelector(':scope > .tool-group');
+    if (!group) {
+      group = document.createElement('details');
+      group.className = 'tool-group';
+      const gs = document.createElement('summary');
+      gs.className = 'tool-group-summary';
+      group.appendChild(gs);
+      const inner = document.createElement('div');
+      inner.className = 'tool-group-inner';
+      group.appendChild(inner);
+    }
+
+    const inner = group.querySelector('.tool-group-inner');
+    // 已有分组里若混着运行中卡片，先把它们移回组外，再收拢已完成项。
+    Array.from(inner.children).filter((c) => (
+      c.classList.contains('tool-call') && !isCompletedToolCall(c)
+    )).forEach((c) => toolsDiv.insertBefore(c, group));
+    completed.forEach((c) => inner.appendChild(c));
+
+    group.open = false;
+    toolsDiv.insertBefore(group, toolsDiv.firstChild);
+    _refreshGroupSummary(group);
+    if (msgEl.id === 'streaming-msg') hasGrouped = true;
+    syncToolFoldAction(msgEl);
+    return true;
   }
 
   function updateToolCall(toolUseId, result) {
@@ -4344,6 +4417,8 @@
     const nextContent = buildToolContentElement(tool);
     const content = el.querySelector('.tool-call-content');
     if (content) content.replaceWith(nextContent);
+    const streamEl = document.getElementById('streaming-msg');
+    if (streamEl && streamEl.contains(el)) syncToolFoldAction(streamEl);
   }
 
   function getDeleteConfirmMessage(agent) {
