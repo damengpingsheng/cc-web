@@ -778,6 +778,22 @@ async function main() {
     const goalUnknownCmd = goalEvents.find((e) => e.type === 'system_message' && /未知指令/.test(e.message || ''));
     assert(!goalUnknownCmd, '/goal must bypass cc-web slash command interceptor (no "未知指令")');
 
+    // Claude Skill context is an internal synthetic prompt. Keep the Skill tool card,
+    // but never surface or persist the full SKILL.md body as hook feedback.
+    const skillEvents = [];
+    const skillListener = (buf) => {
+      try { skillEvents.push(JSON.parse(String(buf))); } catch {}
+    };
+    ws.on('message', skillListener);
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger claude skill context', sessionId: claudeImageSession.sessionId, mode: 'plan', agent: 'claude' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeImageSession.sessionId);
+    ws.off('message', skillListener);
+    assert(skillEvents.some((e) => e.type === 'tool_start' && e.name === 'Skill'), 'Skill tool call should remain visible');
+    assert(skillEvents.some((e) => e.type === 'text_delta' && /SKILL_CONTEXT_HIDDEN_OK/.test(e.text || '')), 'Assistant output after Skill context should still stream');
+    assert(!skillEvents.some((e) => e.type === 'system_message' && /Base directory for this skill:|SKILL_CONTEXT_SHOULD_BE_HIDDEN/.test(e.message || '')), 'Synthetic Skill context must not be sent as a system message');
+    const skillSessionOnDisk = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
+    assert(!JSON.stringify(skillSessionOnDisk.messages || []).includes('SKILL_CONTEXT_SHOULD_BE_HIDDEN'), 'Synthetic Skill context must not be persisted');
+
     // Cloudflare dev config: save with token + 2 zones, verify masked echo & disk merge.
     const cfTokenValue = 'cf-regression-token-1234567890';
     ws.send(JSON.stringify({

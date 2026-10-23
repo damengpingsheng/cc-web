@@ -74,6 +74,40 @@ function readStdin() {
     return;
   }
 
+  if (effectiveInput === 'trigger claude skill context') {
+    const toolUseId = 'call_mock_skill_context';
+    process.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      session_id: sessionId,
+      message: { content: [{ type: 'tool_use', id: toolUseId, name: 'Skill', input: { skill: 'mock-skill' } }] },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'user',
+      session_id: sessionId,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'Launching skill: mock-skill' }] },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'user',
+      session_id: sessionId,
+      isSynthetic: true,
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Base directory for this skill: /tmp/mock-skill\n\n# Mock Skill\n\nSKILL_CONTEXT_SHOULD_BE_HIDDEN' }],
+      },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      session_id: sessionId,
+      message: { content: [{ type: 'text', text: 'SKILL_CONTEXT_HIDDEN_OK' }] },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'result',
+      session_id: sessionId,
+      total_cost_usd: 0,
+    })}\n`);
+    return;
+  }
+
   // Token-limit error mode (P0 coverage): the first run of this prompt fails like the
   // real CLI does when the resumed transcript exceeds the model context window.
   // cc-web must detect it (isContextLimitError) and auto-inject /compact + replay.

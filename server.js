@@ -4853,6 +4853,7 @@ const INJECTED_USER_TAGS = new Set([
   'bash-stderr',
   'system-reminder',
 ]);
+const CLAUDE_SKILL_CONTEXT_PREFIX = /^Base directory for this skill:\s+\S/;
 
 function extractClaudeUserText(raw) {
   if (typeof raw === 'string') return raw;
@@ -4862,7 +4863,11 @@ function extractClaudeUserText(raw) {
 
 function isInjectedClaudeUserEntry(entry, text) {
   if (entry?.isMeta === true) return true;
-  const match = String(text || '').trimStart().match(/^<([a-z-]+)>/);
+  const normalized = String(text || '').trimStart();
+  // stream-json marks Skill context as synthetic but omits isMeta; require both
+  // signals here so a real user message with the same prefix is left untouched.
+  if (entry?.isSynthetic === true && CLAUDE_SKILL_CONTEXT_PREFIX.test(normalized)) return true;
+  const match = normalized.match(/^<([a-z-]+)>/);
   return match ? INJECTED_USER_TAGS.has(match[1]) : false;
 }
 
