@@ -38,6 +38,43 @@ function readStdin() {
   process.stdout.write(`${JSON.stringify({ type: 'thread.started', thread_id: threadId })}\n`);
   process.stdout.write(`${JSON.stringify({ type: 'turn.started' })}\n`);
 
+  if (input === 'trigger codex abort output') {
+    const itemId = 'item_abort_custom';
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.started',
+      item: {
+        id: itemId,
+        type: 'custom_tool_call',
+        name: 'exec',
+        input: 'wait for cancellation',
+        status: 'in_progress',
+      },
+    })}\n`);
+    const keepAlive = setInterval(() => {}, 1000);
+    process.once('SIGINT', () => {
+      clearInterval(keepAlive);
+      const output = [
+        JSON.stringify({
+          type: 'item.completed',
+          item: {
+            id: itemId,
+            type: 'custom_tool_call',
+            name: 'exec',
+            text: 'cancelled by SIGINT',
+            status: 'cancelled',
+          },
+        }),
+        JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item_abort_message', type: 'agent_message', text: 'Codex abort handled.' },
+        }),
+        JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }),
+      ].join('\n') + '\n';
+      process.stdout.write(output, () => process.exit(0));
+    });
+    return;
+  }
+
   if (/pwd/i.test(input)) {
     process.stdout.write(`${JSON.stringify({
       type: 'item.started',

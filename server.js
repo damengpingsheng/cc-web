@@ -1712,9 +1712,8 @@ function isProcessRunning(pid) {
   }
 }
 
-function killProcess(pid, force = false) {
+function killProcess(pid, force = false, signal = force ? 'SIGKILL' : 'SIGTERM') {
   if (!pid) return;
-  const signal = force ? 'SIGKILL' : 'SIGTERM';
   try {
     if (IS_WIN) {
       // taskkill /T 递归杀整棵进程树
@@ -2468,8 +2467,9 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     }
   } catch {}
 
-  const rawCompletionError = entry.lastError || (
-    ((typeof exitCode === 'number' && exitCode !== 0) || (!!signal && signal !== 'SIGTERM'))
+  const intentionalAbort = !!entry.abortedByUser || signal === 'SIGINT' || signal === 'SIGTERM';
+  const rawCompletionError = intentionalAbort ? null : entry.lastError || (
+    ((typeof exitCode === 'number' && exitCode !== 0) || !!signal)
       ? (stderrSnippet || null)
       : null
   );
@@ -4334,10 +4334,19 @@ function handleAbort(ws) {
   if (!entry) return;
 
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
-  killProcess(entry.pid);
+  entry.abortedByUser = true;
+  // SIGINT gives Codex a chance to cancel and persist the in-flight tool output.
+  // SIGTERM/SIGKILL are escalation only: killing too early leaves custom tool calls
+  // without outputs, which makes the next resume fail and forces a context reset.
+  killProcess(entry.pid, false, 'SIGINT');
   setTimeout(() => {
-    killProcess(entry.pid, true);
-  }, 3000);
+    if (activeProcesses.get(sessionId) !== entry) return;
+    killProcess(entry.pid, false, 'SIGTERM');
+    setTimeout(() => {
+      if (activeProcesses.get(sessionId) !== entry) return;
+      killProcess(entry.pid, true);
+    }, 1000);
+  }, 2000);
   // handleProcessComplete will be triggered by the PID monitor
 }
 

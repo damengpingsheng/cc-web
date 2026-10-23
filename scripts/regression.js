@@ -35,6 +35,7 @@
  *   - WS 重连不重渲染聊天区（testWsReconnectPreservesState）
  *   - WS 心跳协议级 ping + 运行中任务 activeOutput 断线补齐（testWsHeartbeatAndActiveOutput）
  *   - atomicWriteJson + kill 进程组 + HTTP 旧 token 拒绝（testRobustnessHardening）
+ *   - 用户停止先发 SIGINT，让 Codex 先闭合未完成 tool call（testCodexAbortGracefulSignal）
  *   - XFF 解析纯函数单测（testClientIpResolution）
  *   - 可信代理 + IP 封禁端到端（testIpBanEnforcement）
  *   - spawn 失败（CLI 路径不存在）只报错单个会话，服务不退出（testSpawnFailureIsolation）
@@ -1177,6 +1178,8 @@ async function main() {
   // Goal 5: long-term robustness (atomic writes + killProcess process-group + HTTP token revocation)
   await testRobustnessHardening();
 
+  await testCodexAbortGracefulSignal();
+
   // Client IP resolution + IP ban enforcement (Goal 3)
   await testClientIpResolution();
   await testIpBanEnforcement();
@@ -1668,6 +1671,62 @@ async function testRobustnessHardening() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Robustness hardening checks passed.');
+}
+
+async function testCodexAbortGracefulSignal() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-abort-signal-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  const password = 'AbortSignal!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex');
+    ws.send(JSON.stringify({
+      type: 'message',
+      text: 'trigger codex abort output',
+      sessionId: session.sessionId,
+      mode: 'yolo',
+      agent: 'codex',
+    }));
+
+    await nextMessage(messages, ws, (msg) => msg.type === 'tool_start' && msg.toolUseId === 'item_abort_custom');
+    ws.send(JSON.stringify({ type: 'abort', sessionId: session.sessionId }));
+
+    const toolEnd = await nextMessage(messages, ws, (msg) => (
+      msg.type === 'tool_end' && msg.toolUseId === 'item_abort_custom'
+    ));
+    assert(toolEnd.result === 'cancelled by SIGINT', `Abort must give Codex a chance to close the tool output (got ${toolEnd.result})`);
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+
+    const saved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
+    const abortTool = saved.messages
+      ?.flatMap((message) => message.toolCalls || [])
+      .find((tool) => tool.id === 'item_abort_custom');
+    assert(abortTool?.done === true, 'Aborted Codex tool call must be persisted as completed');
+    assert(abortTool?.result === 'cancelled by SIGINT', 'Aborted Codex tool output must be persisted');
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Codex abort signal checks passed.');
 }
 
 // Verify CSP header is present on every HTTP response and that the front-end no
