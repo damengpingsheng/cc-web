@@ -1259,7 +1259,7 @@ body.session-loading-active {
   overflow-y: scroll;
   overflow-x: hidden;
   padding: 16px;
-  padding-right: 20px;
+  padding-right: 36px;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -1335,11 +1335,11 @@ body.session-loading-active {
   }
 }
 /* === 提问导航条（右侧常显小横条，一条对应一轮用户提问） === */
-/* 轨道贴最右 16px，与 right:16px 起步的跳转按钮不重叠；
-   容器不吃指针事件，滚动条 thumb 压在上层仍可正常拖动。 */
+/* 轨道位于滚动条左侧，thumb 悬停放大后仍留有 8px 间隔；
+   容器不吃指针事件，横条自身再接收点击。 */
 .msg-nav {
   position: absolute;
-  right: 0;
+  right: 18px;
   top: 6px;
   bottom: 6px;
   width: 16px;
@@ -1376,9 +1376,9 @@ body.session-loading-active {
 }
 .msg-nav-tip {
   position: absolute;
-  right: 22px;
+  right: 38px;
   z-index: 8;
-  max-width: min(400px, calc(100% - 44px));
+  max-width: min(400px, calc(100% - 60px));
   padding: 6px 9px;
   border: 1px solid var(--border-color);
   border-radius: 6px;
@@ -1413,7 +1413,7 @@ body.session-loading-active {
 /* 只显示「能去的方向」：到顶只剩向下，到底只剩向上，中间两枚都在 */
 .scroll-jump {
   position: absolute;
-  right: 16px;
+  right: 40px;
   bottom: 16px;
   display: flex;
   flex-direction: column;
@@ -2640,6 +2640,11 @@ mark.search-hit.current {
   .chat-model-state:hover {
     border-color: transparent;
   }
+}
+
+/* 窄屏但仍使用鼠标时提问导航照常显示，正文右侧也保留同一条独立轨道 */
+@media (max-width: 768px) and (pointer: fine) {
+  .messages { padding-right: 36px; }
 }
 
 @media (max-width: 480px) {
