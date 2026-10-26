@@ -56,7 +56,7 @@
 | `text_delta` | 文本流增量（**经 DOMPurify sanitize 后注入 DOM**，详见 [ARCHITECTURE.md](./ARCHITECTURE.md)） |
 | `tool_start` / `tool_end` | 工具调用起止 |
 | `cost` / `usage` | 成本/用量更新 |
-| `done` | 生成完成 |
+| `done` | 一轮进程结束。`willContinue: true` 表示服务端还会自动重试或续跑，前端不应在该事件后立即发送排队消息 |
 | `background_done` | 后台完成（推送通知触发） |
 | `notify_config` / `notify_test_result` | 通知配置回执 |
 | `password_changed` | 改密通知。成功时返回新 `token`，前端必须用新 token 替换旧 token；改密副作用：**踢掉所有其他已认证 WS 连接**（详见 [CONFIG.md](./CONFIG.md#鉴权与安全)） |

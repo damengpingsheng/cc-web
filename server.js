@@ -2582,7 +2582,8 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       wsSend(entry.ws, { type: 'error', message: completionError });
     }
 
-    wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null });
+    const willContinue = !!(retryCodexWithoutResume || shouldReturnForFollowup || shouldAutoCompact);
+    wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null, willContinue });
     sendSessionList(entry.ws);
     // 同步给其他客户端，避免只有发起的那个标签页知道任务完成
     broadcastBackgroundDone(sessionId, entry, entry.ws);

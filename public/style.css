@@ -2345,6 +2345,92 @@ mark.search-hit.current {
   border-top: 1px solid var(--border-color);
   flex-shrink: 0;
 }
+.message-queue {
+  max-width: 800px;
+  margin: 0 auto 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: #fff;
+  overflow: hidden;
+  font-size: 12px;
+}
+.message-queue-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 6px 10px;
+  background: var(--accent-light);
+}
+.message-queue-title {
+  flex-shrink: 0;
+  font-weight: 700;
+  color: var(--accent);
+}
+.message-queue-status {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.message-queue-resume {
+  appearance: none;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--accent);
+  padding: 4px 8px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.message-queue-resume:hover {
+  border-color: var(--accent);
+}
+.message-queue-items {
+  max-height: 128px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border-color);
+}
+.message-queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 4px 8px 4px 10px;
+  border-bottom: 1px solid rgba(91, 126, 161, 0.12);
+}
+.message-queue-item:last-child { border-bottom: none; }
+.message-queue-index {
+  flex-shrink: 0;
+  min-width: 38px;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+.message-queue-preview {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.message-queue-remove {
+  appearance: none;
+  flex-shrink: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 3px 5px;
+  font: inherit;
+  cursor: pointer;
+}
+.message-queue-remove:hover {
+  color: var(--danger);
+  background: rgba(192, 85, 58, 0.1);
+}
 .attachment-tray {
   display: flex;
   flex-wrap: wrap;
@@ -2511,6 +2597,7 @@ mark.search-hit.current {
   color: #fff;
 }
 .send-btn:hover { background: var(--accent-hover); }
+.send-btn.queue-mode { box-shadow: 0 0 0 3px var(--accent-light); }
 .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .abort-btn {
   background: var(--danger);

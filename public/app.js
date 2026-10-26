@@ -169,6 +169,12 @@
   let sidebarCollapsed = localStorage.getItem('cc-web-sidebar-collapsed') === '1';
   let pendingAttachments = [];
   let uploadingAttachments = [];
+  // 待发送队列只保存在当前标签页内，按会话隔离。普通任务结束前不会自动跨会话发送。
+  const messageQueues = new Map();
+  const pausedMessageQueues = new Map();
+  const PENDING_NEW_SESSION_QUEUE = '__pending_new_session__';
+  const MESSAGE_QUEUE_CAP = 20;
+  let queuedGenerationRestartSessionId = null;
   let loginPasswordValue = ''; // store login password for force-change flow
   let currentCwd = null;
   // 当前会话的会话级 Codex 网关原始值（空表示未单独指定，展示口径见 updateGatewayBadge）
@@ -219,6 +225,7 @@
   const chatGatewayMenu = $('#chat-gateway-menu');
   const chatModelState = $('#chat-model-state');
   const costDisplay = $('#cost-display');
+  const messageQueueEl = $('#message-queue');
   const attachmentTray = $('#attachment-tray');
   const imageUploadInput = $('#image-upload-input');
   const attachBtn = $('#attach-btn');
@@ -1126,6 +1133,7 @@
       attachmentTray.hidden = true;
       attachmentTray.innerHTML = '';
       syncAttachmentActions();
+      syncComposerAction();
       return;
     }
     attachmentTray.hidden = false;
@@ -1162,6 +1170,162 @@
       });
     });
     syncAttachmentActions();
+    syncComposerAction();
+  }
+
+  function getActiveMessageQueueKey() {
+    return currentSessionId || PENDING_NEW_SESSION_QUEUE;
+  }
+
+  function queuePreview(item) {
+    const text = String(item?.text || '').replace(/\s+/g, ' ').trim();
+    const attachmentCount = Array.isArray(item?.attachments) ? item.attachments.length : 0;
+    if (text && attachmentCount > 0) return `${text} · ${attachmentCount} 张图片`;
+    if (text) return text;
+    return attachmentCount ? `${attachmentCount} 张图片` : '';
+  }
+
+  function cleanupMessageQueue(key) {
+    if ((messageQueues.get(key) || []).length > 0) return;
+    messageQueues.delete(key);
+    pausedMessageQueues.delete(key);
+  }
+
+  function renderMessageQueue() {
+    if (!messageQueueEl) return;
+    const key = getActiveMessageQueueKey();
+    const queue = messageQueues.get(key) || [];
+    if (queue.length === 0) {
+      messageQueueEl.hidden = true;
+      messageQueueEl.innerHTML = '';
+      syncComposerAction();
+      return;
+    }
+    const pausedReason = pausedMessageQueues.get(key);
+    const itemsHtml = queue.map((item, index) => {
+      const preview = queuePreview(item).slice(0, 120);
+      const label = index === 0 ? '下一条' : String(index + 1);
+      return `<div class="message-queue-item">
+        <span class="message-queue-index">${label}</span>
+        <span class="message-queue-preview" title="${escapeHtml(queuePreview(item))}">${escapeHtml(preview)}</span>
+        <button class="message-queue-remove" type="button" data-queue-id="${escapeHtml(item.id)}" title="移出队列" aria-label="移出队列第 ${index + 1} 条">✕</button>
+      </div>`;
+    }).join('');
+    messageQueueEl.hidden = false;
+    messageQueueEl.innerHTML = `<div class="message-queue-head">
+      <span class="message-queue-title">待发送 ${queue.length} 条</span>
+      <span class="message-queue-status">${escapeHtml(pausedReason || '当前回复结束后自动发送')}</span>
+      ${pausedReason ? '<button class="message-queue-resume" type="button">继续队列</button>' : ''}
+    </div><div class="message-queue-items">${itemsHtml}</div>`;
+    messageQueueEl.querySelectorAll('.message-queue-remove').forEach((button) => {
+      button.addEventListener('click', () => {
+        const currentQueue = messageQueues.get(key) || [];
+        const index = currentQueue.findIndex((item) => item.id === button.dataset.queueId);
+        if (index < 0) return;
+        const [removed] = currentQueue.splice(index, 1);
+        for (const attachment of removed?.attachments || []) {
+          deleteUploadedAttachment(attachment?.id);
+        }
+        cleanupMessageQueue(key);
+        renderMessageQueue();
+      });
+    });
+    const resumeButton = messageQueueEl.querySelector('.message-queue-resume');
+    if (resumeButton) {
+      resumeButton.addEventListener('click', () => {
+        pausedMessageQueues.delete(key);
+        renderMessageQueue();
+        tryDispatchQueuedMessage(currentSessionId || null);
+      });
+    }
+    syncComposerAction();
+  }
+
+  function syncComposerAction() {
+    const hasContent = msgInput.value.trim().length > 0 || pendingAttachments.length > 0;
+    const canQueue = isGenerating && hasContent;
+    sendBtn.hidden = isGenerating && !hasContent;
+    abortBtn.hidden = !isGenerating || hasContent;
+    sendBtn.classList.toggle('queue-mode', canQueue);
+    const queueCount = (messageQueues.get(getActiveMessageQueueKey()) || []).length;
+    sendBtn.title = canQueue ? `加入队列${queueCount ? `（已有 ${queueCount} 条）` : ''}` : '发送';
+    sendBtn.setAttribute('aria-label', canQueue ? '加入队列' : '发送');
+  }
+
+  function migratePendingMessageQueue(sessionId) {
+    if (!sessionId) return;
+    const pendingQueue = messageQueues.get(PENDING_NEW_SESSION_QUEUE) || [];
+    if (pendingQueue.length === 0) return;
+    const queue = messageQueues.get(sessionId) || [];
+    messageQueues.set(sessionId, queue.concat(pendingQueue));
+    messageQueues.delete(PENDING_NEW_SESSION_QUEUE);
+    if (pausedMessageQueues.has(PENDING_NEW_SESSION_QUEUE)) {
+      pausedMessageQueues.set(sessionId, pausedMessageQueues.get(PENDING_NEW_SESSION_QUEUE));
+      pausedMessageQueues.delete(PENDING_NEW_SESSION_QUEUE);
+    }
+  }
+
+  function pauseActiveMessageQueue(reason) {
+    const key = getActiveMessageQueueKey();
+    if ((messageQueues.get(key) || []).length === 0) return;
+    pausedMessageQueues.set(key, reason);
+    renderMessageQueue();
+  }
+
+  function enqueueComposerMessage(text) {
+    const key = getActiveMessageQueueKey();
+    const queue = messageQueues.get(key) || [];
+    if (queue.length >= MESSAGE_QUEUE_CAP) {
+      appendError(`最多排队 ${MESSAGE_QUEUE_CAP} 条消息，请等待当前队列处理。`);
+      return;
+    }
+    queue.push({
+      id: `queue-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      text,
+      attachments: pendingAttachments.map((attachment) => ({ ...attachment })),
+      mode: currentMode,
+      agent: currentAgent,
+    });
+    messageQueues.set(key, queue);
+    msgInput.value = '';
+    pendingAttachments = [];
+    renderPendingAttachments();
+    renderMessageQueue();
+    autoResize();
+    msgInput.focus();
+  }
+
+  function tryDispatchQueuedMessage(sessionId, options = {}) {
+    if (!sessionId || sessionId !== currentSessionId || isGenerating || isBlockingSessionLoad()) return false;
+    if (pausedMessageQueues.has(sessionId)) return false;
+    const queue = messageQueues.get(sessionId) || [];
+    if (queue.length === 0) return false;
+    if (!options.authoritativeIdle && getSessionMeta(sessionId)?.isRunning !== false) return false;
+    if (!isWsConnected()) {
+      showConnBanner();
+      return false;
+    }
+    const item = queue.shift();
+    cleanupMessageQueue(sessionId);
+    const attachments = Array.isArray(item.attachments) ? item.attachments.map((attachment) => ({ ...attachment })) : [];
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) welcome.remove();
+    virtAppendEls([createMsgElement('user', item.text, attachments, Date.now())]);
+    scrollToBottom(true);
+    send({
+      type: 'message',
+      text: item.text,
+      attachments,
+      sessionId,
+      mode: item.mode || currentMode,
+      agent: item.agent || currentAgent,
+    });
+    // done 与紧随其后的 session_list(isRunning=false) 是两个独立 WS 消息。
+    // 队首消息可能先启动下一轮，这条旧快照不能再触发“漏收 done”的重新加载兜底。
+    queuedGenerationRestartSessionId = sessionId;
+    renderMessageQueue();
+    startGenerating();
+    return true;
   }
 
   async function uploadImageFile(file) {
@@ -1429,6 +1593,8 @@
     scheduleNavRebuild();
     setStatsDisplay(null);
     renderPendingAttachments();
+    renderMessageQueue();
+    syncComposerAction();
     highlightActiveSession();
   }
 
@@ -1466,6 +1632,8 @@
       renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
       rebuildPromptHistory(snapshot.messages || []);
     }
+    renderMessageQueue();
+    syncComposerAction();
     highlightActiveSession();
     renderSessionList();
     if (!options.skipCloseSidebar) closeSidebar();
@@ -1540,10 +1708,14 @@
       // 非 force 的 scrollToBottom 会先看 stickToBottom：加载期间用户自己往上翻过就不再强制
       // 落底，否则每打开一个长会话，最后一块历史到齐时都会把人从正在读的地方拽回底部
       scrollToBottom();
-      requestAnimationFrame(() => clearSessionLoading(sessionId));
+      requestAnimationFrame(() => {
+        clearSessionLoading(sessionId);
+        tryDispatchQueuedMessage(sessionId);
+      });
       return;
     }
     clearSessionLoading(sessionId);
+    tryDispatchQueuedMessage(sessionId);
   }
 
   function finalizeLoadedSession(sessionId) {
@@ -1985,10 +2157,13 @@
         if (currentSessionId) {
           const currentMeta = getSessionMeta(currentSessionId);
           const isServerRunning = !!currentMeta?.isRunning;
-          setCurrentSessionRunningState(isServerRunning);
+          const ignoreQueuedRestartIdle = !isServerRunning
+            && queuedGenerationRestartSessionId === currentSessionId;
+          if (isServerRunning) queuedGenerationRestartSessionId = null;
+          setCurrentSessionRunningState(isServerRunning || ignoreQueuedRestartIdle);
           // 兜底：服务端确认 isRunning 从 true→false 且前端仍在生成态，
           // 说明 done/background_done 因 WS detach 漏掉了。清除生成态并重新加载会话拿到完整输出。
-          if (currentMeta && wasServerRunning && !isServerRunning && hadStreamingUi) {
+          if (currentMeta && wasServerRunning && !isServerRunning && hadStreamingUi && !ignoreQueuedRestartIdle) {
             finishGenerating(currentSessionId);
             beginSessionSwitch(currentSessionId, { blocking: false, force: true });
           }
@@ -2004,6 +2179,7 @@
       }
 
       case 'session_info':
+        migratePendingMessageQueue(msg.sessionId);
         const snapshot = normalizeSessionSnapshot(msg);
         // 服务端在 load_session 里已经把这条会话磁盘上的 hasUnread 清了，但它不回推
         // session_list，而侧栏红点读的是本地 sessions：不在这里跟着灭，红点就会一直挂到
@@ -2232,6 +2408,7 @@
 
       case 'done':
         finishGenerating(msg.sessionId);
+        if (!msg.willContinue) tryDispatchQueuedMessage(msg.sessionId, { authoritativeIdle: true });
         break;
 
       case 'system_message': {
@@ -2318,6 +2495,7 @@
           const toolsDiv = document.querySelector('#streaming-msg .msg-tools');
           if (toolsDiv) toolsDiv.innerHTML = '';
         }
+        syncComposerAction();
         pendingText = msg.text || '';
         flushRender();
         if (msg.toolCalls && msg.toolCalls.length > 0) {
@@ -2341,6 +2519,7 @@
         break;
 
       case 'error':
+        queuedGenerationRestartSessionId = null;
         appendError(msg.message);
         clearSessionLoading();
         if (!isGenerating && currentSessionId) {
@@ -2351,7 +2530,10 @@
           pendingGoalForNewSession = null;
           updateGoalBar();
         }
-        if (isGenerating) finishGenerating();
+        if (isGenerating) {
+          pauseActiveMessageQueue('任务出错，队列已暂停');
+          finishGenerating();
+        }
         break;
 
       case 'notify_config':
@@ -2456,7 +2638,7 @@
     pendingBackgroundTasks = [];
     sendBtn.hidden = true;
     abortBtn.hidden = false;
-    // 不禁用输入框，允许用户继续输入（但无法发送）
+    // 不禁用输入框，允许用户继续输入并加入待发送队列
 
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
@@ -2477,6 +2659,7 @@
     ensureTypingIndicator(bubble);
     virtAttachStream(msgEl);
     scrollToBottom();
+    syncComposerAction();
   }
 
   // 「仍在生成」指示。挂在 bubble 末尾而不是 .msg-text 里：flushRender 每次都重写
@@ -2559,6 +2742,7 @@
       goalState.optimistic = false;
     }
     updateGoalBar();
+    syncComposerAction();
   }
 
   // --- Rendering ---
@@ -5836,15 +6020,26 @@
   }
 
   // --- Send Message ---
-  // 不变量：空文本+无附件、生成中、会话加载阻塞时立即返回；
+  // 不变量：空文本+无附件、会话加载阻塞时立即返回；生成中改为加入待发送队列；
   // 未连接时立即返回并显示断线状态条（不清空输入框、不渲染气泡、不进入生成态，
   // 避免 WS 断线窗口内发送被静默丢弃、重连快照又冲掉本地气泡）。
   // /goal 在此走普通消息路径；Codex 会由服务端转换为目标提示。
   function sendMessage() {
     const text = msgInput.value.trim();
-    if ((!text && pendingAttachments.length === 0) || isGenerating || isBlockingSessionLoad()) return;
+    if ((!text && pendingAttachments.length === 0) || isBlockingSessionLoad()) return;
     if (!isWsConnected()) {
       showConnBanner();
+      return;
+    }
+    if (isGenerating) {
+      if (text.startsWith('/')) {
+        appendError('当前任务运行中，斜杠命令暂不支持加入队列，请等待完成后再发送。');
+        return;
+      }
+      hideCmdMenu();
+      hideOptionPicker();
+      pushPromptHistory(text);
+      enqueueComposerMessage(text);
       return;
     }
     hideCmdMenu();
@@ -5967,12 +6162,14 @@
         promptHistoryIndex = -1;
         msgInput.value = '';
         autoResize();
+        syncComposerAction();
         return true;
       }
       promptHistoryIndex = next;
     }
     msgInput.value = promptHistory[promptHistoryIndex];
     autoResize();
+    syncComposerAction();
     const end = msgInput.value.length;
     msgInput.setSelectionRange(end, end);
     return true;
@@ -6084,7 +6281,10 @@
     }
   });
   sendBtn.addEventListener('click', sendMessage);
-  abortBtn.addEventListener('click', () => send({ type: 'abort' }));
+  abortBtn.addEventListener('click', () => {
+    pauseActiveMessageQueue('已停止当前任务，队列已暂停');
+    send({ type: 'abort' });
+  });
   // B+: goal status bar's own stop button — same semantics as abort, but also nudges UI
   const goalStopBtn = document.getElementById('goal-status-stop');
   if (goalStopBtn) {
@@ -6096,6 +6296,7 @@
           updateGoalBar();
         }
       }
+      pauseActiveMessageQueue('Goal 已停止，队列已暂停');
       send({ type: 'abort' });
     });
   }
@@ -6144,6 +6345,7 @@
 
   msgInput.addEventListener('input', () => {
     autoResize();
+    syncComposerAction();
     promptHistoryIndex = -1;   // 用户一改动内容就退出历史回溯
     const val = msgInput.value;
     // Show slash command menu
@@ -6155,6 +6357,7 @@
   });
 
   msgInput.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
     // Command menu navigation
     if (!cmdMenu.hidden) {
       if (e.key === 'ArrowDown') { e.preventDefault(); navigateCmdMenu(1); return; }
