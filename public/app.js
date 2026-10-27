@@ -4904,6 +4904,7 @@
   const navTipEl = document.getElementById('msg-nav-tip');
   const NAV_TICK_MIN_H = 4;
   const NAV_TICK_MAX_H = 10;
+  const NAV_TICK_VISUAL_GAP = 6; // 2px 横线 + 4px 间隙：密集提问也保留可辨认的间距
   let navTicks = [];          // [{ el, idx, top, y, h }]，idx 是虚拟化里的消息下标，top 是缓存的落位
   let navScrollHeight = -1;   // 上次布局时的内容高度与轨道高度，任一变化才重排
   let navTrackHeight = -1;
@@ -4930,9 +4931,23 @@
     for (const t of navTicks) t.top = virtOffset(t.idx);
     // 写之前先比缓存：拖动/流式时 scrollHeight 每帧都在变，但 1px 以内的落位差肉眼
     // 看不出来，量化到 0.5px 后绝大多数横条可以直接跳过写 style。
-    for (const t of navTicks) {
-      const y = Math.max(0, Math.min(trackH - tickH, (t.top / scrollH) * trackH - tickH / 2));
-      const yq = Math.round(y * 2) / 2;
+    const maxY = Math.max(0, trackH - tickH);
+    const minGap = navTicks.length > 1
+      ? Math.min(NAV_TICK_VISUAL_GAP, maxY / (navTicks.length - 1))
+      : 0;
+    const ys = navTicks.map((t) => {
+      const y = Math.max(0, Math.min(maxY, (t.top / scrollH) * trackH - tickH / 2));
+      return Math.round(y * 2) / 2;
+    });
+    // 先向下推开重叠的刻度，再从底部反向校正；不足以容纳全部刻度时才按轨道长度压缩间距。
+    for (let i = 1; i < ys.length; i++) ys[i] = Math.max(ys[i], ys[i - 1] + minGap);
+    if (ys[ys.length - 1] > maxY) {
+      ys[ys.length - 1] = maxY;
+      for (let i = ys.length - 2; i >= 0; i--) ys[i] = Math.min(ys[i], ys[i + 1] - minGap);
+    }
+    for (let i = 0; i < navTicks.length; i++) {
+      const t = navTicks[i];
+      const yq = Math.round(ys[i] * 2) / 2;
       if (t.y === yq && t.h === tickH) continue;
       t.y = yq;
       t.h = tickH;
