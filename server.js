@@ -226,7 +226,7 @@ function getSummaryApiCredentials(summaryConfig) {
   return null;
 }
 
-function callSummaryApi(creds, prompt) {
+function callSummaryApi(creds, prompt, options = {}) {
   return new Promise((resolve) => {
     try {
       const base = creds.apiBase.replace(/\/+$/, '');
@@ -235,7 +235,7 @@ function callSummaryApi(creds, prompt) {
       const model = creds.model || 'claude-opus-4-6';
       const body = JSON.stringify({
         model,
-        max_tokens: 1024,
+        max_tokens: options.maxTokens || 1024,
         messages: [{ role: 'user', content: prompt }],
       });
       const req = mod.request(url, {
@@ -1745,6 +1745,324 @@ function cleanRunDir(sessionId) {
 // isRunning 只存在于内存（activeProcesses），不进缓存，每次实时计算。
 const sessionSummaryCache = new Map(); // filename -> { mtimeMs, size, summary }
 
+function getSessionMessageText(message) {
+  if (!message || typeof message !== 'object') return '';
+  const content = message.content;
+  let text = '';
+  if (typeof content === 'string') {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content.map((part) => {
+      if (typeof part === 'string') return part;
+      if (!part || typeof part !== 'object') return '';
+      return typeof part.text === 'string' ? part.text : '';
+    }).filter(Boolean).join(' ');
+  } else if (typeof message.text === 'string') {
+    text = message.text;
+  }
+  text = text.replace(/\s+/g, ' ').trim();
+  if (text) return text.slice(0, 160);
+  const toolNames = Array.isArray(message.toolCalls)
+    ? [...new Set(message.toolCalls.map((call) => call?.name).filter(Boolean))].slice(0, 3)
+    : [];
+  return toolNames.length > 0 ? `调用工具 ${toolNames.join(', ')}` : '';
+}
+
+function getSessionLastMessageSummary(session) {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    const role = message?.role === 'user' ? 'user' : (message?.role === 'assistant' ? 'assistant' : '');
+    if (!role) continue;
+    const text = getSessionMessageText(message);
+    if (text) return { lastMessage: text, lastMessageRole: role };
+  }
+  return { lastMessage: '', lastMessageRole: '' };
+}
+
+// 会话标题整理：只把“标题是首条用户消息前缀”的情况当作候选，是否修改仍由前端逐条确认。
+function getSessionTitleMessageText(message) {
+  if (!message || typeof message !== 'object') return '';
+  const content = message.content;
+  if (typeof content === 'string') return content.replace(/\r/g, '').trim();
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === 'string') return part;
+      if (!part || typeof part !== 'object') return '';
+      if (typeof part.text === 'string') return part.text;
+      return typeof part.content === 'string' ? part.content : '';
+    }).filter(Boolean).join('\n').replace(/\r/g, '').trim();
+  }
+  if (typeof content?.text === 'string') return content.text.replace(/\r/g, '').trim();
+  if (typeof message.text === 'string') return message.text.replace(/\r/g, '').trim();
+  return '';
+}
+
+function normalizeSessionTitleText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function classifyPromptDerivedSessionTitle(session) {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  const firstUser = messages.find((message) => message?.role === 'user' && getSessionTitleMessageText(message));
+  if (!firstUser) return null;
+  const rawPrompt = getSessionTitleMessageText(firstUser);
+  const firstLine = (rawPrompt.split('\n').find((line) => line.trim()) || '').trim();
+  const titleNorm = normalizeSessionTitleText(session?.title);
+  const firstLineNorm = normalizeSessionTitleText(firstLine);
+  const promptNorm = normalizeSessionTitleText(rawPrompt);
+  if (titleNorm.length < 8) return null;
+  const sameFirstLine = titleNorm === firstLineNorm;
+  const firstLinePrefix = firstLineNorm.startsWith(titleNorm);
+  const promptPrefix = promptNorm.startsWith(titleNorm);
+  if (!sameFirstLine && !firstLinePrefix && !promptPrefix) return null;
+  return {
+    matchType: sameFirstLine ? 'exact-first-line' : (firstLinePrefix ? 'truncated-first-line' : 'prompt-prefix-across-lines'),
+    firstLine: firstLine.slice(0, 240),
+  };
+}
+
+function truncateSessionTitleContext(text, limit) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+function auditSessionTitles() {
+  const candidates = [];
+  const files = fs.readdirSync(SESSIONS_DIR).filter((file) => file.endsWith('.json'));
+  for (const file of files) {
+    try {
+      const session = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8'));
+      const detected = classifyPromptDerivedSessionTitle(session);
+      if (!detected) continue;
+      const messages = Array.isArray(session.messages) ? session.messages : [];
+      const users = messages
+        .filter((message) => message?.role === 'user')
+        .map((message) => getSessionTitleMessageText(message))
+        .filter((text) => text && !text.startsWith('[系统上下文]'))
+        .slice(-6)
+        .map((text) => truncateSessionTitleContext(text, 360));
+      const assistantTail = messages
+        .filter((message) => message?.role === 'assistant')
+        .map((message) => getSessionTitleMessageText(message))
+        .filter(Boolean)
+        .slice(-3)
+        .map((text) => truncateSessionTitleContext(text, 520));
+      const id = path.basename(file, '.json');
+      candidates.push({
+        id,
+        title: String(session.title || 'Untitled'),
+        agent: getSessionAgent(session),
+        updated: session.updated || null,
+        messageCount: messages.length,
+        active: activeProcesses.has(id),
+        matchType: detected.matchType,
+        firstLine: detected.firstLine,
+        users,
+        assistantTail,
+      });
+    } catch {}
+  }
+  return candidates.sort((a, b) => new Date(b.updated || 0) - new Date(a.updated || 0));
+}
+
+function buildSessionTitleSuggestionPrompt(candidates) {
+  const input = candidates.map((candidate) => ({
+    id: candidate.id,
+    oldTitle: candidate.title,
+    agent: candidate.agent,
+    userMessages: candidate.users,
+    assistantTail: candidate.assistantTail,
+  }));
+  return `请整理 cc-web 会话标题。下面每个候选的旧标题由首条用户提问自动派生，不能直接沿用。
+
+规则：
+1. 阅读 userMessages 的需求顺序和 assistantTail 的最终有效结论，标题概括整段对话实际完成或调查的内容。
+2. 优先使用 12-30 个中文字符的短名词或动作短语，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。
+3. 去掉“帮我、我想、是否可以、可行吗、为什么、请”等提问外壳和问号。
+4. 后续实现或诊断改变了范围时，标题要覆盖最终范围；只有证据支持时才写“完成/修复”，否则用“分析、核查、排查、评审”等中性动词。
+5. 不复制日志、密钥、长路径或个人数据，不使用 Markdown，不换行。运行中的会话也给建议，但客户端不会应用。
+6. 只输出 JSON 数组，每项严格为 {"id":"原 id","title":"新标题"}，不要解释。
+
+候选：
+${JSON.stringify(input)}`;
+}
+
+function parseSessionTitleSuggestions(text, candidates) {
+  const source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  const start = source.indexOf('[');
+  const end = source.lastIndexOf(']');
+  if (start < 0 || end <= start) return new Map();
+  let parsed;
+  try { parsed = JSON.parse(source.slice(start, end + 1)); } catch { return new Map(); }
+  if (!Array.isArray(parsed)) return new Map();
+  const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+  const suggestions = new Map();
+  for (const item of parsed) {
+    const id = typeof item?.id === 'string' ? item.id : '';
+    if (!candidateIds.has(id) || suggestions.has(id)) continue;
+    const title = normalizeSessionTitleText(item?.title).replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 100);
+    if (!title || title === candidates.find((entry) => entry.id === id)?.title) continue;
+    const candidate = candidates.find((entry) => entry.id === id);
+    if (classifyPromptDerivedSessionTitle({
+      title,
+      messages: candidate?.firstLine ? [{ role: 'user', content: candidate.firstLine }] : [],
+    })) continue;
+    suggestions.set(id, title);
+  }
+  return suggestions;
+}
+
+function getSessionTitleSuggestionCredentials() {
+  const summaryConfig = loadNotifyConfig().summary || {};
+  for (const source of [summaryConfig.apiSource, 'claude', 'codex']) {
+    if (!source) continue;
+    const creds = getSummaryApiCredentials({ ...summaryConfig, apiSource: source });
+    if (creds) return creds;
+  }
+  return null;
+}
+
+async function handleAuditSessionTitles(ws) {
+  let candidates = [];
+  try {
+    candidates = auditSessionTitles();
+  } catch (error) {
+    return wsSend(ws, {
+      type: 'session_title_audit',
+      candidates: [],
+      aiStatus: 'error',
+      aiMessage: `扫描会话标题失败：${error.message}`,
+    });
+  }
+  if (candidates.length === 0) {
+    return wsSend(ws, {
+      type: 'session_title_audit',
+      candidates: [],
+      aiStatus: 'empty',
+      aiMessage: '没有发现从首条用户提问派生的标题。',
+    });
+  }
+
+  const creds = getSessionTitleSuggestionCredentials();
+  if (!creds) {
+    return wsSend(ws, {
+      type: 'session_title_audit',
+      candidates,
+      aiStatus: 'unavailable',
+      aiMessage: '未找到可用的 Claude/Codex 自定义 API，候选已列出，可手工填写新标题。',
+    });
+  }
+
+  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(candidates), { maxTokens: 2048 });
+  const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, candidates) : new Map();
+  wsSend(ws, {
+    type: 'session_title_audit',
+    candidates: candidates.map((candidate) => ({
+      ...candidate,
+      suggestion: suggestions.get(candidate.id) || '',
+    })),
+    aiStatus: suggestions.size > 0 ? 'ready' : 'failed',
+    aiMessage: suggestions.size > 0
+      ? `已根据完整对话生成 ${suggestions.size} 条建议，请确认后应用。`
+      : '标题建议生成失败，候选已列出，可手工填写。',
+  });
+}
+
+function titleAuditBackupRoot() {
+  const now = new Date();
+  const day = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+  const home = process.env.HOME || process.env.USERPROFILE || __dirname;
+  return path.join(home, 'work_dir', 'tmp', `${day}-cc-web-session-titles`);
+}
+
+function atomicReplaceSessionTitleFile(filePath, oldTitle, newTitle) {
+  const source = fs.readFileSync(filePath, 'utf8');
+  const needle = `"title": ${JSON.stringify(oldTitle)}`;
+  const position = source.indexOf(needle);
+  if (position < 0) throw new Error('找不到会话顶层 title 字段');
+  if (source.indexOf(needle, position + needle.length) >= 0) throw new Error('会话 title 字段不唯一');
+  const next = source.slice(0, position) + `"title": ${JSON.stringify(newTitle)}` + source.slice(position + needle.length);
+  const tempPath = `${filePath}.title-${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`;
+  const mode = fs.statSync(filePath).mode & 0o777;
+  const fd = fs.openSync(tempPath, 'wx', mode);
+  try {
+    fs.writeFileSync(fd, next, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tempPath, filePath);
+}
+
+function handleApplySessionTitles(ws, changes) {
+  if (!Array.isArray(changes) || changes.length === 0) {
+    return wsSend(ws, { type: 'session_titles_applied', success: false, message: '没有选择要修改的标题。' });
+  }
+  if (changes.length > 50) {
+    return wsSend(ws, { type: 'session_titles_applied', success: false, message: '一次最多整理 50 个会话标题。' });
+  }
+
+  const prepared = [];
+  const seen = new Set();
+  try {
+    for (const change of changes) {
+      const id = path.basename(String(change?.id || ''), '.json');
+      const oldTitle = typeof change?.oldTitle === 'string' ? change.oldTitle : '';
+      const newTitle = normalizeSessionTitleText(change?.newTitle);
+      if (!id || seen.has(id)) throw new Error('会话 ID 缺失或重复');
+      seen.add(id);
+      if (!newTitle) throw new Error(`会话 ${id.slice(0, 8)} 的新标题为空`);
+      if (newTitle.length > 100) throw new Error(`会话 ${id.slice(0, 8)} 的新标题超过 100 字`);
+      if (newTitle === oldTitle) throw new Error(`会话 ${id.slice(0, 8)} 的标题没有变化`);
+      if (activeProcesses.has(id)) throw new Error(`会话 ${id.slice(0, 8)} 正在运行，请完成后再整理`);
+      const filePath = sessionPath(id);
+      if (!fs.existsSync(filePath)) throw new Error(`会话 ${id.slice(0, 8)} 不存在`);
+      const before = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (before.title !== oldTitle) throw new Error(`会话 ${id.slice(0, 8)} 的标题已变化，请重新体检`);
+      if (classifyPromptDerivedSessionTitle({ ...before, title: newTitle })) {
+        throw new Error(`会话 ${id.slice(0, 8)} 的新标题仍沿用了首问`);
+      }
+      prepared.push({ id, filePath, oldTitle, newTitle, before });
+    }
+  } catch (error) {
+    return wsSend(ws, { type: 'session_titles_applied', success: false, message: error.message });
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupDir = path.join(titleAuditBackupRoot(), `backup-${stamp}`);
+  try {
+    fs.mkdirSync(backupDir, { recursive: true });
+    for (const item of prepared) fs.copyFileSync(item.filePath, path.join(backupDir, `${item.id}.json`));
+    fs.writeFileSync(path.join(backupDir, 'changes.json'), `${JSON.stringify(prepared.map(({ id, oldTitle, newTitle }) => ({ id, oldTitle, newTitle })), null, 2)}\n`, 'utf8');
+    for (const item of prepared) atomicReplaceSessionTitleFile(item.filePath, item.oldTitle, item.newTitle);
+    for (const item of prepared) {
+      const after = JSON.parse(fs.readFileSync(item.filePath, 'utf8'));
+      if (after.title !== item.newTitle) throw new Error(`会话 ${item.id.slice(0, 8)} 写后标题不一致`);
+      after.title = item.before.title;
+      if (JSON.stringify(after) !== JSON.stringify(item.before)) {
+        throw new Error(`会话 ${item.id.slice(0, 8)} 的非标题数据发生变化`);
+      }
+    }
+  } catch (error) {
+    plog('WARN', 'session_titles_apply_failed', { error: error.message, backupDir });
+    return wsSend(ws, { type: 'session_titles_applied', success: false, message: `标题写入失败：${error.message}` });
+  }
+
+  for (const item of prepared) sessionSummaryCache.delete(`${item.id}.json`);
+  for (const client of wss.clients) {
+    if (client._ccwebAuthed && client.readyState === 1) sendSessionList(client);
+  }
+  plog('INFO', 'session_titles_applied', { count: prepared.length, backupDir });
+  wsSend(ws, {
+    type: 'session_titles_applied',
+    success: true,
+    count: prepared.length,
+    backupDir,
+    message: `已更新 ${prepared.length} 个会话标题。`,
+  });
+}
+
 function sendSessionList(ws) {
   try {
     const files = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'));
@@ -1761,6 +2079,7 @@ function sendSessionList(ws) {
           summary = cached.summary;
         } else {
           const s = normalizeSession(JSON.parse(fs.readFileSync(filePath, 'utf8')));
+          const lastMessage = getSessionLastMessageSummary(s);
           summary = {
             id: s.id,
             title: s.title || 'Untitled',
@@ -1768,6 +2087,9 @@ function sendSessionList(ws) {
             hasUnread: !!s.hasUnread,
             agent: getSessionAgent(s),
             group: s.group || '',
+            cwd: s.cwd || '',
+            lastMessage: lastMessage.lastMessage,
+            lastMessageRole: lastMessage.lastMessageRole,
             // CLI 侧的真实 session id（侧栏每个会话项的标题下方展示）。每轮任务 done 后
             // 本函数都会重推，所以 resume 换了 id 前端也能跟上。
             claudeSessionId: s.claudeSessionId || '',
@@ -2979,6 +3301,12 @@ wss.on('connection', (ws, req) => {
         break;
       case 'rename_session':
         handleRenameSession(ws, msg.sessionId, msg.title);
+        break;
+      case 'audit_session_titles':
+        handleAuditSessionTitles(ws);
+        break;
+      case 'apply_session_titles':
+        handleApplySessionTitles(ws, msg.changes);
         break;
       case 'set_mode':
         handleSetMode(ws, msg.sessionId, msg.mode);

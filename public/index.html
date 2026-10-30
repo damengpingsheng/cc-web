@@ -15,7 +15,7 @@
       document.documentElement.dataset.theme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="style.css?v=1.5.1-my.62">
+  <link rel="stylesheet" href="style.css?v=1.5.1-my.66">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
 </head>
 <body>
@@ -46,6 +46,11 @@
           <button id="import-session-btn">导入本地 CLI 会话</button>
           <button id="add-group-btn">新建分组</button>
         </div>
+        <button id="session-overview-btn" class="session-overview-entry" type="button">
+          <span class="session-overview-entry-mark" aria-hidden="true"><i></i><i></i></span>
+          <span class="session-overview-entry-text">会话总台</span>
+          <span id="session-overview-entry-count" class="session-overview-entry-count">0</span>
+        </button>
       </div>
       <div id="session-list" class="session-list"></div>
       <div class="sidebar-footer">
@@ -170,6 +175,62 @@
     </main>
   </div>
 
+  <section id="session-overview" class="session-overview" role="dialog" aria-modal="true" aria-labelledby="session-overview-title" aria-describedby="session-overview-summary" hidden>
+    <header class="session-overview-header">
+      <div class="session-overview-heading">
+        <h1 id="session-overview-title">会话总台</h1>
+        <p id="session-overview-summary"><span id="session-overview-total">0</span> 条会话，来自 Claude 与 Codex</p>
+      </div>
+      <label class="session-overview-search">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m12.6 12.6 4 4"/></svg>
+        <input id="session-overview-search" type="search" placeholder="搜索标题、项目或会话 ID" autocomplete="off" spellcheck="false" aria-label="搜索全部会话">
+        <span id="session-overview-match-count" class="session-overview-match-count"></span>
+      </label>
+      <div class="session-overview-actions">
+        <button id="session-overview-title-audit" class="session-overview-title-audit" type="button" title="识别并整理从首条提问派生的会话标题">整理标题</button>
+        <button id="session-overview-close" class="session-overview-close" type="button">返回会话 <kbd>Esc</kbd></button>
+      </div>
+    </header>
+    <div class="session-overview-controls">
+      <div class="session-overview-filter-group" role="group" aria-label="按 Agent 筛选">
+        <button type="button" class="session-overview-filter active" data-overview-agent="all">全部 <span id="session-overview-agent-all-count">0</span></button>
+        <button type="button" class="session-overview-filter" data-overview-agent="claude">Claude <span id="session-overview-agent-claude-count">0</span></button>
+        <button type="button" class="session-overview-filter" data-overview-agent="codex">Codex <span id="session-overview-agent-codex-count">0</span></button>
+      </div>
+      <div class="session-overview-filter-group session-overview-status-filters" role="group" aria-label="按状态筛选">
+        <button type="button" class="session-overview-filter active" data-overview-status="all">全部状态</button>
+        <button type="button" class="session-overview-filter" data-overview-status="running">运行中 <span id="session-overview-running-count">0</span></button>
+        <button type="button" class="session-overview-filter" data-overview-status="unread">未读 <span id="session-overview-unread-count">0</span></button>
+        <button type="button" class="session-overview-filter" data-overview-status="favorite">收藏 <span id="session-overview-favorite-count">0</span></button>
+      </div>
+    </div>
+    <div class="session-overview-scroll">
+      <div id="session-overview-focus" class="session-overview-focus" hidden></div>
+      <div id="session-overview-list" class="session-overview-list"></div>
+    </div>
+    <div id="session-title-audit" class="session-title-audit" hidden>
+      <section class="session-title-audit-panel" role="dialog" aria-modal="true" aria-labelledby="session-title-audit-heading" aria-describedby="session-title-audit-description">
+        <header class="session-title-audit-header">
+          <div>
+            <span class="session-title-audit-eyebrow">标题整理</span>
+            <h2 id="session-title-audit-heading">会话标题体检</h2>
+            <p id="session-title-audit-description">只处理沿用首条提问的标题，应用前可逐条修改。</p>
+          </div>
+          <button id="session-title-audit-close" class="modal-close-btn" type="button" aria-label="关闭标题整理">✕</button>
+        </header>
+        <div id="session-title-audit-status" class="session-title-audit-status" role="status" aria-live="polite"></div>
+        <div id="session-title-audit-list" class="session-title-audit-list"></div>
+        <footer class="session-title-audit-footer">
+          <p>规则：概括整段会话实际工作，去掉提问外壳；无明确结论时使用中性动词。</p>
+          <div>
+            <button id="session-title-audit-cancel" class="modal-btn-secondary" type="button">取消</button>
+            <button id="session-title-audit-apply" class="modal-btn-primary" type="button" disabled>应用所选</button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  </section>
+
   <div id="session-loading-overlay" class="session-loading-overlay" hidden aria-live="polite" aria-hidden="true">
     <div class="session-loading-card" role="status" aria-busy="true">
       <div class="session-loading-badge">Session</div>
@@ -187,6 +248,6 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.11/purify.min.js"></script>
-  <script src="app.js?v=1.5.1-my.62"></script>
+  <script src="app.js?v=1.5.1-my.66"></script>
 </body>
 </html>

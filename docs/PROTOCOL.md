@@ -6,7 +6,7 @@
 
 ### 客户端 → 服务端
 
-`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 34 个 case = **35 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
+`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 38 个 case = **39 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
 
 | 类型 | 用途 |
 |---|---|
@@ -17,6 +17,8 @@
 | `load_session` | 加载会话 |
 | `delete_session` | 删除会话 |
 | `rename_session` | 重命名会话 |
+| `audit_session_titles` | 扫描由首条用户消息派生的会话标题，并按可用模型配置生成内容型标题建议 |
+| `apply_session_titles { changes }` | 备份后批量更新标题。每项含 `id` / `oldTitle` / `newTitle`；任一会话正在运行或标题已变化时整批拒绝 |
 | `set_mode` | 切换 permissionMode |
 | `list_sessions` | 拉取会话列表 |
 | `detach_view` | 关闭查看模式 |
@@ -39,7 +41,7 @@
 
 ### 服务端 → 客户端
 
-`public/app.js` 中 `handleServerMessage` 函数，共 **31 个 case**：
+`public/app.js` 中 `handleServerMessage` 函数，共 **38 个 case**：
 
 | 类型 | 用途 |
 |---|---|
@@ -52,6 +54,8 @@
 | `session_history_chunk` | 历史分块（懒加载，详见 [RUNTIME.md](./RUNTIME.md#懒加载历史)） |
 | `resume_generating` | 恢复生成态 |
 | `session_renamed` | 重命名通知 |
+| `session_title_audit` | 标题体检结果。含 `candidates`、`aiStatus`（`ready` / `unavailable` / `failed` / `empty` / `error`）和 `aiMessage`；候选附带历史用户意图、助手结论与可选 `suggestion` |
+| `session_titles_applied` | 标题批量更新回执。成功时含 `count` 与备份目录 `backupDir`；失败时不写入 |
 | `mode_changed` / `model_changed` | 模式/模型切换通知 |
 | `text_delta` | 文本流增量（**经 DOMPurify sanitize 后注入 DOM**，详见 [ARCHITECTURE.md](./ARCHITECTURE.md)） |
 | `tool_start` / `tool_end` | 工具调用起止 |

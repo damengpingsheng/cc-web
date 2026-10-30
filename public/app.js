@@ -161,6 +161,24 @@
   // 优先恢复本标签页自己的选择：sessionStorage 按标签页隔离、刷新不丢、关页才清空，
   // 刷新后不被其他标签页的切换带偏；新开标签页没有本页记录时回退到 localStorage 的全局最后一次选择。
   let currentAgent = normalizeAgent(sessionStorage.getItem('cc-web-agent') || localStorage.getItem('cc-web-agent'));
+  const SESSION_OVERVIEW_FAVORITES_KEY = 'cc-web-session-overview-favorites';
+  function loadSessionOverviewFavorites() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SESSION_OVERVIEW_FAVORITES_KEY) || '[]');
+      return new Set(Array.isArray(saved) ? saved.filter((id) => typeof id === 'string' && id) : []);
+    } catch {
+      return new Set();
+    }
+  }
+  let sessionOverviewFavorites = loadSessionOverviewFavorites();
+  let sessionOverviewOpen = false;
+  let sessionOverviewHistoryEntry = false;
+  let sessionTitleAuditHistoryEntry = false;
+  let sessionOverviewAgent = 'all';
+  let sessionOverviewStatus = 'all';
+  let sessionOverviewQuery = '';
+  let sessionTitleAuditCandidates = [];
+  let sessionTitleAuditLoading = false;
   let currentTheme = (document.documentElement.dataset.theme || localStorage.getItem('cc-web-theme') || 'washi');
   let codexConfigCache = null;
   let loadedHistorySessionId = null;
@@ -214,6 +232,15 @@
   const newChatArrow = $('#new-chat-arrow');
   const newChatDropdown = $('#new-chat-dropdown');
   const importSessionBtn = $('#import-session-btn');
+  const sessionOverviewBtn = $('#session-overview-btn');
+  const sessionOverviewEntryCount = $('#session-overview-entry-count');
+  const sessionOverviewTitleAuditBtn = $('#session-overview-title-audit');
+  const sessionTitleAudit = $('#session-title-audit');
+  const sessionTitleAuditClose = $('#session-title-audit-close');
+  const sessionTitleAuditCancel = $('#session-title-audit-cancel');
+  const sessionTitleAuditApply = $('#session-title-audit-apply');
+  const sessionTitleAuditStatus = $('#session-title-audit-status');
+  const sessionTitleAuditList = $('#session-title-audit-list');
   const sessionList = $('#session-list');
   const addGroupBtn = $('#add-group-btn');
   const chatTitle = $('#chat-title');
@@ -242,6 +269,11 @@
   const searchIncludeTools = $('#msg-search-include-tools');
   const searchCaseSensitive = $('#msg-search-case-sensitive');
   const searchWholeWord = $('#msg-search-whole-word');
+  const sessionOverview = $('#session-overview');
+  const sessionOverviewSearch = $('#session-overview-search');
+  const sessionOverviewMatchCount = $('#session-overview-match-count');
+  const sessionOverviewFocus = $('#session-overview-focus');
+  const sessionOverviewList = $('#session-overview-list');
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -1402,6 +1434,471 @@
     return sessions.filter((s) => normalizeAgent(s.agent) === currentAgent);
   }
 
+  function updateSessionOverviewEntryCount() {
+    if (sessionOverviewEntryCount) sessionOverviewEntryCount.textContent = String(sessions.length);
+  }
+
+  function getSessionOverviewGroupName(session) {
+    if (!session?.group) return '';
+    return groups.find((group) => group.id === session.group)?.name || '';
+  }
+
+  function getSessionOverviewProject(cwd) {
+    const value = String(cwd || '').replace(/[/\\]+$/, '');
+    if (!value) return '';
+    const parts = value.split(/[/\\]+/).filter(Boolean);
+    return parts.slice(-2).join('/') || value;
+  }
+
+  function getSessionOverviewDateBucket(dateStr) {
+    const date = new Date(dateStr || 0);
+    if (Number.isNaN(date.getTime())) return '更早';
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const dateDay = new Date(date);
+    dateDay.setHours(0, 0, 0, 0);
+    const days = Math.floor((today.getTime() - dateDay.getTime()) / 86400000);
+    if (days <= 0) return '今天';
+    if (days === 1) return '昨天';
+    if (days < 7) return '最近 7 天';
+    return '更早';
+  }
+
+  function isSessionOverviewFavorite(sessionId) {
+    return sessionOverviewFavorites.has(sessionId);
+  }
+
+  function persistSessionOverviewFavorites() {
+    try {
+      localStorage.setItem(SESSION_OVERVIEW_FAVORITES_KEY, JSON.stringify([...sessionOverviewFavorites]));
+    } catch {}
+  }
+
+  function toggleSessionOverviewFavorite(sessionId) {
+    if (!sessionId || !sessions.some((session) => session.id === sessionId)) return;
+    if (sessionOverviewFavorites.has(sessionId)) sessionOverviewFavorites.delete(sessionId);
+    else sessionOverviewFavorites.add(sessionId);
+    persistSessionOverviewFavorites();
+    renderSessionOverview();
+    requestAnimationFrame(() => {
+      const nextFavoriteButton = [...document.querySelectorAll('[data-overview-favorite-id]')]
+        .find((button) => button.dataset.overviewFavoriteId === sessionId);
+      if (nextFavoriteButton) {
+        nextFavoriteButton.focus({ preventScroll: true });
+      } else if (sessionOverviewStatus === 'favorite') {
+        document.querySelector('[data-overview-status="favorite"]')?.focus();
+      }
+    });
+  }
+
+  function compareSessionOverviewItems(a, b) {
+    if (isSessionOverviewFavorite(a.id) !== isSessionOverviewFavorite(b.id)) {
+      return isSessionOverviewFavorite(a.id) ? -1 : 1;
+    }
+    if (!!a.isRunning !== !!b.isRunning) return a.isRunning ? -1 : 1;
+    if (!!a.hasUnread !== !!b.hasUnread) return a.hasUnread ? -1 : 1;
+    return new Date(b.updated || 0) - new Date(a.updated || 0);
+  }
+
+  function getSessionOverviewMatches() {
+    const query = sessionOverviewQuery.trim().toLocaleLowerCase();
+    return sessions
+      .filter((session) => sessionOverviewAgent === 'all' || normalizeAgent(session.agent) === sessionOverviewAgent)
+      .filter((session) => sessionOverviewStatus === 'all'
+        || (sessionOverviewStatus === 'running' && session.isRunning)
+        || (sessionOverviewStatus === 'unread' && session.hasUnread)
+        || (sessionOverviewStatus === 'favorite' && isSessionOverviewFavorite(session.id)))
+      .filter((session) => {
+        if (!query) return true;
+        const haystack = [
+          session.title,
+          session.cwd,
+          session.lastMessage,
+          session.claudeSessionId,
+          session.codexThreadId,
+          AGENT_LABELS[normalizeAgent(session.agent)],
+          getSessionOverviewGroupName(session),
+        ].filter(Boolean).join('\n').toLocaleLowerCase();
+        return haystack.includes(query);
+      })
+      .sort(compareSessionOverviewItems);
+  }
+
+  function buildSessionOverviewPreview(session, agentLabel) {
+    if (!session.lastMessage) {
+      return '<span class="session-overview-preview empty">还没有消息</span>';
+    }
+    const roleLabel = session.lastMessageRole === 'user' ? '你' : agentLabel;
+    return `<span class="session-overview-preview" title="${escapeHtml(session.lastMessage)}">
+      <span class="session-overview-preview-role">${escapeHtml(roleLabel)}</span>
+      <span class="session-overview-preview-text">${escapeHtml(session.lastMessage)}</span>
+    </span>`;
+  }
+
+  function buildSessionOverviewItem(session) {
+    const agent = normalizeAgent(session.agent);
+    const agentLabel = AGENT_LABELS[agent];
+    const project = getSessionOverviewProject(session.cwd);
+    const runtimeId = agent === 'codex' ? (session.codexThreadId || '') : (session.claudeSessionId || '');
+    const favorite = isSessionOverviewFavorite(session.id);
+    const statuses = [];
+    if (session.id === currentSessionId) statuses.push('<span class="session-overview-state current">当前</span>');
+    if (session.isRunning) statuses.push('<span class="session-overview-state running"><i></i>运行中</span>');
+    if (session.hasUnread) statuses.push('<span class="session-overview-state unread">未读</span>');
+    return `
+      <div class="session-overview-item-shell">
+        <button type="button" class="session-overview-item agent-${agent}${session.id === currentSessionId ? ' active' : ''}" data-overview-session-id="${escapeHtml(session.id)}">
+          <span class="session-overview-agent">${escapeHtml(agentLabel)}</span>
+          <span class="session-overview-item-main">
+            <span class="session-overview-item-title">${escapeHtml(session.title || 'Untitled')}</span>
+            ${buildSessionOverviewPreview(session, agentLabel)}
+            <span class="session-overview-item-meta">
+              ${project ? `<span title="${escapeHtml(session.cwd)}">${escapeHtml(project)}</span>` : '<span>未记录项目目录</span>'}
+              ${runtimeId ? `<span class="session-overview-runtime-id" title="${escapeHtml(agentLabel)} 会话 ID ${escapeHtml(runtimeId)}">${escapeHtml(runtimeId.slice(0, 8))}</span>` : ''}
+            </span>
+          </span>
+          <span class="session-overview-states">${statuses.join('')}</span>
+          <time class="session-overview-time" datetime="${escapeHtml(session.updated || '')}">${escapeHtml(timeAgo(session.updated))}</time>
+          <span class="session-overview-open" aria-hidden="true">›</span>
+        </button>
+        <button type="button" class="session-overview-favorite${favorite ? ' active' : ''}" data-overview-favorite-id="${escapeHtml(session.id)}" aria-label="${favorite ? '取消置顶' : '置顶会话'}" aria-pressed="${favorite ? 'true' : 'false'}" title="${favorite ? '取消置顶' : '置顶会话'}">${favorite ? '★' : '☆'}</button>
+      </div>`;
+  }
+
+  function buildSessionOverviewGroup(title, groupSessions) {
+    const claudeCount = groupSessions.filter((session) => normalizeAgent(session.agent) === 'claude').length;
+    const codexCount = groupSessions.length - claudeCount;
+    return `
+      <section class="session-overview-group">
+        <header class="session-overview-group-header">
+          <div class="session-overview-group-heading">
+            <h2>${escapeHtml(title)}</h2>
+            <span>${groupSessions.length} 个会话</span>
+          </div>
+          <div class="session-overview-group-mix">
+            ${claudeCount ? `<span class="agent-claude">Claude ${claudeCount}</span>` : ''}
+            ${codexCount ? `<span class="agent-codex">Codex ${codexCount}</span>` : ''}
+          </div>
+        </header>
+        <div class="session-overview-group-items">${groupSessions.map(buildSessionOverviewItem).join('')}</div>
+      </section>`;
+  }
+
+  function buildSessionOverviewFocusCard(session) {
+    const agent = normalizeAgent(session.agent);
+    const agentLabel = AGENT_LABELS[agent];
+    const statuses = [];
+    if (session.isRunning) statuses.push('<span class="session-overview-state running"><i></i>运行中</span>');
+    if (session.hasUnread) statuses.push('<span class="session-overview-state unread">未读</span>');
+    if (isSessionOverviewFavorite(session.id)) statuses.push('<span class="session-overview-state favorite">已置顶</span>');
+    return `
+      <button type="button" class="session-overview-focus-card agent-${agent}" data-overview-session-id="${escapeHtml(session.id)}">
+        <span class="session-overview-focus-top">
+          <span class="session-overview-agent">${escapeHtml(agentLabel)}</span>
+          <time datetime="${escapeHtml(session.updated || '')}">${escapeHtml(timeAgo(session.updated))}</time>
+        </span>
+        <span class="session-overview-focus-title">${escapeHtml(session.title || 'Untitled')}</span>
+        ${buildSessionOverviewPreview(session, agentLabel)}
+        <span class="session-overview-focus-states">${statuses.length > 0 ? statuses.join('') : '<span class="session-overview-focus-recent">最近更新</span>'}</span>
+      </button>`;
+  }
+
+  function renderSessionOverviewFocus(matches) {
+    if (!sessionOverviewFocus) return;
+    const eligible = !sessionOverviewQuery.trim() && sessionOverviewStatus === 'all';
+    if (!eligible || matches.length === 0) {
+      sessionOverviewFocus.hidden = true;
+      sessionOverviewFocus.innerHTML = '';
+      return;
+    }
+    const focusSessions = matches.slice(0, 3);
+    const hasPriority = focusSessions.some((session) => session.isRunning || session.hasUnread || isSessionOverviewFavorite(session.id));
+    sessionOverviewFocus.innerHTML = `
+      <div class="session-overview-focus-heading">
+        <div>
+          <h2>继续工作</h2>
+          <p>${hasPriority ? '运行中、未读与置顶会话优先' : '最近更新的会话'}</p>
+        </div>
+        <span>${focusSessions.length} 个快捷入口</span>
+      </div>
+      <div class="session-overview-focus-grid">${focusSessions.map(buildSessionOverviewFocusCard).join('')}</div>`;
+    sessionOverviewFocus.hidden = false;
+  }
+
+  function renderSessionOverview() {
+    updateSessionOverviewEntryCount();
+    const total = $('#session-overview-total');
+    if (total) total.textContent = String(sessions.length);
+
+    const claudeCount = sessions.filter((session) => normalizeAgent(session.agent) === 'claude').length;
+    const codexCount = sessions.length - claudeCount;
+    $('#session-overview-agent-all-count').textContent = String(sessions.length);
+    $('#session-overview-agent-claude-count').textContent = String(claudeCount);
+    $('#session-overview-agent-codex-count').textContent = String(codexCount);
+
+    const agentSessions = sessions.filter((session) => sessionOverviewAgent === 'all'
+      || normalizeAgent(session.agent) === sessionOverviewAgent);
+    $('#session-overview-running-count').textContent = String(agentSessions.filter((session) => session.isRunning).length);
+    $('#session-overview-unread-count').textContent = String(agentSessions.filter((session) => session.hasUnread).length);
+    $('#session-overview-favorite-count').textContent = String(agentSessions.filter((session) => isSessionOverviewFavorite(session.id)).length);
+
+    document.querySelectorAll('[data-overview-agent]').forEach((button) => {
+      const active = button.dataset.overviewAgent === sessionOverviewAgent;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+    document.querySelectorAll('[data-overview-status]').forEach((button) => {
+      const active = button.dataset.overviewStatus === sessionOverviewStatus;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+
+    const matches = getSessionOverviewMatches();
+    renderSessionOverviewFocus(matches);
+    if (sessionOverviewMatchCount) {
+      sessionOverviewMatchCount.textContent = (sessionOverviewQuery.trim() || sessionOverviewStatus !== 'all' || sessionOverviewAgent !== 'all')
+        ? `${matches.length} 条` : '';
+    }
+    if (matches.length === 0) {
+      const filtered = sessionOverviewQuery.trim() || sessionOverviewStatus !== 'all' || sessionOverviewAgent !== 'all';
+      sessionOverviewList.innerHTML = `
+        <div class="session-overview-empty">
+          <h2>${filtered ? '没有匹配的会话' : '还没有会话'}</h2>
+          <p>${filtered ? '调整搜索词或筛选条件后再试。' : '新开会话后，Claude 和 Codex 的会话都会汇总到这里。'}</p>
+          ${filtered ? '<button type="button" data-overview-clear>清除筛选</button>' : ''}
+        </div>`;
+      return;
+    }
+
+    const favoriteMatches = matches.filter((session) => isSessionOverviewFavorite(session.id));
+    const regularMatches = matches.filter((session) => !isSessionOverviewFavorite(session.id));
+    const sections = favoriteMatches.length > 0 ? [buildSessionOverviewGroup('置顶', favoriteMatches)] : [];
+
+    const buckets = new Map();
+    const groupOrder = [];
+    for (const group of groups) {
+      buckets.set(group.id, []);
+      groupOrder.push({ id: group.id, title: group.name });
+    }
+    const ungrouped = [];
+    for (const session of regularMatches) {
+      if (groups.length > 0) {
+        if (session.group && buckets.has(session.group)) buckets.get(session.group).push(session);
+        else ungrouped.push(session);
+      }
+    }
+
+    if (groups.length > 0) {
+      if (ungrouped.length > 0) groupOrder.push({ id: '', title: '未分组' });
+      sections.push(...groupOrder.map((group) => {
+        const items = group.id ? buckets.get(group.id) : ungrouped;
+        return items.length > 0 ? buildSessionOverviewGroup(group.title, items) : '';
+      }));
+    } else {
+      const dateBuckets = new Map();
+      for (const session of regularMatches) {
+        const label = getSessionOverviewDateBucket(session.updated);
+        if (!dateBuckets.has(label)) dateBuckets.set(label, []);
+        dateBuckets.get(label).push(session);
+      }
+      sections.push(...['今天', '昨天', '最近 7 天', '更早']
+        .filter((label) => dateBuckets.has(label))
+        .map((label) => buildSessionOverviewGroup(label, dateBuckets.get(label))));
+    }
+    sessionOverviewList.innerHTML = sections.join('');
+  }
+
+  function setSessionTitleAuditStatus(message, tone = '') {
+    if (!sessionTitleAuditStatus) return;
+    sessionTitleAuditStatus.textContent = message || '';
+    sessionTitleAuditStatus.className = `session-title-audit-status${tone ? ` ${tone}` : ''}`;
+  }
+
+  function updateSessionTitleAuditApplyState() {
+    if (!sessionTitleAuditApply || !sessionTitleAuditList) return;
+    const selected = [...sessionTitleAuditList.querySelectorAll('[data-title-audit-select]:checked')];
+    const valid = !sessionTitleAuditLoading && selected.length > 0 && selected.every((checkbox) => {
+      const item = checkbox.closest('[data-title-audit-id]');
+      const input = item?.querySelector('[data-title-audit-input]');
+      const oldTitle = item?.dataset.titleAuditOld || '';
+      const title = input?.value.trim() || '';
+      return title && title !== oldTitle && item?.dataset.titleAuditActive !== 'true';
+    });
+    sessionTitleAuditApply.disabled = !valid;
+    sessionTitleAuditApply.textContent = selected.length > 0 ? `应用所选（${selected.length}）` : '应用所选';
+  }
+
+  function renderSessionTitleAudit() {
+    if (!sessionTitleAuditList) return;
+    if (sessionTitleAuditLoading) {
+      sessionTitleAuditList.innerHTML = '<div class="session-title-audit-loading">正在读取会话内容并生成标题建议…</div>';
+      updateSessionTitleAuditApplyState();
+      return;
+    }
+    if (sessionTitleAuditCandidates.length === 0) {
+      sessionTitleAuditList.innerHTML = '<div class="session-title-audit-empty">没有可整理的候选标题。</div>';
+      updateSessionTitleAuditApplyState();
+      return;
+    }
+    const matchLabels = {
+      'exact-first-line': '完整首行',
+      'truncated-first-line': '首行截断',
+      'prompt-prefix-across-lines': '跨行截断',
+    };
+    sessionTitleAuditList.innerHTML = sessionTitleAuditCandidates.map((candidate) => {
+      const agent = normalizeAgent(candidate.agent);
+      const suggestion = typeof candidate.suggestion === 'string' ? candidate.suggestion : '';
+      const checked = suggestion && !candidate.active ? ' checked' : '';
+      const userLines = Array.isArray(candidate.users) && candidate.users.length > 0
+        ? `<ol>${candidate.users.map((text) => `<li>${escapeHtml(text)}</li>`).join('')}</ol>`
+        : '<p>没有可用的用户消息线索。</p>';
+      const assistantLines = Array.isArray(candidate.assistantTail) && candidate.assistantTail.length > 0
+        ? candidate.assistantTail.map((text) => `<span class="session-title-audit-result">${escapeHtml(text)}</span>`).join('')
+        : '';
+      return `
+        <article class="session-title-audit-item${candidate.active ? ' active' : ''}" data-title-audit-id="${escapeHtml(candidate.id)}" data-title-audit-old="${escapeHtml(candidate.title)}" data-title-audit-active="${candidate.active ? 'true' : 'false'}">
+          <div class="session-title-audit-item-head">
+            <label class="session-title-audit-check">
+              <input type="checkbox" data-title-audit-select${checked}${candidate.active ? ' disabled' : ''}>
+              选择修改
+            </label>
+            <span class="session-title-audit-agent agent-${agent}">${escapeHtml(AGENT_LABELS[agent])}</span>
+            ${candidate.active ? '<span class="session-title-audit-running">运行中，完成后再整理</span>' : ''}
+            <span class="session-title-audit-item-meta">${escapeHtml(matchLabels[candidate.matchType] || '首问派生')} · ${Number(candidate.messageCount) || 0} 条消息 · ${escapeHtml(timeAgo(candidate.updated))}</span>
+          </div>
+          <div class="session-title-audit-old"><strong>原标题</strong>${escapeHtml(candidate.title)}</div>
+          <div class="session-title-audit-input-row">
+            <label for="title-audit-${escapeHtml(candidate.id)}">新标题</label>
+            <input id="title-audit-${escapeHtml(candidate.id)}" type="text" maxlength="100" value="${escapeHtml(suggestion)}" placeholder="填写 12–30 字的内容型标题" autocomplete="off" data-title-audit-input${candidate.active ? ' disabled' : ''}>
+          </div>
+          <details class="session-title-audit-context">
+            <summary>查看对话线索（${(candidate.users || []).length} 条用户消息）</summary>
+            ${userLines}
+            ${assistantLines}
+          </details>
+        </article>`;
+    }).join('');
+    updateSessionTitleAuditApplyState();
+  }
+
+  function setSessionOverviewContentInert(inert) {
+    if (!sessionOverview) return;
+    sessionOverview.querySelectorAll(':scope > .session-overview-header, :scope > .session-overview-controls, :scope > .session-overview-scroll')
+      .forEach((element) => { element.inert = inert; });
+  }
+
+  function isSessionTitleAuditHistoryState(state) {
+    return !!(state && state.ccWebView === 'session-title-audit');
+  }
+
+  function openSessionTitleAudit(options = {}) {
+    if (!sessionTitleAudit || !sessionTitleAuditApply) return;
+    if (!options.fromHistory && !isSessionTitleAuditHistoryState(history.state)) {
+      const currentState = history.state && typeof history.state === 'object' ? history.state : {};
+      history.pushState({ ...currentState, ccWebView: 'session-title-audit' }, '', location.href);
+    }
+    sessionTitleAuditHistoryEntry = true;
+    sessionTitleAudit.hidden = false;
+    sessionTitleAudit.setAttribute('aria-hidden', 'false');
+    setSessionOverviewContentInert(true);
+    sessionTitleAuditCandidates = [];
+    sessionTitleAuditLoading = true;
+    setSessionTitleAuditStatus('正在扫描 Claude 与 Codex 会话标题…');
+    renderSessionTitleAudit();
+    send({ type: 'audit_session_titles' });
+    requestAnimationFrame(() => sessionTitleAuditClose?.focus());
+  }
+
+  function closeSessionTitleAudit(options = {}) {
+    if (!sessionTitleAudit || sessionTitleAudit.hidden) return;
+    const shouldRestoreHistory = !options.fromHistory
+      && sessionTitleAuditHistoryEntry
+      && isSessionTitleAuditHistoryState(history.state);
+    sessionTitleAuditHistoryEntry = false;
+    sessionTitleAudit.hidden = true;
+    sessionTitleAudit.setAttribute('aria-hidden', 'true');
+    setSessionOverviewContentInert(false);
+    sessionTitleAuditCandidates = [];
+    sessionTitleAuditLoading = false;
+    if (sessionTitleAuditList) sessionTitleAuditList.innerHTML = '';
+    setSessionTitleAuditStatus('');
+    if (sessionTitleAuditApply) {
+      sessionTitleAuditApply.disabled = true;
+      sessionTitleAuditApply.textContent = '应用所选';
+    }
+    if (options.restoreFocus !== false) sessionOverviewTitleAuditBtn?.focus();
+    if (shouldRestoreHistory) history.back();
+  }
+
+  function applySelectedSessionTitles() {
+    if (!sessionTitleAuditList || !sessionTitleAuditApply) return;
+    const changes = [...sessionTitleAuditList.querySelectorAll('[data-title-audit-select]:checked')]
+      .map((checkbox) => {
+        const item = checkbox.closest('[data-title-audit-id]');
+        const input = item?.querySelector('[data-title-audit-input]');
+        return {
+          id: item?.dataset.titleAuditId || '',
+          oldTitle: item?.dataset.titleAuditOld || '',
+          newTitle: input?.value.trim() || '',
+        };
+      })
+      .filter((change) => change.id && change.newTitle && change.newTitle !== change.oldTitle);
+    if (changes.length === 0) return;
+    sessionTitleAuditLoading = true;
+    sessionTitleAuditApply.disabled = true;
+    sessionTitleAuditApply.textContent = '应用中…';
+    setSessionTitleAuditStatus('正在备份原会话并写入标题…');
+    send({ type: 'apply_session_titles', changes });
+  }
+
+  function isSessionOverviewHistoryState(state) {
+    return !!(state && state.ccWebView === 'session-overview');
+  }
+
+  function openSessionOverview(options = {}) {
+    if (!sessionOverview || sessionOverviewOpen) return;
+    if (!options.fromHistory && !isSessionOverviewHistoryState(history.state)) {
+      const currentState = history.state && typeof history.state === 'object' ? history.state : {};
+      history.pushState({ ...currentState, ccWebView: 'session-overview' }, '', location.href);
+    }
+    sessionOverviewHistoryEntry = true;
+    sessionOverviewOpen = true;
+    sessionOverview.hidden = false;
+    sessionOverview.setAttribute('aria-hidden', 'false');
+    if (app) app.inert = true;
+    if (window.matchMedia('(max-width: 768px)').matches) closeSidebar();
+    renderSessionOverview();
+    requestAnimationFrame(() => sessionOverviewSearch?.focus());
+  }
+
+  function closeSessionOverview(options = {}) {
+    if (!sessionOverview || !sessionOverviewOpen) return;
+    if (sessionTitleAudit && !sessionTitleAudit.hidden) {
+      closeSessionTitleAudit({ restoreFocus: false });
+    }
+    const shouldRestoreHistory = !options.fromHistory
+      && sessionOverviewHistoryEntry
+      && isSessionOverviewHistoryState(history.state);
+    sessionOverviewHistoryEntry = false;
+    sessionOverviewOpen = false;
+    sessionOverview.hidden = true;
+    sessionOverview.setAttribute('aria-hidden', 'true');
+    if (app) app.inert = false;
+    if (options.restoreFocus !== false) sessionOverviewBtn?.focus();
+    if (shouldRestoreHistory) history.back();
+  }
+
+  function openSessionFromOverview(sessionId) {
+    const meta = getSessionMeta(sessionId);
+    if (!meta) return;
+    const targetAgent = normalizeAgent(meta.agent);
+    closeSessionOverview({ restoreFocus: false });
+    if (targetAgent !== currentAgent) {
+      syncViewForAgent(targetAgent, { preserveCurrent: false, loadLast: false });
+    }
+    openSession(sessionId);
+  }
+
   function shouldOverlayRuntimeBadge() {
     return window.matchMedia('(max-width: 768px), (pointer: coarse)').matches;
   }
@@ -2181,6 +2678,10 @@
       case 'session_info':
         migratePendingMessageQueue(msg.sessionId);
         const snapshot = normalizeSessionSnapshot(msg);
+        // load_session 的 isRunning 是队列派发守卫读取的权威状态。多标签页抢占
+        // entry.ws 时，本页通常收不到 done，只会在 background_done 后重新 load_session；
+        // 若不回写 sessions，finishSessionSwitch() 仍会读到旧的“运行中”并静默卡住队首。
+        syncSessionRunningState(msg.sessionId, msg.isRunning);
         // 服务端在 load_session 里已经把这条会话磁盘上的 hasUnread 清了，但它不回推
         // session_list，而侧栏红点读的是本地 sessions：不在这里跟着灭，红点就会一直挂到
         // 下一次列表刷新（别的会话跑完 / 改名归组 / 刷新页面）。snapshot.hasUnread 是清除前
@@ -2257,6 +2758,26 @@
       case 'group_list':
         groups = Array.isArray(msg.groups) ? msg.groups.filter((g) => g && g.id && g.name) : [];
         renderSessionList();
+        break;
+
+      case 'session_title_audit':
+        if (!sessionTitleAudit || sessionTitleAudit.hidden) break;
+        sessionTitleAuditLoading = false;
+        sessionTitleAuditCandidates = Array.isArray(msg.candidates) ? msg.candidates : [];
+        renderSessionTitleAudit();
+        setSessionTitleAuditStatus(msg.aiMessage || '', msg.aiStatus === 'ready' ? '' : 'warning');
+        break;
+
+      case 'session_titles_applied':
+        if (!sessionTitleAudit || sessionTitleAudit.hidden) break;
+        sessionTitleAuditLoading = false;
+        if (msg.success) {
+          closeSessionTitleAudit();
+          showToast(msg.message || '会话标题已更新');
+        } else {
+          setSessionTitleAuditStatus(msg.message || '标题更新失败，请重试。', 'warning');
+          updateSessionTitleAuditApplyState();
+        }
         break;
 
       case 'session_renamed':
@@ -2590,6 +3111,9 @@
         if (msg.sessionId === currentSessionId) {
           // Task completed for current session — clear generating state without reloading
           // (reloading would trigger scrollToBottom and interrupt user reading)
+          // 此连接不是 entry.ws 时只收到 background_done，不会收到 done + session_list。
+          // 先同步权威空闲状态，下面的 force load_session 收尾后才能安全派出队首。
+          syncSessionRunningState(msg.sessionId, false);
           finishGenerating(msg.sessionId);
           // 但能收到这条的前提是本连接不是 entry.ws：服务端在 broadcastBackgroundDone 里跳过
           // 发起端，只发给其余连接（server.js 的 broadcastBackgroundDone）。也就是说这一轮的
@@ -2599,7 +3123,7 @@
           beginSessionSwitch(msg.sessionId, { blocking: false, force: true });
         } else {
           // Task completed for background session — update cache + refresh session list
-          updateCachedSession(msg.sessionId, (snapshot) => { snapshot.isRunning = false; });
+          syncSessionRunningState(msg.sessionId, false);
           send({ type: 'list_sessions' });
         }
         updateGoalBar();
@@ -5352,7 +5876,23 @@
     sessions = sessions.map((s) => (s.id === sessionId ? { ...s, hasUnread: false } : s));
   }
 
+  // 把服务端权威的运行态同时写回侧栏元数据与会话快照缓存。队列派发只认
+  // sessions 里的 isRunning；缓存里的旧值也会影响切回会话时的生成态。
+  function syncSessionRunningState(sessionId, isRunning) {
+    if (!sessionId) return;
+    const running = !!isRunning;
+    if (sessions.some((session) => session.id === sessionId && !!session.isRunning !== running)) {
+      sessions = sessions.map((session) => (
+        session.id === sessionId ? { ...session, isRunning: running } : session
+      ));
+      renderSessionList();
+    }
+    updateCachedSession(sessionId, (snapshot) => { snapshot.isRunning = running; });
+  }
+
   function renderSessionList() {
+    updateSessionOverviewEntryCount();
+    if (sessionOverviewOpen) renderSessionOverview();
     sessionList.innerHTML = '';
     const visibleSessions = getVisibleSessions();
     if (visibleSessions.length === 0) {
@@ -6276,6 +6816,92 @@
       showImportCodexSessionModal();
     } else {
       showImportSessionModal();
+    }
+  });
+  sessionOverviewBtn?.addEventListener('click', () => {
+    newChatDropdown.hidden = true;
+    openSessionOverview();
+  });
+  $('#session-overview-close')?.addEventListener('click', closeSessionOverview);
+  sessionOverviewTitleAuditBtn?.addEventListener('click', openSessionTitleAudit);
+  sessionTitleAuditClose?.addEventListener('click', () => closeSessionTitleAudit());
+  sessionTitleAuditCancel?.addEventListener('click', () => closeSessionTitleAudit());
+  sessionTitleAuditApply?.addEventListener('click', applySelectedSessionTitles);
+  sessionTitleAudit?.addEventListener('click', (e) => {
+    if (e.target === sessionTitleAudit) closeSessionTitleAudit();
+  });
+  sessionTitleAuditList?.addEventListener('input', (e) => {
+    const input = e.target.closest('[data-title-audit-input]');
+    if (!input) return;
+    const item = input.closest('[data-title-audit-id]');
+    const checkbox = item?.querySelector('[data-title-audit-select]');
+    if (checkbox && !checkbox.disabled) {
+      checkbox.checked = !!input.value.trim() && input.value.trim() !== (item.dataset.titleAuditOld || '');
+    }
+    updateSessionTitleAuditApplyState();
+  });
+  sessionTitleAuditList?.addEventListener('change', (e) => {
+    if (e.target.closest('[data-title-audit-select]')) updateSessionTitleAuditApplyState();
+  });
+  sessionOverviewSearch?.addEventListener('input', () => {
+    sessionOverviewQuery = sessionOverviewSearch.value;
+    renderSessionOverview();
+  });
+  document.querySelectorAll('[data-overview-agent]').forEach((button) => {
+    button.addEventListener('click', () => {
+      sessionOverviewAgent = button.dataset.overviewAgent || 'all';
+      renderSessionOverview();
+    });
+  });
+  document.querySelectorAll('[data-overview-status]').forEach((button) => {
+    button.addEventListener('click', () => {
+      sessionOverviewStatus = button.dataset.overviewStatus || 'all';
+      renderSessionOverview();
+    });
+  });
+  sessionOverviewList?.addEventListener('click', (e) => {
+    const favoriteButton = e.target.closest('[data-overview-favorite-id]');
+    if (favoriteButton) {
+      toggleSessionOverviewFavorite(favoriteButton.dataset.overviewFavoriteId);
+      return;
+    }
+    const clearButton = e.target.closest('[data-overview-clear]');
+    if (clearButton) {
+      sessionOverviewAgent = 'all';
+      sessionOverviewStatus = 'all';
+      sessionOverviewQuery = '';
+      if (sessionOverviewSearch) sessionOverviewSearch.value = '';
+      renderSessionOverview();
+      sessionOverviewSearch?.focus();
+      return;
+    }
+    const sessionButton = e.target.closest('[data-overview-session-id]');
+    if (sessionButton) openSessionFromOverview(sessionButton.dataset.overviewSessionId);
+  });
+  sessionOverviewFocus?.addEventListener('click', (e) => {
+    const sessionButton = e.target.closest('[data-overview-session-id]');
+    if (sessionButton) openSessionFromOverview(sessionButton.dataset.overviewSessionId);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sessionTitleAudit && !sessionTitleAudit.hidden) {
+      e.preventDefault();
+      closeSessionTitleAudit();
+    } else if (e.key === 'Escape' && sessionOverviewOpen) {
+      e.preventDefault();
+      closeSessionOverview();
+    }
+  });
+  window.addEventListener('popstate', (event) => {
+    if (isSessionTitleAuditHistoryState(event.state)) {
+      if (!sessionOverviewOpen) openSessionOverview({ fromHistory: true });
+      openSessionTitleAudit({ fromHistory: true });
+    } else if (isSessionOverviewHistoryState(event.state)) {
+      if (sessionTitleAudit && !sessionTitleAudit.hidden) {
+        closeSessionTitleAudit({ fromHistory: true, restoreFocus: false });
+      }
+      openSessionOverview({ fromHistory: true });
+    } else if (sessionOverviewOpen) {
+      closeSessionOverview({ fromHistory: true });
     }
   });
   document.addEventListener('click', (e) => {

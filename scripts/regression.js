@@ -1187,6 +1187,9 @@ async function main() {
   // 会话分组协议（group_create/rename/delete + session_move）
   await testSessionGroups();
 
+  // 会话标题体检（首问候选识别 + 运行中保护 + 仅 title 原子更新 + 备份）
+  await testSessionTitleAudit();
+
   // spawn 失败只影响单个会话，不能打死整个服务（proc.on('error') 缺失回归）
   await testSpawnFailureIsolation();
 
@@ -1435,6 +1438,12 @@ async function testWsReconnectPreservesState() {
   assert(/hasInitialAuthCompleted\s*=\s*true/.test(indexHtml), 'app.js must set hasInitialAuthCompleted=true after first successful auth');
   // On auth failure / token invalidation, the flag must reset
   assert(/hasInitialAuthCompleted\s*=\s*false[\s\S]{0,200}cc-web-auth-failed/.test(indexHtml) || /auth-failed[\s\S]{0,200}hasInitialAuthCompleted\s*=\s*false/.test(indexHtml), 'app.js must reset hasInitialAuthCompleted on auth failure');
+  // 多标签页抢占 entry.ws 后，原标签页只收到 background_done；它必须用
+  // session_info/background_done 的权威 isRunning 回写 sessions，否则队列派发守卫
+  // 会一直读到旧的“运行中”，队首消息永远停在待发送。
+  assert(/function syncSessionRunningState\(sessionId, isRunning\)/.test(indexHtml), 'app.js must define syncSessionRunningState helper');
+  assert(/case 'session_info':[\s\S]{0,400}syncSessionRunningState\(msg\.sessionId, msg\.isRunning\)/.test(indexHtml), 'session_info must synchronize authoritative isRunning into sessions');
+  assert(/case 'background_done':[\s\S]{0,1200}syncSessionRunningState\(msg\.sessionId, false\)[\s\S]{0,300}finishGenerating\(msg\.sessionId\)/.test(indexHtml), 'background_done for the open session must mark sessions idle before reload/queue dispatch');
 
   // 2. Behavioral: simulate reconnect via real WS + token-auth
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-reconnect-'));
@@ -1879,6 +1888,104 @@ async function testSessionGroups() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Session group checks passed.');
+}
+
+// 会话标题体检：只识别首问派生标题；应用前再次拒绝运行中会话，成功后只改 title 并留下备份。
+async function testSessionTitleAudit() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-title-audit-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  for (const d of [configDir, sessionsDir, logsDir, homeDir]) mkdirp(d);
+  const password = 'TitleAudit!234';
+  const port = await getFreePort();
+  const fixedUpdated = '2026-01-02T03:04:05.000Z';
+  const prompt = '帮我分析一下这个问题的具体原因并给出修复方案';
+  const inactiveId = 'title-audit-inactive';
+  const activeId = 'title-audit-active';
+  const semanticId = 'title-audit-semantic';
+  const sleepChild = spawn('sleep', ['60'], { stdio: 'ignore' });
+
+  const writeSession = (id, title, agent, messages) => {
+    const session = { id, title, agent, updated: fixedUpdated, cwd: '/tmp/title-audit', messages };
+    fs.writeFileSync(path.join(sessionsDir, `${id}.json`), JSON.stringify(session, null, 2));
+    return session;
+  };
+  const inactiveBefore = writeSession(inactiveId, prompt.slice(0, 18), 'codex', [
+    { role: 'user', content: prompt, timestamp: fixedUpdated },
+    { role: 'user', content: '继续实现并补上回归验证', timestamp: fixedUpdated },
+    { role: 'assistant', content: '已实现标题体检、备份和写后校验。', timestamp: fixedUpdated },
+  ]);
+  const activeBefore = writeSession(activeId, prompt, 'claude', [
+    { role: 'user', content: prompt, timestamp: fixedUpdated },
+  ]);
+  writeSession(semanticId, '分析缓存链路抖动', 'claude', [
+    { role: 'user', content: '看看缓存链路为什么抖动', timestamp: fixedUpdated },
+  ]);
+  const activeRunDir = path.join(sessionsDir, `${activeId}-run`);
+  mkdirp(activeRunDir);
+  fs.writeFileSync(path.join(activeRunDir, 'pid'), String(sleepChild.pid));
+  fs.writeFileSync(path.join(activeRunDir, 'output.jsonl'), '');
+
+  try {
+    await withServer({
+      PORT: String(port),
+      CC_WEB_PASSWORD: password,
+      CC_WEB_CONFIG_DIR: configDir,
+      CC_WEB_SESSIONS_DIR: sessionsDir,
+      CC_WEB_LOGS_DIR: logsDir,
+      HOME: homeDir,
+      CLAUDE_PATH: MOCK_CLAUDE,
+      CODEX_PATH: MOCK_CODEX,
+    }, async () => {
+      const { ws, messages } = await connectWs(port, password);
+      await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.length === 3);
+
+      ws.send(JSON.stringify({ type: 'audit_session_titles' }));
+      const audit = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit');
+      assert(audit.aiStatus === 'unavailable', `No custom API should fall back to manual mode (got ${audit.aiStatus})`);
+      assert(audit.candidates.length === 2, `Audit should find exactly two prompt-derived titles (got ${audit.candidates.length})`);
+      assert(!audit.candidates.some((item) => item.id === semanticId), 'Semantic title must not be an audit candidate');
+      assert(audit.candidates.find((item) => item.id === activeId)?.active === true, 'Running session must be marked active');
+      assert(audit.candidates.find((item) => item.id === inactiveId)?.users.length === 2, 'Audit should expose later user intent as context');
+
+      const newTitle = '实现会话标题体检与安全批量整理';
+      ws.send(JSON.stringify({
+        type: 'apply_session_titles',
+        changes: [
+          { id: inactiveId, oldTitle: inactiveBefore.title, newTitle },
+          { id: activeId, oldTitle: activeBefore.title, newTitle: '整理运行中会话标题' },
+        ],
+      }));
+      const blocked = await nextMessage(messages, ws, (msg) => msg.type === 'session_titles_applied');
+      assert(blocked.success === false && /运行/.test(blocked.message || ''), 'Running session must block the whole apply batch');
+      assert(JSON.parse(fs.readFileSync(path.join(sessionsDir, `${inactiveId}.json`), 'utf8')).title === inactiveBefore.title, 'Failed batch must not partially write titles');
+
+      ws.send(JSON.stringify({
+        type: 'apply_session_titles',
+        changes: [{ id: inactiveId, oldTitle: inactiveBefore.title, newTitle }],
+      }));
+      const applied = await nextMessage(messages, ws, (msg) => msg.type === 'session_titles_applied');
+      assert(applied.success === true && applied.count === 1, `Inactive title should apply (${applied.message || 'no message'})`);
+      const renamedList = await nextMessage(messages, ws, (msg) => (
+        msg.type === 'session_list' && msg.sessions.find((item) => item.id === inactiveId)?.title === newTitle
+      ));
+      assert(renamedList.sessions.find((item) => item.id === inactiveId).title === newTitle, 'Applied title must be broadcast in session_list');
+
+      const inactiveAfter = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${inactiveId}.json`), 'utf8'));
+      assert(inactiveAfter.title === newTitle, 'Applied title must be persisted');
+      inactiveAfter.title = inactiveBefore.title;
+      assert(JSON.stringify(inactiveAfter) === JSON.stringify(inactiveBefore), 'Apply must only change the title field');
+      assert(applied.backupDir && fs.existsSync(path.join(applied.backupDir, `${inactiveId}.json`)), 'Apply must create a recoverable backup');
+
+      ws.close();
+    });
+  } finally {
+    try { sleepChild.kill('SIGTERM'); } catch {}
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+  console.log('Session title audit checks passed.');
 }
 
 // spawn 失败（CLI 路径不存在）必须只让本会话报错，不能打死整个服务。
