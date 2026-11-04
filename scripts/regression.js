@@ -774,6 +774,16 @@ async function main() {
     assert(Array.isArray(storedClaudeSession.messages?.[0]?.attachments) && storedClaudeSession.messages[0].attachments.length === 1, 'Claude message should persist attachment metadata');
     assert(storedClaudeSession.claudeSessionId, 'Claude session id should be persisted after first run');
     const claudeSessionIdBeforeMode = storedClaudeSession.claudeSessionId;
+    // Real Claude writes its native transcript on the first run. The mock does not,
+    // so create it here; otherwise the new missing-transcript preflight correctly
+    // intercepts the resume-mode case before it can assert --resume semantics.
+    const claudeNativeDir = path.join(homeDir, '.claude', 'projects', path.resolve(storedClaudeSession.cwd).replace(/^\//, '-').replace(/\//g, '-'));
+    mkdirp(claudeNativeDir);
+    fs.writeFileSync(path.join(claudeNativeDir, `${claudeSessionIdBeforeMode}.jsonl`), JSON.stringify({
+      type: 'user', sessionId: claudeSessionIdBeforeMode, cwd: storedClaudeSession.cwd,
+      message: { role: 'user', content: 'describe attachment' },
+    }) + '\n');
+
     // Mode switching must not clear Claude runtime session id (resume should keep context).
     ws.send(JSON.stringify({ type: 'set_mode', sessionId: claudeImageSession.sessionId, mode: 'plan' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'mode_changed' && msg.mode === 'plan');
@@ -1226,6 +1236,10 @@ async function main() {
   await testAutoSessionTitle();
   await testBenignCodexStderrExit();
   await testCodexEmptyFinalRecovery();
+
+  // Claude transcript 过期后必须在 spawn 前拦截，并由显式选择决定恢复方式
+  await testClaudeMissingTranscriptRecovery();
+  await testClaudeSnapshotRecovery();
 
   // spawn 失败只影响单个会话，不能打死整个服务（proc.on('error') 缺失回归）
   await testSpawnFailureIsolation();
@@ -2455,6 +2469,156 @@ async function testSessionCwdValidation() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Session cwd validation checks passed.');
+}
+
+// transcript 超过 Claude 的 cleanupPeriodDays 后，cc-web 仍保留 claudeSessionId。
+// 新消息必须在校验会话仍可恢复之前被拦下：不落用户历史、不 spawn；用户显式选择
+// “新上下文”后清除失效句柄并只重放一次，画面历史与 token 无关。
+async function testClaudeMissingTranscriptRecovery() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-claude-recovery-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  const password = 'ClaudeRecovery!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+    const sessionId = 'claude-missing-transcript-test';
+    fs.writeFileSync(path.join(sessionsDir, `${sessionId}.json`), JSON.stringify({
+      id: sessionId,
+      title: 'missing transcript',
+      created: new Date().toISOString(),
+      updated: new Date().toISOString(),
+      agent: 'claude',
+      claudeSessionId: '01a1dead-dead-7ade-8bad-000000000001',
+      codexThreadId: null,
+      model: null,
+      permissionMode: 'yolo',
+      totalCost: 0,
+      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      messages: [{ role: 'user', content: 'preserved history', timestamp: new Date().toISOString() }],
+      cwd: workDir,
+      // mock CLI 不写原生 transcript；标记为已导入以跳过仅适用于真实 Claude
+      // 历史文件的 assistant 同步，避免测试制造重复消息假象。
+      importedFrom: 'mock-project',
+    }));
+
+    ws.send(JSON.stringify({ type: 'load_session', sessionId }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.sessionId === sessionId);
+    ws.send(JSON.stringify({ type: 'message', text: 'recover me', sessionId, mode: 'yolo', agent: 'claude' }));
+    const recovery = await nextMessage(messages, ws, (msg) => msg.type === 'claude_recovery_required' && msg.sessionId === sessionId);
+    assert(recovery.snapshotAvailable === false, 'Seed must not report an unrelated snapshot as recoverable');
+    assert(recovery.recoveryToken, 'Recovery prompt must carry a token');
+
+    await sleep(300);
+    const beforeChoice = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sessionId}.json`), 'utf8'));
+    assert(beforeChoice.messages.length === 1, 'Preflight rejection must not add the user message to history');
+    assert(beforeChoice.claudeSessionId === '01a1dead-dead-7ade-8bad-000000000001', 'Rejected round must preserve the old runtime id until the user chooses');
+    const logBefore = fs.existsSync(path.join(logsDir, 'process.log')) ? fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8') : '';
+    assert(!logBefore.includes('\"event\":\"process_spawn\"'), 'Missing transcript must be rejected before spawn');
+
+    ws.send(JSON.stringify({ type: 'claude_recovery_choice', recoveryToken: recovery.recoveryToken, sessionId, action: 'new_context' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sessionId);
+    const afterChoice = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sessionId}.json`), 'utf8'));
+    assert(afterChoice.claudeSessionId !== '01a1dead-dead-7ade-8bad-000000000001', 'New-context choice must clear the stale runtime id');
+    const replayUserCount = afterChoice.messages.filter((m) => m.role === 'user' && m.content === 'recover me').length;
+    assert(replayUserCount === 1, `Replay must append the user message exactly once (got ${replayUserCount})`);
+    assert(afterChoice.messages[1].content === 'recover me', 'Replay must preserve the original user text');
+    assert(afterChoice.messages.some((m) => m.role === 'assistant' && /Claude mock handled: recover me/.test(m.content || '')), 'Replay must include the assistant reply');
+    const spawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+      .split('\n').filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter((item) => item?.event === 'process_spawn' && item.sessionId === sessionId.slice(0, 8));
+    assert(spawns.length === 1, `Recovery replay must spawn exactly once (got ${spawns.length})`);
+    assert(!spawns[0].args.includes('--resume'), 'New-context replay must not resume the stale id');
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Claude missing transcript recovery checks passed.');
+}
+
+async function testClaudeSnapshotRecovery() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-claude-snapshot-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  const password = 'ClaudeSnapshot!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port), CC_WEB_PASSWORD: password, CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir, CC_WEB_LOGS_DIR: logsDir, HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE, CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+    const sessionId = 'claude-snapshot-recovery-test';
+    const claudeSessionId = '01a1feed-feed-7eed-8eed-000000000002';
+    const history = [
+      { type: 'user', sessionId: claudeSessionId, cwd: workDir, message: { role: 'user', content: 'snapshot prompt' } },
+      { type: 'assistant', sessionId: claudeSessionId, cwd: workDir, message: { role: 'assistant', content: [{ type: 'text', text: 'snapshot answer' }] } },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n';
+    const projectKeyName = path.basename(workDir).replace(/ /g, '_').replace(/[^A-Za-z0-9_.@-]+/g, '_') || 'root';
+    const hash = require('crypto').createHash('sha256').update(path.resolve(workDir), 'utf8').digest('hex').slice(0, 16);
+    const snapshotDir = path.join(homeDir, '.ai-session-trace', 'claude', `${projectKeyName}.${hash}`, claudeSessionId);
+    mkdirp(snapshotDir);
+    fs.writeFileSync(path.join(snapshotDir, 'transcript.jsonl'), history);
+    fs.writeFileSync(path.join(snapshotDir, 'transcript.sha256'), `${require('crypto').createHash('sha256').update(history).digest('hex')}  transcript.jsonl\n`);
+    fs.writeFileSync(path.join(sessionsDir, `${sessionId}.json`), JSON.stringify({
+      id: sessionId, title: 'snapshot recovery', created: new Date().toISOString(), updated: new Date().toISOString(),
+      agent: 'claude', claudeSessionId, codexThreadId: null, model: null, permissionMode: 'yolo', totalCost: 0,
+      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      messages: [{ role: 'user', content: 'preserved history', timestamp: new Date().toISOString() }], cwd: workDir,
+      importedFrom: 'mock-project',
+    }));
+
+    ws.send(JSON.stringify({ type: 'load_session', sessionId }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.sessionId === sessionId);
+    ws.send(JSON.stringify({ type: 'message', text: 'restore and retry', sessionId, mode: 'yolo', agent: 'claude' }));
+    const recovery = await nextMessage(messages, ws, (msg) => msg.type === 'claude_recovery_required' && msg.sessionId === sessionId);
+    assert(recovery.snapshotAvailable === true, 'Validated snapshot must be offered for recovery');
+    const tamperedSnapshotPath = path.join(snapshotDir, 'transcript.jsonl');
+    fs.appendFileSync(tamperedSnapshotPath, '{"type":"tampered"}\n');
+    ws.send(JSON.stringify({ type: 'claude_recovery_choice', recoveryToken: recovery.recoveryToken, sessionId, action: 'restore_snapshot' }));
+    const reject = await nextMessage(messages, ws, (msg) => msg.type === 'error');
+    assert(/完整性校验/.test(reject.message || ''), 'Tampered snapshot must be rejected by revalidation');
+    fs.writeFileSync(tamperedSnapshotPath, history);
+    ws.send(JSON.stringify({ type: 'claude_recovery_choice', recoveryToken: recovery.recoveryToken, sessionId, action: 'restore_snapshot' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sessionId);
+    const restoredDir = path.join(homeDir, '.claude', 'projects', path.resolve(workDir).replace(/^\//, '-').replace(/\//g, '-'));
+    const restoredPath = path.join(restoredDir, `${claudeSessionId}.jsonl`);
+    assert(fs.readFileSync(restoredPath, 'utf8') === history, 'Recovered transcript must match the validated snapshot byte-for-byte');
+    const after = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sessionId}.json`), 'utf8'));
+    assert(after.claudeSessionId === claudeSessionId, 'Snapshot recovery must retain the runtime id');
+    const replayUserCount = after.messages.filter((m) => m.role === 'user' && m.content === 'restore and retry').length;
+    assert(replayUserCount === 1 && after.messages[1].content === 'restore and retry', 'Snapshot recovery must append the user message exactly once');
+    const spawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8').split('\n').filter(Boolean)
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter((item) => item?.event === 'process_spawn' && item.sessionId === sessionId.slice(0, 8));
+    assert(spawns.length === 1, `Snapshot recovery must spawn exactly once (got ${spawns.length})`);
+    assert(spawns[0].args.includes(`--resume ${claudeSessionId}`), 'Snapshot recovery must resume the restored transcript');
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Claude snapshot recovery checks passed.');
 }
 
 main().catch((err) => {

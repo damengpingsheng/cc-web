@@ -701,6 +701,14 @@ const pendingSlashCommands = new Map();
 // Pending compact retry metadata: sessionId -> { text: string, mode: string, reason: string }
 const pendingCompactRetries = new Map();
 
+// Claude transcript 缺失时暂存本轮用户消息：recoveryToken -> {
+//   sessionId, text, attachments, mode, hideInHistory, expiresAt
+// }
+// 消息在用户选择恢复方式前不落 history，也不会启动 CLI。token 与 session 双向绑定，
+// 避免多标签页之间拿错恢复动作。
+const pendingClaudeRecoveries = new Map();
+const CLAUDE_RECOVERY_TTL_MS = 10 * 60 * 1000;
+
 // P2 预防性水位压缩阈值（%）：Claude resume 前读 transcript jsonl 水位，
 // 达到 窗口大小 × 该比例 则先自动 /compact 再重放原消息（CC_WEB_AUTOCOMPACT_PCT 可调，收敛到 10-99）
 const AUTOCOMPACT_PCT = Math.min(99, Math.max(10, parseInt(process.env.CC_WEB_AUTOCOMPACT_PCT, 10) || 80));
@@ -3549,6 +3557,9 @@ wss.on('connection', (ws, req) => {
           handleMessage(ws, msg);
         }
         break;
+      case 'claude_recovery_choice':
+        handleClaudeRecoveryChoice(ws, msg);
+        break;
       case 'abort':
         handleAbort(ws);
         break;
@@ -4816,6 +4827,9 @@ function deleteCodexLocalSession(session) {
 function deleteSessionCleanup(sessionId) {
   pendingSlashCommands.delete(sessionId);
   pendingCompactRetries.delete(sessionId);
+  for (const [token, pending] of pendingClaudeRecoveries) {
+    if (pending.sessionId === sessionId) pendingClaudeRecoveries.delete(token);
+  }
   preemptCompactGuard.delete(sessionId);
   if (activeProcesses.has(sessionId)) {
     const entry = activeProcesses.get(sessionId);
@@ -4960,7 +4974,7 @@ function handleAbort(ws) {
  */
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
-  const { hideInHistory = false, codexEmptyFinalRetry = false } = options;
+  const { hideInHistory = false, recoveryReplay = false, codexEmptyFinalRetry = false } = options;
   const textValue = typeof text === 'string' ? text : '';
   const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const normalizedText = textValue.trim();
@@ -5020,6 +5034,18 @@ function handleMessage(ws, msg, options = {}) {
 
   if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
     session.permissionMode = mode;
+  }
+
+  // Claude 的 runtime ID 只是原生 transcript 的 resume 句柄。transcript 被 CLI
+  // 清理后继续 --resume 只会固定失败；先拦截本轮消息，由用户选择从本地快照恢复
+  // 或清除失效句柄、以新的 Claude 上下文继续。恢复后的重放不再重复预检。
+  if (
+    !recoveryReplay
+    && isClaudeSession(session)
+    && session.claudeSessionId
+    && !locateClaudeSessionJsonl(session.claudeSessionId)
+  ) {
+    return requestClaudeRecovery(ws, session, textValue, attachments, session.permissionMode || 'yolo', { hideInHistory });
   }
 
   // === P2 预防性水位压缩（仅 Claude resume 场景）===
@@ -5270,6 +5296,7 @@ function handleMessage(ws, msg, options = {}) {
     agent: getSessionAgent(session),
     cwd: spawnSpec.cwd,
     inputText: spawnText,
+    claudeFreshContext: isClaudeSession(session) && !session.claudeSessionId,
     mode: session.permissionMode || 'yolo',
     codexResumed: !!spawnSpec.resume,
     codexResumeFallbackAttempted: !!options.codexResumeFallbackAttempted,
@@ -5426,6 +5453,151 @@ function locateClaudeSessionJsonl(claudeSessionId) {
     }
   } catch {}
   return null;
+}
+
+function claudeProjectDirForCwd(cwd) {
+  return String(path.resolve(cwd || process.env.HOME || process.cwd())).replace(/^[\/]/, '-').replace(/[\/]/g, '-');
+}
+
+function claudeTraceProjectKey(cwd) {
+  const dirName = path.basename(path.resolve(cwd || process.env.HOME || process.cwd())).replace(/ /g, '_').replace(/[^A-Za-z0-9_.@-]+/g, '_').replace(/^[._]+|[._]+$/g, '').slice(0, 96) || 'root';
+  const hash = crypto.createHash('sha256').update(path.resolve(cwd || process.env.HOME || process.cwd()), 'utf8').digest('hex').slice(0, 16);
+  return `${dirName}.${hash}`;
+}
+
+// 定位 ai-session-trace 保存的 Claude transcript 快照。只接受 sessionId、cwd 和
+// SHA-256 都匹配的快照，不把任意同 ID 文件当可恢复数据。
+function locateClaudeTranscriptSnapshot(session) {
+  if (!session?.claudeSessionId || !session.cwd) return null;
+  const traceRoot = process.env.AI_SESSION_TRACE_ROOT || path.join(process.env.HOME || '', '.ai-session-trace');
+  const snapshotDir = path.join(traceRoot, 'claude', claudeTraceProjectKey(session.cwd), sanitizeId(session.claudeSessionId));
+  const transcriptPath = path.join(snapshotDir, 'transcript.jsonl');
+  const digestPath = path.join(snapshotDir, 'transcript.sha256');
+  let content;
+  try { content = fs.readFileSync(transcriptPath); } catch { return null; }
+  const digest = crypto.createHash('sha256').update(content).digest('hex');
+  let expectedDigest = '';
+  try { expectedDigest = fs.readFileSync(digestPath, 'utf8').trim().split(/\s+/)[0] || ''; } catch { return null; }
+  if (!/^[0-9a-f]{64}$/i.test(expectedDigest) || expectedDigest.toLowerCase() !== digest) {
+    plog('WARN', 'claude_recovery_snapshot_bad_digest', { sessionId: session.id.slice(0, 8), snapshotPath: transcriptPath });
+    return null;
+  }
+  let sessionIdMatches = false;
+  for (const line of content.toString('utf8').split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry.sessionId === session.claudeSessionId || entry.session_id === session.claudeSessionId) {
+        sessionIdMatches = true;
+        break;
+      }
+    } catch {}
+  }
+  if (!sessionIdMatches) return null;
+  return { snapshotPath: transcriptPath, content, sha256: digest };
+}
+
+function requestClaudeRecovery(ws, session, text, attachments, mode, options) {
+  const now = Date.now();
+  for (const [token, pending] of pendingClaudeRecoveries) {
+    if (pending.expiresAt <= now) pendingClaudeRecoveries.delete(token);
+  }
+  const recoveryToken = crypto.randomUUID();
+  // 同一会话只保留最新一份待恢复消息，避免重复点击发送后旧弹窗还能重放。
+  for (const [token, pending] of pendingClaudeRecoveries) {
+    if (pending.sessionId === session.id) pendingClaudeRecoveries.delete(token);
+  }
+  pendingClaudeRecoveries.set(recoveryToken, {
+    sessionId: session.id,
+    text,
+    attachments,
+    mode,
+    hideInHistory: !!options.hideInHistory,
+    expiresAt: now + CLAUDE_RECOVERY_TTL_MS,
+  });
+  const snapshot = locateClaudeTranscriptSnapshot(session);
+  plog('WARN', 'claude_recovery_required', {
+    sessionId: session.id.slice(0, 8),
+    claudeSessionId: session.claudeSessionId,
+    snapshotAvailable: !!snapshot,
+  });
+  wsSend(ws, {
+    type: 'claude_recovery_required',
+    sessionId: session.id,
+    recoveryToken,
+    claudeSessionId: session.claudeSessionId,
+    snapshotAvailable: !!snapshot,
+    snapshotPath: snapshot?.snapshotPath || null,
+  });
+}
+
+function handleClaudeRecoveryChoice(ws, msg) {
+  const token = String(msg?.recoveryToken || '');
+  const pending = pendingClaudeRecoveries.get(token);
+  if (!pending || pending.expiresAt <= Date.now()) {
+    pendingClaudeRecoveries.delete(token);
+    return wsSend(ws, { type: 'error', message: 'Claude 会话恢复选项已过期，请重新发送消息。' });
+  }
+  const action = msg.action;
+  if (msg.sessionId !== pending.sessionId || !['restore_snapshot', 'new_context'].includes(action)) {
+    return wsSend(ws, { type: 'error', message: '无效的 Claude 会话恢复选项。' });
+  }
+  const session = loadSession(pending.sessionId);
+  if (!session || !isClaudeSession(session) || !session.claudeSessionId) {
+    pendingClaudeRecoveries.delete(token);
+    return wsSend(ws, { type: 'error', message: '待恢复的 Claude 会话已不存在。' });
+  }
+  if (activeProcesses.has(session.id)) {
+    return wsSend(ws, { type: 'error', message: '当前会话正在处理中，请先点击停止按钮。' });
+  }
+
+  // token 在手但会话已经恢复出可用 transcript 时，不覆盖现有文件；保留 pending
+  // 让用户能改选 new_context，或取消后重新发送。
+  if (action === 'restore_snapshot' && locateClaudeSessionJsonl(session.claudeSessionId)) {
+    return wsSend(ws, { type: 'error', message: 'Claude transcript 已可正常恢复，无需还原快照。' });
+  }
+
+  if (action === 'restore_snapshot') {
+    const snapshot = locateClaudeTranscriptSnapshot(session);
+    if (!snapshot) {
+      return wsSend(ws, { type: 'error', message: '没有找到通过完整性校验的 Claude transcript 快照。' });
+    }
+    const projectDir = path.join(CLAUDE_PROJECTS_DIR, claudeProjectDirForCwd(session.cwd));
+    const targetPath = path.join(projectDir, `${sanitizeId(session.claudeSessionId)}.jsonl`);
+    try {
+      fs.mkdirSync(projectDir, { recursive: true });
+      const tmpPath = `${targetPath}.recover-${crypto.randomUUID()}.tmp`;
+      fs.writeFileSync(tmpPath, snapshot.content, { mode: 0o600 });
+      fs.renameSync(tmpPath, targetPath);
+    } catch (e) {
+      plog('ERROR', 'claude_recovery_restore_failed', { sessionId: session.id.slice(0, 8), error: e.message });
+      return wsSend(ws, { type: 'error', message: `恢复 Claude transcript 失败: ${e.message}` });
+    }
+    plog('INFO', 'claude_recovery_snapshot_restored', {
+      sessionId: session.id.slice(0, 8),
+      claudeSessionId: session.claudeSessionId,
+      targetPath,
+      sha256: snapshot.sha256,
+    });
+  } else {
+    const oldClaudeSessionId = session.claudeSessionId;
+    session.claudeSessionId = null;
+    session.updated = new Date().toISOString();
+    saveSession(session);
+    plog('INFO', 'claude_recovery_new_context', {
+      sessionId: session.id.slice(0, 8),
+      oldClaudeSessionId,
+    });
+  }
+
+  pendingClaudeRecoveries.delete(token);
+  wsSessionMap.set(ws, session.id);
+  handleMessage(ws, {
+    text: pending.text,
+    sessionId: session.id,
+    mode: pending.mode,
+    attachments: pending.attachments,
+  }, { hideInHistory: pending.hideInHistory, recoveryReplay: true });
 }
 
 function resolveClaudeSessionLocalMeta(claudeSessionId) {

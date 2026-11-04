@@ -34,6 +34,8 @@ Codex 执行完工具后直接结束、没有输出最终总结时，页面曾�
 
 ### 修复
 
+Claude transcript 被 CLI 按保留期清理后，cc-web 不再继续执行必然失败的 `--resume`。发送消息前会检查原生 transcript；缺失时保留本轮输入但不写入历史、不启动 CLI，并让用户选择从完整性校验通过的本地会话快照恢复，或保留 cc-web 历史并以新的 Claude 上下文继续。恢复后只重放一次原消息。
+
 修复 Codex CLI 正常退出但 stderr 含非致命诊断时，页面误报“Codex 任务失败”的竞态。正常 `exit` 事件现在立即保存真实退出码，PID 监控优先使用该结果；即使监控先于延迟收尾观察到进程消失，也不会把退出码 0 替换成未知信号。`codex_memories_write::phase2: Phase 2 no changes` 已识别为非致命诊断，不再单独触发任务失败提示。
 
 ### 新增
@@ -46,6 +48,7 @@ Codex 执行完工具后直接结束、没有输出最终总结时，页面曾�
 
 - `node --check server.js`、`node --check public/app.js`、`node --check scripts/regression.js`、`git diff --check` 通过。
 - `npm run regression` 全部通过，包含 `Session title audit checks passed` 与 `Auto session title checks passed`。
+- Claude transcript 恢复专项覆盖：缺失时阻止 spawn 且不写历史；无快照时以新上下文继续；有效快照按 SHA-256 恢复并 resume；两条路径都只重放一次原消息。
 - 自动标题专项覆盖：最终轮完成触发、标题落盘与广播、标题来源为 `auto`、API 只调用一次、手工标题在下一轮后仍保持 `manual`。
 - Codex 诊断竞态专项覆盖：PID 监控 50ms 先于最终收尾、stderr 含无害 Phase 2 日志，结果仍保持 `exitCode=0` 且页面无任务失败提示。
 - 回归可通过测试专用 `CC_WEB_PID_MONITOR_INTERVAL_MS=50` 稳定覆盖监控竞态。

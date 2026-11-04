@@ -28,7 +28,7 @@ Browser (public/)
 ```
 
 - HTTP 仅 3 个端点（附件上传、附件删除、静态文件含 SPA fallback）
-- WebSocket 承载 95% 业务逻辑，客户端→服务端 31 个 type（含 auth），服务端→客户端 30 个 type（详见 [PROTOCOL.md](./PROTOCOL.md)）
+- WebSocket 承载 95% 业务逻辑，客户端→服务端 42 个 type（含 auth），服务端→客户端 40 个 type（详见 [PROTOCOL.md](./PROTOCOL.md)）
 - Claude/Codex detached 子进程，输出写入 `sessions/<id>-run/output.jsonl`，由 `FileTailer` 流式推送前端
 - 不引入框架是刻意设计：行为主要在 `server.js`，加 `lib/` 适配层与原生 JS 前端 `public/app.js`
 

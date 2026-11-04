@@ -198,6 +198,9 @@
   // 当前会话的会话级 Codex 网关原始值（空表示未单独指定，展示口径见 updateGatewayBadge）
   let currentCodexGateway = '';
   let currentSessionRunning = false;
+  // 最近一条已乐观渲染、但可能被 Claude transcript 预检拦下的消息。选择恢复时
+  // 保留气泡；取消发送时恢复输入框和附件，避免 UI 看起来已经发送。
+  let pendingClaudeRecoveryUi = null;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
   // 区分首次 auth 成功 vs WS 重连后的 auth 成功：
@@ -1344,6 +1347,7 @@
     if (welcome) welcome.remove();
     virtAppendEls([createMsgElement('user', item.text, attachments, Date.now())]);
     scrollToBottom(true);
+    pendingClaudeRecoveryUi = { sessionId, text: item.text, attachments: attachments.map((attachment) => ({ ...attachment })) };
     send({
       type: 'message',
       text: item.text,
@@ -3043,6 +3047,25 @@
             }
           }
         }
+        break;
+
+      case 'claude_recovery_required':
+        finishGenerating(msg.sessionId);
+        showClaudeRecoveryModal(msg, (action) => {
+          const pending = pendingClaudeRecoveryUi?.sessionId === msg.sessionId ? pendingClaudeRecoveryUi : null;
+          pendingClaudeRecoveryUi = null;
+          if (action === 'cancel') {
+            if (pending) {
+              msgInput.value = pending.text;
+              pendingAttachments = pending.attachments;
+              renderPendingAttachments();
+              autoResize();
+            }
+            if (msg.sessionId === currentSessionId) {
+              send({ type: 'load_session', sessionId: msg.sessionId });
+            }
+          }
+        });
         break;
 
       case 'error':
@@ -6687,6 +6710,7 @@
     virtAppendEls([createMsgElement('user', text, attachments, Date.now())]);
     scrollToBottom(true);
 
+    pendingClaudeRecoveryUi = { sessionId: currentSessionId, text, attachments: attachments.map((attachment) => ({ ...attachment })) };
     send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
     msgInput.value = '';
     pendingAttachments = [];
@@ -8394,6 +8418,55 @@
 
   // --- New Session Modal ---
   let _onCwdSuggestions = null;
+
+  function showClaudeRecoveryModal(msg, onResolved) {
+    const existing = document.getElementById('claude-recovery-overlay');
+    if (existing) existing.remove();
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'claude-recovery-overlay';
+    overlay.innerHTML = `
+      <div class="modal-panel">
+        <div class="modal-header">
+          <span class="modal-title">Claude 上下文不可恢复</span>
+          <button class="modal-close-btn" id="cr-close-btn">✕</button>
+        </div>
+        <div class="modal-body">
+          <p style="margin:0 0 12px;line-height:1.65">Claude Code 已找不到这个会话的本地 transcript。本轮消息尚未写入历史，也没有启动 CLI。</p>
+          <p style="margin:0 0 12px;line-height:1.65">${msg.snapshotAvailable
+            ? '检测到通过完整性校验的本地快照，可以从快照恢复后继续。'
+            : '没有找到通过完整性校验的本地快照，只能以新的 Claude 上下文继续；cc-web 中的消息历史会保留。'}</p>
+          <div style="font-size:0.86em;opacity:0.68;word-break:break-all">session: ${escapeHtml(msg.claudeSessionId || '')}</div>
+        </div>
+        <div class="modal-footer">
+          <button class="modal-btn-secondary" id="cr-cancel-btn">取消发送</button>
+          <button class="modal-btn-secondary" id="cr-new-btn">新上下文继续</button>
+          <button class="modal-btn-primary" id="cr-restore-btn"${msg.snapshotAvailable ? '' : ' disabled'}>从快照恢复</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    let settled = false;
+    const choose = (action) => {
+      if (settled) return;
+      settled = true;
+      // 取消只关闭前端弹窗；服务端 pending 会在 10 分钟后自然失效。
+      if (action !== 'cancel') {
+        send({ type: 'claude_recovery_choice', recoveryToken: msg.recoveryToken, sessionId: msg.sessionId, action });
+      }
+      overlay.remove();
+      if (action === 'restore_snapshot' || action === 'new_context') {
+        startGenerating();
+      }
+      onResolved?.(action);
+    };
+    overlay.querySelector('#cr-close-btn').addEventListener('click', () => choose('cancel'));
+    overlay.querySelector('#cr-cancel-btn').addEventListener('click', () => choose('cancel'));
+    overlay.querySelector('#cr-new-btn').addEventListener('click', () => choose('new_context'));
+    overlay.querySelector('#cr-restore-btn').addEventListener('click', () => choose('restore_snapshot'));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) choose('cancel'); });
+  }
 
   function showNewSessionModal() {
     const targetAgent = currentAgent;

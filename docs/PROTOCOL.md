@@ -6,12 +6,13 @@
 
 ### 客户端 → 服务端
 
-`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 39 个 case = **40 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
+`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 41 个 case = **42 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
 
 | 类型 | 用途 |
 |---|---|
 | `auth` | 鉴权握手（独立分支，在 WS `message` 事件回调顶部，switch 之前）。负载可选 `password` 或 `token`，两者其一即可 |
 | `message` | 用户消息（含文本/图片/斜杠命令） |
+| `claude_recovery_choice { recoveryToken, sessionId, action }` | Claude transcript 缺失后的恢复选择。`action=restore_snapshot` 校验并恢复本地快照；`action=new_context` 清除失效 `claudeSessionId`。两者都会重放同一条原消息 |
 | `abort` | 中断当前生成（**服务端 kill 整个进程组**，详见 [RUNTIME.md](./RUNTIME.md)） |
 | `new_session` | 新建会话（local/remote） |
 | `load_session` | 加载会话 |
@@ -41,7 +42,7 @@
 
 ### 服务端 → 客户端
 
-`public/app.js` 中 `handleServerMessage` 函数，共 **39 个 case**：
+`public/app.js` 中 `handleServerMessage` 函数，共 **40 个 case**：
 
 | 类型 | 用途 |
 |---|---|
@@ -54,6 +55,7 @@
 | Session `assistant` message | 正常回复含 `content` / `toolCalls`；`kind: 'codex-empty-final'` 表示 Codex 工具已完成但两次都没有最终文本，前端保留工具记录并显示不完整提示 |
 | `session_history_chunk` | 历史分块（懒加载，详见 [RUNTIME.md](./RUNTIME.md#懒加载历史)） |
 | `resume_generating` | 恢复生成态 |
+| `claude_recovery_required` | 检测到 Claude `claudeSessionId` 对应的原生 transcript 已不存在。含 `sessionId`、短时 `recoveryToken`、`snapshotAvailable` 和可选 `snapshotPath`；此时本轮消息未写入历史，也未启动 CLI |
 | `session_renamed` | 重命名通知。`source: 'manual'` 表示用户命名，`source: 'auto'` 表示每轮完成后的自动整理 |
 | `session_title_audit` | 标题体检结果。含 `candidates`、`aiStatus`（`ready` / `unavailable` / `failed` / `empty` / `error`）和 `aiMessage`；候选附带历史用户意图、助手结论与可选 `suggestion` |
 | `session_titles_applied` | 标题批量更新回执。成功时含 `count` 与备份目录 `backupDir`；失败时不写入 |

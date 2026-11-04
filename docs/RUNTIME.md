@@ -2,6 +2,17 @@
 
 > 会话持久化、detached 进程生命周期、关键运行时模式。架构见 [ARCHITECTURE.md](./ARCHITECTURE.md)，契约见 [PROTOCOL.md](./PROTOCOL.md)，配置见 [CONFIG.md](./CONFIG.md)。
 
+## Claude transcript 缺失恢复
+
+Claude Code 会按 `cleanupPeriodDays` 清理 `~/.claude/projects/<project>/<sessionId>.jsonl`。cc-web 的 session JSON 可能仍保留消息和 `claudeSessionId`，但继续执行 `--resume` 会固定得到 `No conversation found with session ID`。
+
+发送 Claude 消息前，服务端检查原生 transcript。缺失时不写入本轮用户消息、不 spawn CLI，而是发送 `claude_recovery_required` 并暂存消息 10 分钟。前端提供两种选择：
+
+- `restore_snapshot`：读取 `<AI_SESSION_TRACE_ROOT>/claude/<projectKey>/<sessionId>/transcript.jsonl`，校验配套 `transcript.sha256` 及 transcript 内的 `sessionId`，原子复制到当前 cwd 对应的 `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`，再以同一 `claudeSessionId` 重试。
+- `new_context`：清除失效的 `claudeSessionId`，保留 cc-web 消息历史，以新 Claude 上下文重试。
+
+重放只在用户选择后发生，且用户消息只写入历史一次。恢复 token 与原 session 绑定，10 分钟后失效，取消选择不会发送任何内容。`AI_SESSION_TRACE_ROOT` 未设置时默认使用 `~/.ai-session-trace`；没有 hook 快照时仅提供 `new_context`。
+
 ## 会话持久化
 
 ### 文件布局
