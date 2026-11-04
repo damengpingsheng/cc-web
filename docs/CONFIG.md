@@ -130,13 +130,17 @@
     "apiSource": "claude",
     "apiBase": "...",
     "apiKey": "...",
-    "model": "..."
+    "model": "...",
+    "autoTitle": false
   }
 }
 ```
 
 - `trigger`: `'background'`（仅后台完成触发）或 `'always'`
 - `apiSource`: `'claude'` / `'codex'` / `'custom'`
+- `autoTitle`: 每轮最终回复完成后自动整理会话标题。只更新首问派生或此前自动生成的标题；`titleSource: 'manual'` 的用户命名不会被覆盖，可复用上述摘要 API。
+
+标题来源保存在会话 JSON 的 `titleSource`：`'prompt'`（首问派生）/ `'auto'`（自动生成）/ `'manual'`（用户命名）。旧会话没有该字段时，仅当标题仍是首问前缀才视为可自动整理。
 
 ### PUSHPLUS_TOKEN 迁移
 

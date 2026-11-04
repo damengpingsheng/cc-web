@@ -7212,6 +7212,7 @@
     const summaryApiBase = panel.querySelector('#notify-summary-apibase');
     const summaryApiKey = panel.querySelector('#notify-summary-apikey');
     const summaryModel = panel.querySelector('#notify-summary-model');
+    const autoTitle = panel.querySelector('#notify-auto-title');
     const cs = currentConfig?.summary || {};
     return {
       provider,
@@ -7234,6 +7235,7 @@
         apiBase: summaryApiBase ? summaryApiBase.value.trim() : (cs.apiBase || ''),
         apiKey: summaryApiKey ? summaryApiKey.value.trim() : (cs.apiKey || ''),
         model: summaryModel ? summaryModel.value.trim() : (cs.model || ''),
+        autoTitle: autoTitle ? autoTitle.checked : !!cs.autoTitle,
       },
     };
   }
@@ -7282,6 +7284,13 @@
           </div>
         </div>
       </div>
+      <div class="settings-divider"></div>
+      <div class="settings-section-title">会话标题</div>
+      <div class="settings-field" style="flex-direction:row;align-items:center;gap:10px">
+        <label style="margin:0;flex:1">每轮结束后自动整理标题</label>
+        <input type="checkbox" id="notify-auto-title" ${s.autoTitle ? 'checked' : ''} style="width:auto;margin:0">
+      </div>
+      <div class="settings-inline-note">仅更新首问派生或此前自动生成的标题；手工命名不会被覆盖。使用上面的摘要 API 配置。</div>
     `;
   }
 

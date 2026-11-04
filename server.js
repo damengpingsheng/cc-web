@@ -116,6 +116,7 @@ const DEFAULT_SUMMARY_CONFIG = {
   apiBase: '',
   apiKey: '',
   model: '',
+  autoTitle: false,
 };
 
 function loadNotifyConfig() {
@@ -171,6 +172,7 @@ function getNotifyConfigMasked() {
       apiBase: s.apiBase || '',
       apiKey: maskToken(s.apiKey),
       model: s.model || '',
+      autoTitle: !!s.autoTitle,
     },
   };
 }
@@ -1593,6 +1595,7 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'sshHostId')) session.sshHostId = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'remoteCwd')) session.remoteCwd = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'group')) session.group = '';
+  if (!Object.prototype.hasOwnProperty.call(session, 'titleSource')) session.titleSource = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'loop')) session.loop = null;
   if (session.loop) {
     const intervalMs = Number(session.loop.intervalMs);
@@ -1799,6 +1802,19 @@ function getSessionTitleMessageText(message) {
   return '';
 }
 
+// 标题来源用于区分自动生成的标题和用户手工命名：只有 prompt 派生或此前自动生成的
+// 标题允许后台整理，manual 标题永不覆盖。旧会话没有该字段时按 prompt 派生判断。
+function getSessionTitleSource(session) {
+  const source = session?.titleSource;
+  if (source === 'manual' || source === 'auto' || source === 'prompt') return source;
+  return classifyPromptDerivedSessionTitle(session) ? 'prompt' : '';
+}
+
+function canAutoManageSessionTitle(session) {
+  const source = getSessionTitleSource(session);
+  return source === 'prompt' || source === 'auto';
+}
+
 function normalizeSessionTitleText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
@@ -1970,6 +1986,113 @@ async function handleAuditSessionTitles(ws) {
   });
 }
 
+// 自动标题整理是每轮完成后的后台任务，不阻塞 done。同一会话最多保留一个在途请求；
+// 新一轮开始时通过 generation 失效旧请求，写回前还会重新读取磁盘校验标题和消息快照。
+const autoTitleState = new Map();
+const autoTitleInFlight = new Set();
+const autoTitlePending = new Set();
+
+function buildAutoTitleCandidate(session) {
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  const users = messages
+    .filter((message) => message?.role === 'user')
+    .map((message) => getSessionTitleMessageText(message))
+    .filter((text) => text && !text.startsWith('[系统上下文]'))
+    .slice(-6)
+    .map((text) => truncateSessionTitleContext(text, 360));
+  const assistantTail = messages
+    .filter((message) => message?.role === 'assistant')
+    .map((message) => getSessionTitleMessageText(message))
+    .filter(Boolean)
+    .slice(-3)
+    .map((text) => truncateSessionTitleContext(text, 520));
+  return {
+    id: session.id,
+    title: String(session.title || 'Untitled'),
+    agent: getSessionAgent(session),
+    firstLine: classifyPromptDerivedSessionTitle(session)?.firstLine || '',
+    users,
+    assistantTail,
+  };
+}
+
+function cancelAutoSessionTitle(sessionId) {
+  autoTitlePending.delete(sessionId);
+  const state = autoTitleState.get(sessionId);
+  if (!state) return;
+  state.generation += 1;
+  autoTitleState.delete(sessionId);
+}
+
+function beginSessionTitleRequest(sessionId) {
+  if (autoTitleInFlight.has(sessionId)) return false;
+  autoTitleInFlight.add(sessionId);
+  return true;
+}
+
+function scheduleAutoSessionTitle(sessionId) {
+  const config = loadNotifyConfig().summary || {};
+  if (!config.autoTitle) return;
+  const session = loadSession(sessionId);
+  if (!session || !canAutoManageSessionTitle(session)) return;
+  if (!beginSessionTitleRequest(sessionId)) {
+    autoTitlePending.add(sessionId);
+    return;
+  }
+  const creds = getSessionTitleSuggestionCredentials();
+  if (!creds) {
+    autoTitleInFlight.delete(sessionId);
+    plog('WARN', 'auto_title_skipped', { sessionId: sessionId.slice(0, 8), reason: 'no_api' });
+    return;
+  }
+
+  const previous = autoTitleState.get(sessionId);
+  if (previous) cancelAutoSessionTitle(sessionId);
+  const state = { generation: 1, running: null };
+  autoTitleState.set(sessionId, state);
+  const candidate = buildAutoTitleCandidate(session);
+  const expectedTitle = candidate.title;
+  const expectedMessageCount = session.messages.length;
+
+  state.running = (async () => {
+    const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt([candidate]), { maxTokens: 4096, timeoutMs: 45000 });
+    const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, [candidate]) : new Map();
+    const newTitle = suggestions.get(sessionId) || '';
+    if (!newTitle) return;
+
+    // 请求期间若有新一轮、手工改名、会话删除或开关关闭，丢弃这个旧结果。
+    if (autoTitleState.get(sessionId) !== state || state.generation !== 1) return;
+    const current = loadSession(sessionId);
+    if (!current || !canAutoManageSessionTitle(current)) return;
+    if (current.title !== expectedTitle || current.messages.length !== expectedMessageCount) return;
+    if (!loadNotifyConfig().summary?.autoTitle) return;
+
+    current.title = newTitle;
+    current.titleSource = 'auto';
+    saveSession(current);
+    sessionSummaryCache.delete(`${sessionId}.json`);
+    for (const client of wss.clients) {
+      if (client._ccwebAuthed && client.readyState === 1) sendSessionList(client);
+    }
+    for (const client of wss.clients) {
+      if (client._ccwebAuthed && client.readyState === 1) {
+        wsSend(client, { type: 'session_renamed', sessionId, title: current.title, source: 'auto' });
+      }
+    }
+    plog('INFO', 'auto_title_applied', {
+      sessionId: sessionId.slice(0, 8),
+      oldTitle: expectedTitle,
+      title: current.title,
+    });
+  })().catch((error) => {
+    plog('WARN', 'auto_title_failed', { sessionId: sessionId.slice(0, 8), error: error.message });
+  }).finally(() => {
+    autoTitleInFlight.delete(sessionId);
+    if (autoTitleState.get(sessionId) === state) autoTitleState.delete(sessionId);
+    if (autoTitlePending.delete(sessionId)) scheduleAutoSessionTitle(sessionId);
+  });
+}
+
 function titleAuditBackupRoot() {
   const now = new Date();
   const day = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
@@ -2041,6 +2164,11 @@ function handleApplySessionTitles(ws, changes) {
       const after = JSON.parse(fs.readFileSync(item.filePath, 'utf8'));
       if (after.title !== item.newTitle) throw new Error(`会话 ${item.id.slice(0, 8)} 写后标题不一致`);
       after.title = item.before.title;
+      if (Object.prototype.hasOwnProperty.call(item.before, 'titleSource')) {
+        after.titleSource = item.before.titleSource;
+      } else {
+        delete after.titleSource;
+      }
       if (JSON.stringify(after) !== JSON.stringify(item.before)) {
         throw new Error(`会话 ${item.id.slice(0, 8)} 的非标题数据发生变化`);
       }
@@ -2051,6 +2179,12 @@ function handleApplySessionTitles(ws, changes) {
   }
 
   for (const item of prepared) sessionSummaryCache.delete(`${item.id}.json`);
+  for (const item of prepared) {
+    const updated = JSON.parse(fs.readFileSync(item.filePath, 'utf8'));
+    updated.titleSource = 'manual';
+    atomicWriteJson(item.filePath, JSON.stringify(updated, null, 2));
+    sessionSummaryCache.delete(`${item.id}.json`);
+  }
   for (const client of wss.clients) {
     if (client._ccwebAuthed && client.readyState === 1) sendSessionList(client);
   }
@@ -2966,6 +3100,12 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     handleMessage(entry.ws, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
     return;
   }
+
+  // 仅最终成功的一轮触发；compact 重放、Codex 重试、自动目标和中止轮都已有
+  // 后续进程或不是稳定结论，不在这里基于半成品自动命名。
+  if (!intentionalAbort && pendingSlash?.kind !== 'compact' && !contextLimitExceeded && !retryCodexWithoutResume && !shouldReturnForFollowup && !shouldAutoCompact && session && entry.fullText) {
+    scheduleAutoSessionTitle(sessionId);
+  }
 }
 
 // Global PID monitor: detect process completion (especially after server restart)
@@ -3447,6 +3587,7 @@ function handleSaveNotifyConfig(ws, newConfig) {
     apiBase: ns.apiBase !== undefined ? ns.apiBase : (cs.apiBase || ''),
     apiKey: (ns.apiKey && !ns.apiKey.includes('****')) ? ns.apiKey : (cs.apiKey || ''),
     model: ns.model !== undefined ? ns.model : (cs.model || ''),
+    autoTitle: ns.autoTitle !== undefined ? !!ns.autoTitle : !!cs.autoTitle,
   };
 
   saveNotifyConfig(merged);
@@ -4292,6 +4433,7 @@ function handleNewSession(ws, msg) {
   const session = {
     id,
     title: 'New Chat',
+    titleSource: 'prompt',
     created: new Date().toISOString(),
     updated: new Date().toISOString(),
     agent,
@@ -4609,11 +4751,13 @@ function handleRenameSession(ws, sessionId, title) {
   if (!sessionId || !title) return;
   const session = loadSession(sessionId);
   if (session) {
+    cancelAutoSessionTitle(session.id);
     session.title = String(title).slice(0, 100);
+    session.titleSource = 'manual';
     session.updated = new Date().toISOString();
     saveSession(session);
     sendSessionList(ws);
-    wsSend(ws, { type: 'session_renamed', sessionId, title: session.title });
+    wsSend(ws, { type: 'session_renamed', sessionId, title: session.title, source: 'manual' });
   }
 }
 
@@ -4733,6 +4877,7 @@ function handleMessage(ws, msg, options = {}) {
 	    session = {
 	      id,
 	      title: derivedTitle,
+	      titleSource: 'prompt',
 	      created: new Date().toISOString(),
 	      updated: new Date().toISOString(),
 	      agent,
@@ -4802,6 +4947,7 @@ function handleMessage(ws, msg, options = {}) {
 
   if (session.title === 'New Chat' || session.title === 'Untitled') {
     session.title = derivedTitle;
+    session.titleSource = 'prompt';
   }
 
   if (!hideInHistory) {

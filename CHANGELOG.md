@@ -8,6 +8,25 @@
 
 ---
 
+## 分叉 v1.5.52
+
+### 新增
+
+通知设置新增“每轮结束后自动整理标题”。每轮最终回复完成后，服务端在后台根据最近 6 条用户需求和最后 3 条助手结论生成会话标题，不阻塞 `done`；标题变化后广播 `session_renamed` 与 `session_list`，当前页和侧栏即时同步。
+
+自动整理只接管首问派生标题和此前自动生成的标题。用户通过会话重命名或标题体检应用后的命名会记录为 `manual`，后续轮次不会覆盖。同一会话限制一个在途请求；请求期间出现新一轮、手工改名、会话删除或开关关闭时，旧结果会丢弃，写回前还会复核标题与消息数。compact 重放、Codex 重试和 `/goal` 续跑等中间轮次不触发自动命名。
+
+### 验证
+
+- `node --check server.js`、`node --check public/app.js`、`node --check scripts/regression.js`、`git diff --check` 通过。
+- `npm run regression` 全部通过，包含 `Session title audit checks passed` 与 `Auto session title checks passed`。
+- 自动标题专项覆盖：最终轮完成触发、标题落盘与广播、标题来源为 `auto`、API 只调用一次、手工标题在下一轮后仍保持 `manual`。
+
+### 生效前提
+
+- 本次包含 `server.js`、前端和协议字段改动，需要重启 cc-web 服务进程。
+- 前端静态资源 `?v=` 已打到 `1.5.1-my.68`，服务重启后刷新页面，在“通知设置”中启用“每轮结束后自动整理标题”。
+
 ## 分叉 v1.5.51
 
 ### 改进

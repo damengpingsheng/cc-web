@@ -27,6 +27,7 @@
  *   - Codex /goal 兼容提示 + /loop 持久化调度与取消
  *   - Native session 导入（Claude .jsonl + Codex rollout + SQLite）
  *   - Codex 导入删除（JSON + rollout + SQLite thread 三处清理）
+ *   - 会话标题手动体检 + 每轮结束自动整理（手工标题优先）
  *
  * 安全/健壮性覆盖（5 项目标 + 7 项断言）：
  *   - 改密失效 + 新 token 立即可用 + 并发连接被踢下线（testPasswordChangeAtomicity）
@@ -1188,8 +1189,9 @@ async function main() {
   // 会话分组协议（group_create/rename/delete + session_move）
   await testSessionGroups();
 
-  // 会话标题体检（首问候选识别 + 运行中保护 + 仅 title 原子更新 + 备份）
+  // 会话标题（首问候选识别 + 运行中保护 + 自动整理 + 手工标题来源保护）
   await testSessionTitleAudit();
+  await testAutoSessionTitle();
 
   // spawn 失败只影响单个会话，不能打死整个服务（proc.on('error') 缺失回归）
   await testSpawnFailureIsolation();
@@ -1891,7 +1893,7 @@ async function testSessionGroups() {
   console.log('Session group checks passed.');
 }
 
-// 会话标题体检：只识别首问派生标题；应用前再次拒绝运行中会话，成功后只改 title 并留下备份。
+// 会话标题：手动体检+自动整理。自动整理只接管首问/此前自动标题，手动标题不可覆盖。
 async function testSessionTitleAudit() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-title-audit-'));
   const configDir = path.join(tempRoot, 'config');
@@ -2020,7 +2022,9 @@ async function testSessionTitleAudit() {
 
       const inactiveAfter = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${inactiveId}.json`), 'utf8'));
       assert(inactiveAfter.title === newTitle, 'Applied title must be persisted');
+      assert(inactiveAfter.titleSource === 'manual', 'Applied title must become manual so auto-title cannot overwrite it');
       inactiveAfter.title = inactiveBefore.title;
+      delete inactiveAfter.titleSource;
       assert(JSON.stringify(inactiveAfter) === JSON.stringify(inactiveBefore), 'Apply must only change the title field');
       assert(applied.backupDir && fs.existsSync(path.join(applied.backupDir, `${inactiveId}.json`)), 'Apply must create a recoverable backup');
 
@@ -2032,6 +2036,110 @@ async function testSessionTitleAudit() {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
   console.log('Session title audit checks passed.');
+}
+
+// 自动标题在每轮完成后的后台任务中落盘，并广播 session_renamed；手工标题来源必须优先。
+async function testAutoSessionTitle() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-auto-title-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  const password = 'AutoTitle!234';
+  const port = await getFreePort();
+  let apiRequests = 0;
+  const titleApiServer = http.createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      apiRequests += 1;
+      const prompt = JSON.parse(body).messages?.[0]?.content || '';
+      const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
+      const content = JSON.stringify([{ id: candidates[0]?.id, title: '自动生成的会话标题' }]);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    titleApiServer.once('error', reject);
+    titleApiServer.listen(0, '127.0.0.1', resolve);
+  });
+  const titleApiPort = titleApiServer.address().port;
+
+  try {
+    await withServer({
+      PORT: String(port),
+      CC_WEB_PASSWORD: password,
+      CC_WEB_CONFIG_DIR: configDir,
+      CC_WEB_SESSIONS_DIR: sessionsDir,
+      CC_WEB_LOGS_DIR: logsDir,
+      HOME: homeDir,
+      CLAUDE_PATH: MOCK_CLAUDE,
+      CODEX_PATH: MOCK_CODEX,
+    }, async () => {
+      const { ws, messages } = await connectWs(port, password);
+      await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+      fs.writeFileSync(path.join(configDir, 'notify.json'), JSON.stringify({
+        provider: 'off',
+        summary: {
+          enabled: false,
+          autoTitle: true,
+          apiSource: 'custom',
+          apiBase: `http://127.0.0.1:${titleApiPort}`,
+          apiKey: 'test-key',
+          model: 'test-model',
+        },
+      }, null, 2));
+
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+      const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
+      ws.send(JSON.stringify({ type: 'message', text: '自动标题回归测试', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+      await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'auto');
+      const saved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
+      assert(saved.title === '自动生成的会话标题', `Auto title should be persisted (got ${saved.title})`);
+      assert(saved.titleSource === 'auto', 'Auto title source should be persisted');
+      assert(apiRequests === 1, `Auto title should call API once (got ${apiRequests})`);
+
+      ws.send(JSON.stringify({ type: 'rename_session', sessionId: session.sessionId, title: '保留手工命名' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'manual');
+      ws.send(JSON.stringify({ type: 'message', text: '下一轮保留手工标题', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+      await sleep(150);
+      const manualSaved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
+      assert(manualSaved.title === '保留手工命名', `Manual title must win (got ${manualSaved.title})`);
+      assert(manualSaved.titleSource === 'manual', 'Manual title source must remain manual');
+
+      // 开关关闭后即使出现新的首问标题也不能调用标题 API。
+      fs.writeFileSync(path.join(configDir, 'notify.json'), JSON.stringify({
+        provider: 'off',
+        summary: {
+          enabled: false,
+          autoTitle: false,
+          apiSource: 'custom',
+          apiBase: `http://127.0.0.1:${titleApiPort}`,
+          apiKey: 'test-key',
+          model: 'test-model',
+        },
+      }, null, 2));
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+      const disabledSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.sessionId !== session.sessionId);
+      ws.send(JSON.stringify({ type: 'message', text: '关闭开关后不应自动整理', sessionId: disabledSession.sessionId, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === disabledSession.sessionId);
+      await sleep(150);
+      const disabledSaved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${disabledSession.sessionId}.json`), 'utf8'));
+      assert(disabledSaved.title === '关闭开关后不应自动整理', `Disabled auto-title must keep prompt title (got ${disabledSaved.title})`);
+      assert(apiRequests === 1, `Disabled auto-title must not call API (got ${apiRequests})`);
+      ws.close();
+    });
+  } finally {
+    await new Promise((resolve) => titleApiServer.close(resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+  console.log('Auto session title checks passed.');
 }
 
 // spawn 失败（CLI 路径不存在）必须只让本会话报错，不能打死整个服务。

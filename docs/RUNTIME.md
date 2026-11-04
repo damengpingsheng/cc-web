@@ -15,7 +15,7 @@
 
 `server.js` 中 `normalizeSession()` 在加载时统一字段默认值。**新增字段必须在 `normalizeSession` 设默认值**，保证前向兼容。
 
-当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `totalCost` / `totalUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `messages`。
+当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `totalCost` / `totalUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `titleSource` / `messages`。
 
 **不在该函数设默认值**（由创建/业务路径显式赋值）：
 - `permissionMode` — 由 `handleNewSession` / `handleMessage` 创建时赋值，默认 `'yolo'`
@@ -52,6 +52,7 @@
 | `hasUnread` | 是否有未读消息（侧栏高亮） |
 | `updated` | 最后更新时间戳（ISO） |
 | `group` | 所属分组 id（`''`=未分组，`normalizeSession` 设默认值） |
+| `titleSource` | 标题来源：`'prompt'` / `'auto'` / `'manual'` / `''`（旧数据）。自动整理只接管前两者 |
 
 ### 会话分组持久化
 

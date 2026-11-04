@@ -53,7 +53,7 @@
 | `session_info` | 会话元信息。运行中会话额外附带 `activeOutput`（string，内存实时全量输出，用于断线补齐，见 [RUNTIME.md](./RUNTIME.md#ws-心跳与断线内容补齐)）；任务结束后该键省略 |
 | `session_history_chunk` | 历史分块（懒加载，详见 [RUNTIME.md](./RUNTIME.md#懒加载历史)） |
 | `resume_generating` | 恢复生成态 |
-| `session_renamed` | 重命名通知 |
+| `session_renamed` | 重命名通知。`source: 'manual'` 表示用户命名，`source: 'auto'` 表示每轮完成后的自动整理 |
 | `session_title_audit` | 标题体检结果。含 `candidates`、`aiStatus`（`ready` / `unavailable` / `failed` / `empty` / `error`）和 `aiMessage`；候选附带历史用户意图、助手结论与可选 `suggestion` |
 | `session_titles_applied` | 标题批量更新回执。成功时含 `count` 与备份目录 `backupDir`；失败时不写入 |
 | `mode_changed` / `model_changed` | 模式/模型切换通知 |
