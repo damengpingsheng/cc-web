@@ -1603,23 +1603,20 @@
       </button>`;
   }
 
-  function renderSessionOverviewFocus(matches) {
+  function renderSessionOverviewFocus(focusSessions) {
     if (!sessionOverviewFocus) return;
-    const eligible = !sessionOverviewQuery.trim() && sessionOverviewStatus === 'all';
-    if (!eligible || matches.length === 0) {
+    if (focusSessions.length === 0) {
       sessionOverviewFocus.hidden = true;
       sessionOverviewFocus.innerHTML = '';
       return;
     }
-    const focusSessions = matches.slice(0, 3);
-    const hasPriority = focusSessions.some((session) => session.isRunning || session.hasUnread || isSessionOverviewFavorite(session.id));
     sessionOverviewFocus.innerHTML = `
       <div class="session-overview-focus-heading">
         <div>
-          <h2>继续工作</h2>
-          <p>${hasPriority ? '运行中、未读与置顶会话优先' : '最近更新的会话'}</p>
+          <h2>最近活跃</h2>
+          <p>跨分组显示，运行中与会话活动优先</p>
         </div>
-        <span>${focusSessions.length} 个快捷入口</span>
+        <span>最近 ${focusSessions.length} 条</span>
       </div>
       <div class="session-overview-focus-grid">${focusSessions.map(buildSessionOverviewFocusCard).join('')}</div>`;
     sessionOverviewFocus.hidden = false;
@@ -1654,7 +1651,13 @@
     });
 
     const matches = getSessionOverviewMatches();
-    renderSessionOverviewFocus(matches);
+    const favoriteMatches = matches.filter((session) => isSessionOverviewFavorite(session.id));
+    const focusSessions = matches
+      .filter((session) => !isSessionOverviewFavorite(session.id))
+      .slice(0, 8);
+    const focusIds = new Set(focusSessions.map((session) => session.id));
+    const regularMatches = matches.filter((session) => !isSessionOverviewFavorite(session.id) && !focusIds.has(session.id));
+    renderSessionOverviewFocus(focusSessions);
     if (sessionOverviewMatchCount) {
       sessionOverviewMatchCount.textContent = (sessionOverviewQuery.trim() || sessionOverviewStatus !== 'all' || sessionOverviewAgent !== 'all')
         ? `${matches.length} 条` : '';
@@ -1670,8 +1673,6 @@
       return;
     }
 
-    const favoriteMatches = matches.filter((session) => isSessionOverviewFavorite(session.id));
-    const regularMatches = matches.filter((session) => !isSessionOverviewFavorite(session.id));
     const sections = favoriteMatches.length > 0 ? [buildSessionOverviewGroup('置顶', favoriteMatches)] : [];
 
     const buckets = new Map();
@@ -1690,6 +1691,11 @@
 
     if (groups.length > 0) {
       if (ungrouped.length > 0) groupOrder.push({ id: '', title: '未分组' });
+      groupOrder.sort((a, b) => {
+        const aItems = a.id ? buckets.get(a.id) : ungrouped;
+        const bItems = b.id ? buckets.get(b.id) : ungrouped;
+        return new Date(bItems[0]?.updated || 0) - new Date(aItems[0]?.updated || 0);
+      });
       sections.push(...groupOrder.map((group) => {
         const items = group.id ? buckets.get(group.id) : ungrouped;
         return items.length > 0 ? buildSessionOverviewGroup(group.title, items) : '';
