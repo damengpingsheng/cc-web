@@ -245,7 +245,7 @@ function callSummaryApi(creds, prompt, options = {}) {
           'Authorization': `Bearer ${creds.apiKey}`,
           'Content-Length': Buffer.byteLength(body),
         },
-        timeout: 20000,
+        timeout: options.timeoutMs || 20000,
       }, (res) => {
         let data = '';
         res.on('data', c => data += c);
@@ -1954,7 +1954,7 @@ async function handleAuditSessionTitles(ws) {
     });
   }
 
-  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(candidates), { maxTokens: 2048 });
+  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(candidates), { maxTokens: 4096, timeoutMs: 45000 });
   const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, candidates) : new Map();
   wsSend(ws, {
     type: 'session_title_audit',

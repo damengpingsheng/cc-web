@@ -49,6 +49,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const net = require('net');
+const http = require('http');
 const { spawn, spawnSync } = require('child_process');
 const WebSocket = require('ws');
 
@@ -1907,6 +1908,29 @@ async function testSessionTitleAudit() {
   const semanticId = 'title-audit-semantic';
   const sleepChild = spawn('sleep', ['60'], { stdio: 'ignore' });
 
+  let titleApiRequest = null;
+  const titleApiServer = http.createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      titleApiRequest = JSON.parse(body);
+      const prompt = titleApiRequest.messages?.[0]?.content || '';
+      const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
+      const content = JSON.stringify(candidates.map((candidate) => ({ id: candidate.id, title: `整理后的标题：${candidate.oldTitle}` })));
+      setTimeout(() => {
+        if (res.destroyed) return;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      }, 20500);
+    });
+  });
+  await new Promise((resolve, reject) => {
+    titleApiServer.once('error', reject);
+    titleApiServer.listen(0, '127.0.0.1', resolve);
+  });
+  const titleApiPort = titleApiServer.address().port;
+
   const writeSession = (id, title, agent, messages) => {
     const session = { id, title, agent, updated: fixedUpdated, cwd: '/tmp/title-audit', messages };
     fs.writeFileSync(path.join(sessionsDir, `${id}.json`), JSON.stringify(session, null, 2));
@@ -1943,8 +1967,24 @@ async function testSessionTitleAudit() {
       await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.length === 3);
 
       ws.send(JSON.stringify({ type: 'audit_session_titles' }));
-      const audit = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit');
-      assert(audit.aiStatus === 'unavailable', `No custom API should fall back to manual mode (got ${audit.aiStatus})`);
+      const unavailable = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit');
+      assert(unavailable.aiStatus === 'unavailable', `No custom API should fall back to manual mode (got ${unavailable.aiStatus})`);
+
+      fs.writeFileSync(path.join(configDir, 'notify.json'), JSON.stringify({
+        provider: 'off',
+        summary: {
+          enabled: true,
+          apiSource: 'custom',
+          apiBase: `http://127.0.0.1:${titleApiPort}`,
+          apiKey: 'test-key',
+          model: 'test-model',
+        },
+      }, null, 2));
+      ws.send(JSON.stringify({ type: 'audit_session_titles' }));
+      const audit = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit', 30000);
+      assert(audit.aiStatus === 'ready', `Configured title API should generate suggestions (got ${audit.aiStatus}: ${audit.aiMessage})`);
+      assert(titleApiRequest?.max_tokens === 4096, `Title API should request 4096 output tokens (got ${titleApiRequest?.max_tokens})`);
+      assert(titleApiRequest?.model === 'test-model', `Title API should use configured model (got ${titleApiRequest?.model})`);
       assert(audit.candidates.length === 2, `Audit should find exactly two prompt-derived titles (got ${audit.candidates.length})`);
       assert(!audit.candidates.some((item) => item.id === semanticId), 'Semantic title must not be an audit candidate');
       assert(audit.candidates.find((item) => item.id === activeId)?.active === true, 'Running session must be marked active');
@@ -1983,6 +2023,7 @@ async function testSessionTitleAudit() {
     });
   } finally {
     try { sleepChild.kill('SIGTERM'); } catch {}
+    await new Promise((resolve) => titleApiServer.close(resolve));
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
   console.log('Session title audit checks passed.');
