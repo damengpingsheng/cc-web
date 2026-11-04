@@ -38,6 +38,10 @@ function readStdin() {
   process.stdout.write(`${JSON.stringify({ type: 'thread.started', thread_id: threadId })}\n`);
   process.stdout.write(`${JSON.stringify({ type: 'turn.started' })}\n`);
 
+  if (input === 'trigger codex benign stderr') {
+    process.stderr.write('2026-11-04T08:28:05.057427Z ERROR codex_memories_write::phase2: Phase 2 no changes\n');
+  }
+
   if (input === 'trigger codex abort output') {
     const itemId = 'item_abort_custom';
     process.stdout.write(`${JSON.stringify({

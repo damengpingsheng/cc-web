@@ -1192,6 +1192,7 @@ async function main() {
   // 会话标题（首问候选识别 + 运行中保护 + 自动整理 + 手工标题来源保护）
   await testSessionTitleAudit();
   await testAutoSessionTitle();
+  await testBenignCodexStderrExit();
 
   // spawn 失败只影响单个会话，不能打死整个服务（proc.on('error') 缺失回归）
   await testSpawnFailureIsolation();
@@ -2140,6 +2141,54 @@ async function testAutoSessionTitle() {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
   console.log('Auto session title checks passed.');
+}
+
+// Codex may write non-fatal diagnostics to stderr while still exiting 0. The PID
+// monitor can observe the process before the 300ms exit finalizer; it must use the
+// authoritative exit event instead of misclassifying the run as a task failure.
+async function testBenignCodexStderrExit() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-benign-stderr-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  const password = 'BenignStderr!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+    CC_WEB_PID_MONITOR_INTERVAL_MS: '50',
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger codex benign stderr', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+    await sleep(400);
+    assert(!messages.some((msg) => msg.type === 'error' && msg.message?.includes('Codex 任务失败')), 'Benign Codex stderr on exit 0 must not surface as a task failure');
+
+    const processLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
+    const completion = processLog.split('\n')
+      .filter(Boolean)
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .find((item) => item?.event === 'process_complete' && item.sessionId === session.sessionId.slice(0, 8));
+    assert(completion?.exitCode === 0, `PID monitor must preserve observed exit code 0 (got ${completion?.exitCode})`);
+    assert(completion?.error === null, `Benign stderr must not become a completion error (got ${completion?.error})`);
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Benign Codex stderr exit checks passed.');
 }
 
 // spawn 失败（CLI 路径不存在）必须只让本会话报错，不能打死整个服务。

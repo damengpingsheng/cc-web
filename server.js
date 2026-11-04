@@ -66,6 +66,7 @@ const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
 const GROUPS_CONFIG_PATH = path.join(CONFIG_DIR, 'groups.json');
 // WS 心跳间隔（毫秒）：每轮 ping 全部客户端，连续两轮无 pong 判定死连接 terminate
 const WS_PING_INTERVAL_MS = parseInt(process.env.CC_WEB_WS_PING_INTERVAL_MS, 10) || 25000;
+const PID_MONITOR_INTERVAL_MS = Math.max(20, parseInt(process.env.CC_WEB_PID_MONITOR_INTERVAL_MS, 10) || 2000);
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -2758,6 +2759,14 @@ function condenseRuntimeError(raw) {
   return lines.slice(0, 3).join(' ');
 }
 
+function stripBenignRuntimeDiagnostics(raw) {
+  return String(raw || '')
+    .split('\n')
+    .filter((line) => !/^\S+\s+ERROR\s+codex_memories_write::phase2:\s+Phase 2 no changes\s*$/.test(line.trim()))
+    .join('\n')
+    .trim();
+}
+
 function formatRuntimeError(agent, raw, context = {}) {
   const condensed = condenseRuntimeError(raw);
   const exitInfo = typeof context.exitCode === 'number' ? `（退出码 ${context.exitCode}）` : '';
@@ -2925,9 +2934,10 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   } catch {}
 
   const intentionalAbort = !!entry.abortedByUser || signal === 'SIGINT' || signal === 'SIGTERM';
+  const actionableStderr = stripBenignRuntimeDiagnostics(stderrSnippet);
   const rawCompletionError = intentionalAbort ? null : entry.lastError || (
     ((typeof exitCode === 'number' && exitCode !== 0) || !!signal)
-      ? (stderrSnippet || null)
+      ? (actionableStderr || null)
       : null
   );
   contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
@@ -3112,15 +3122,21 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 setInterval(() => {
   for (const [sessionId, entry] of activeProcesses) {
     if (entry.pid && !isProcessRunning(entry.pid)) {
+      const hasObservedExit = Object.prototype.hasOwnProperty.call(entry, 'exitCode');
       plog('INFO', 'pid_monitor_detected_exit', {
         sessionId: sessionId.slice(0, 8),
         pid: entry.pid,
         wsConnected: !!entry.ws,
+        hasObservedExit,
       });
-      handleProcessComplete(sessionId, null, 'unknown (detected by monitor)');
+      handleProcessComplete(
+        sessionId,
+        hasObservedExit ? entry.exitCode : null,
+        hasObservedExit ? entry.signal : 'unknown (detected by monitor)',
+      );
     }
   }
-}, 2000);
+}, PID_MONITOR_INTERVAL_MS);
 
 cleanupExpiredAttachments();
 setInterval(cleanupExpiredAttachments, 6 * 60 * 60 * 1000);
@@ -5123,6 +5139,14 @@ function handleMessage(ws, msg, options = {}) {
       exitCode: code,
       signal: signal,
     });
+    // PID monitor may notice the disappearance before the delayed finalizer below.
+    // Persist the authoritative exit result now so the monitor never substitutes
+    // an unknown signal for a successful exit.
+    const exiting = activeProcesses.get(currentSessionId);
+    if (exiting && exiting.pid === proc.pid) {
+      exiting.exitCode = code;
+      exiting.signal = signal;
+    }
     // Small delay to ensure file is fully flushed
     setTimeout(() => {
       // pid 一致性守卫：300ms 窗口内若收尾已被 pid monitor 等通道执行（entry 已删），
