@@ -58,6 +58,7 @@ const REPO_DIR = path.resolve(__dirname, '..');
 const SERVER_PATH = path.join(REPO_DIR, 'server.js');
 const MOCK_CLAUDE = path.join(REPO_DIR, 'scripts', 'mock-claude.js');
 const MOCK_CODEX = path.join(REPO_DIR, 'scripts', 'mock-codex.js');
+const { createAgentRuntime } = require(path.join(REPO_DIR, 'lib', 'agent-runtime.js'));
 
 function mkdirp(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -443,6 +444,37 @@ async function testContextUsage() {
   console.log('Context usage estimation checks passed.');
 }
 
+// Startup recovery replayed a Claude output.jsonl containing thousands of
+// system events. Event normalization must not load/save the large session JSON
+// for each one; it must collect the runtime ID and persist once by the caller.
+async function testRecoveryReplayRuntime() {
+  const runtime = createAgentRuntime({
+    processEnv: process.env, CLAUDE_PATH: '', CODEX_PATH: '', MODEL_MAP: {},
+    loadModelConfig: () => ({}), applyCustomTemplateToSettings: () => {},
+    loadCodexConfig: () => ({}), prepareCodexCustomRuntime: () => null,
+    wsSend: () => {}, truncateObj: (x) => x, sanitizeToolInput: (_, x) => x,
+    isInjectedClaudeUserEntry: () => false,
+    loadSession: () => { throw new Error('recoveryReplay must not loadSession'); },
+    saveSession: () => { throw new Error('recoveryReplay must not saveSession'); },
+    setRuntimeSessionId: () => {}, clearRuntimeSessionId: () => {}, getRuntimeSessionId: () => null,
+  });
+  const entry = { agent: 'claude', ws: null, fullText: '', toolCalls: [], lastError: null, recoveryReplay: true };
+  runtime.processClaudeEvent(entry, { type: 'system', session_id: 'recovered-claude-id' }, 'session');
+  runtime.processClaudeEvent(entry, { type: 'system', subtype: 'hook_progress', session_id: 'recovered-claude-id' }, 'session');
+  runtime.processClaudeEvent(entry, { type: 'assistant', message: { content: [{ type: 'text', text: 'recovered answer' }] } }, 'session');
+  runtime.processClaudeEvent(entry, { type: 'result', session_id: 'recovered-claude-id', total_cost_usd: 1.5 }, 'session');
+  assert(entry.recoveredRuntimeSessionId === 'recovered-claude-id', 'Recovery must collect the Claude runtime ID in memory');
+  assert(entry.fullText === 'recovered answer', 'Recovery must collect the final assistant text in memory');
+  assert(entry.lastCost === 1.5, 'Recovery must collect final cost without persisting per event');
+
+  const codexEntry = { agent: 'codex', ws: null, fullText: '', toolCalls: [], lastError: null, recoveryReplay: true };
+  runtime.processCodexEvent(codexEntry, { type: 'thread.started', thread_id: 'recovered-codex-id' }, 'session');
+  runtime.processCodexEvent(codexEntry, { type: 'turn.completed', usage: { input_tokens: 4, output_tokens: 2 } }, 'session');
+  assert(codexEntry.recoveredRuntimeSessionId === 'recovered-codex-id', 'Recovery must collect the Codex thread ID in memory');
+  assert(codexEntry.lastUsage?.input_tokens === 4, 'Recovery must retain usage for one final session write');
+  console.log('Recovery replay runtime checks passed.');
+}
+
 async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
@@ -742,7 +774,6 @@ async function main() {
     assert(Array.isArray(storedClaudeSession.messages?.[0]?.attachments) && storedClaudeSession.messages[0].attachments.length === 1, 'Claude message should persist attachment metadata');
     assert(storedClaudeSession.claudeSessionId, 'Claude session id should be persisted after first run');
     const claudeSessionIdBeforeMode = storedClaudeSession.claudeSessionId;
-
     // Mode switching must not clear Claude runtime session id (resume should keep context).
     ws.send(JSON.stringify({ type: 'set_mode', sessionId: claudeImageSession.sessionId, mode: 'plan' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'mode_changed' && msg.mode === 'plan');
@@ -1167,6 +1198,7 @@ async function main() {
 
   // P2 unit tests: lib/context-usage.js (watermark estimation + preempt threshold)
   await testContextUsage();
+  await testRecoveryReplayRuntime();
 
   // Static + HTTP-header checks for XSS hardening (Goal 2)
   await testXssHardening();
@@ -1193,6 +1225,7 @@ async function main() {
   await testSessionTitleAudit();
   await testAutoSessionTitle();
   await testBenignCodexStderrExit();
+  await testCodexEmptyFinalRecovery();
 
   // spawn 失败只影响单个会话，不能打死整个服务（proc.on('error') 缺失回归）
   await testSpawnFailureIsolation();
@@ -2189,6 +2222,92 @@ async function testBenignCodexStderrExit() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Benign Codex stderr exit checks passed.');
+}
+
+// Codex can finish after a tool call without emitting an AgentMessage. cc-web
+// must resume once and ask for the conclusion; a second empty finish must be
+// surfaced as an error instead of another retry or a silent done.
+async function testCodexEmptyFinalRecovery() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-codex-empty-final-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  const password = 'CodexEmptyFinal!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
+
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger codex empty final', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+    const retryNotice = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /没有返回最终回答/.test(msg.message || ''));
+    assert(/自动重试一次/.test(retryNotice.message || ''), 'Empty Codex final should announce its one-shot retry');
+    const recovered = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /Codex recovered final summary/.test(msg.text || ''));
+    assert(/Codex recovered final summary/.test(recovered.text || ''), 'Recovery prompt should return a final summary');
+    const firstDone = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+    assert(firstDone.willContinue === true, 'First empty final done should mark an in-flight retry');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId && msg.willContinue === false);
+
+    const recoveredSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
+    assert(!recoveredSession.messages.some((msg) => msg.kind === 'codex-empty-final'), 'Successful empty-final recovery must not leave a failure marker');
+    assert(!recoveredSession.messages.some((msg) => String(msg.content || '').includes('[cc-web empty-final retry]')), 'Internal Codex retry prompt must stay out of history');
+    const userCount = recoveredSession.messages.filter((msg) => msg.role === 'user').length;
+    assert(userCount === 1, `Empty-final retry must not add a user turn (got ${userCount})`);
+
+    // The last output flag is runtime state, so cover it at the event-normalizer
+    // boundary instead of relying only on the websocket flow above.
+    const runtimeProbe = { agent: 'codex', fullText: '', toolCalls: [], lastError: null, ws: null };
+    const runtime = createAgentRuntime({
+      processEnv: process.env, CLAUDE_PATH: '', CODEX_PATH: '', MODEL_MAP: {},
+      loadModelConfig: () => ({}), applyCustomTemplateToSettings: () => {},
+      loadCodexConfig: () => ({}), prepareCodexCustomRuntime: () => null,
+      wsSend: () => {}, truncateObj: (x) => x, sanitizeToolInput: (_, x) => x,
+      isInjectedClaudeUserEntry: () => false, loadSession: () => null, saveSession: () => {},
+      setRuntimeSessionId: () => {}, clearRuntimeSessionId: () => {}, getRuntimeSessionId: () => null,
+    });
+    runtime.processCodexEvent(runtimeProbe, { type: 'item.completed', item: { id: 'probe-msg', type: 'agent_message', text: 'answer' } }, 'probe');
+    assert(runtimeProbe.codexLastOutputWasText === true, 'Codex agent_message must mark last output as text');
+    runtime.processCodexEvent(runtimeProbe, { type: 'item.completed', item: { id: 'probe-tool', type: 'command_execution', status: 'completed' } }, 'probe');
+    assert(runtimeProbe.codexLastOutputWasText === false, 'Codex tool completion must clear last-output text flag');
+    runtime.processCodexEvent(runtimeProbe, { type: 'item.completed', item: { id: 'probe-text-2', type: 'agent_message', text: 'final' } }, 'probe');
+    runtime.processCodexEvent(runtimeProbe, { type: 'item.completed', item: { id: 'probe-reasoning', type: 'reasoning', text: 'meta' } }, 'probe');
+    assert(runtimeProbe.codexLastOutputWasText === true, 'Reasoning events must not replace the final visible agent text');
+
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger codex repeated empty final', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /自动重试一次/.test(msg.message || ''));
+    const stillEmpty = await nextMessage(messages, ws, (msg) => msg.type === 'error' && /仍未返回最终回答/.test(msg.message || ''));
+    assert(/本轮结果可能不完整/.test(stillEmpty.message || ''), 'Second empty final should surface an explicit incomplete-result error');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+
+    const incompleteSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
+    const incomplete = incompleteSession.messages.find((msg) => msg.kind === 'codex-empty-final');
+    assert(incomplete?.toolCalls?.length > 0, 'Unrecoverable empty Codex turn must persist a visible incomplete marker with tool calls');
+
+    const spawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8').split('\n').filter(Boolean)
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter((item) => item?.event === 'process_spawn' && item.sessionId === session.sessionId.slice(0, 8));
+    assert(spawns.length === 4, `Two empty-final turns must each spawn original + one retry (got ${spawns.length})`);
+    assert(spawns.filter((item) => item.resume === false).length === 1, 'Only the first Codex process may start without resume');
+    assert(spawns.filter((item) => item.resume === true).length === 3, 'Every recovery and resumed user turn must use Codex resume');
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Codex empty final recovery checks passed.');
 }
 
 // spawn 失败（CLI 路径不存在）必须只让本会话报错，不能打死整个服务。

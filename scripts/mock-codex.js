@@ -42,6 +42,33 @@ function readStdin() {
     process.stderr.write('2026-11-04T08:28:05.057427Z ERROR codex_memories_write::phase2: Phase 2 no changes\n');
   }
 
+  const emitEmptyFinal = () => {
+    const itemId = `item_empty_final_tool_${Date.now()}`;
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.started',
+      item: {
+        id: itemId,
+        type: 'command_execution',
+        command: '/bin/bash -lc true',
+        aggregated_output: '',
+        exit_code: null,
+        status: 'in_progress',
+      },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: itemId,
+        type: 'command_execution',
+        command: '/bin/bash -lc true',
+        aggregated_output: '',
+        exit_code: 0,
+        status: 'completed',
+      },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 0 } })}\n`);
+  };
+
   if (input === 'trigger codex abort output') {
     const itemId = 'item_abort_custom';
     process.stdout.write(`${JSON.stringify({
@@ -76,6 +103,18 @@ function readStdin() {
       ].join('\n') + '\n';
       process.stdout.write(output, () => process.exit(0));
     });
+    return;
+  }
+
+  if (input === 'trigger codex repeated empty final') {
+    state.codexRepeatEmptyFinal = true;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    emitEmptyFinal();
+    return;
+  }
+
+  if (input === 'trigger codex empty final' || (state.codexRepeatEmptyFinal && input.includes('没有生成最终回答'))) {
+    emitEmptyFinal();
     return;
   }
 
@@ -128,7 +167,9 @@ function readStdin() {
     ? 'Codex compact finished.'
     : isInitPrompt
       ? 'Codex init finished.'
-    : `Codex mock handled (${imageCount} image): ${input}`;
+      : input.includes('没有生成最终回答')
+        ? 'Codex recovered final summary.'
+        : `Codex mock handled (${imageCount} image): ${input}`;
 
   process.stdout.write(`${JSON.stringify({
     type: 'item.completed',

@@ -103,6 +103,8 @@ handleProcessComplete                  ← server.js
 
 **关键含义**：服务重启**不会**终止进行中的 Claude/Codex 工作。
 
+死亡进程回放使用 `recoveryReplay` 模式：只收集最终文本、工具调用、usage/cost 和 runtime ID，不逐事件读写 session JSON；全部读完后再原子落盘一次并清理 run 目录。Claude 的每个 `system` 事件都会带 session ID，逐事件落盘会在数千个事件的长会话上造成启动阶段大量同步 I/O。
+
 ### 中断进程（killProcess）
 
 用户点停止按钮 / 发 abort 时，`killProcess(pid)` 杀**整个进程组**而不是单进程：
@@ -121,6 +123,10 @@ handleProcessComplete                  ← server.js
 并跑 `npm run regression`。
 
 ## 关键运行时模式
+
+### Codex 空最终回答恢复
+
+Codex 正常退出时若本轮已执行非 reasoning 工具、最后一个输出仍是工具完成事件而非 `agent_message`，且没有其他错误或重试链，cc-web 会以 `resume` 在同一 thread 上自动追问一次最终总结。该内部追问不进入会话历史；第二次仍为空时发送明确错误，不再循环。用户中止、`/compact`、隐藏的内部轮次和上下文超限路径都不触发该恢复。
 
 ### 自动 compact 重试
 

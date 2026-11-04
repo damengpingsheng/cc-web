@@ -3826,6 +3826,13 @@
 	    if (m.kind === 'local-command' && m.localCommand) return buildLocalCommandElement(m);
 	    if (m.kind === 'compact-summary') return buildCompactSummaryElement(m);
 	    const el = createMsgElement(m.role, m.content, m.attachments || [], m.timestamp || null);
+	    if (m.kind === 'codex-empty-final') {
+	      const notice = document.createElement('div');
+	      notice.className = 'tool-call-empty';
+	      notice.style.padding = '6px 10px';
+	      notice.textContent = '本轮 Codex 已执行工具，但没有生成最终回答；已保留已完成的工具记录。';
+	      el.querySelector('.msg-bubble').appendChild(notice);
+	    }
 	    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
 	      const bubble = el.querySelector('.msg-bubble');
 	      const FOLD_AT = 3;

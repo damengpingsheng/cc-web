@@ -27,12 +27,13 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { StringDecoder } = require('string_decoder');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
 const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('./lib/context-usage');
 const { createAuthStore } = require('./lib/auth');
-const { createCodexRolloutStore } = require('./lib/codex-rollouts');
+const { createCodexRolloutStore, CODEX_EMPTY_FINAL_RETRY_MARKER } = require('./lib/codex-rollouts');
 const { createClientIpResolver } = require('./lib/client-ip');
 
 // Load .env
@@ -2767,6 +2768,32 @@ function stripBenignRuntimeDiagnostics(raw) {
     .trim();
 }
 
+const CODEX_EMPTY_FINAL_RETRY_PROMPT = `${CODEX_EMPTY_FINAL_RETRY_MARKER}\n上一轮已经执行了工具，但没有生成最终回答。请基于当前对话和已完成的工具结果，直接向用户给出完整、简洁的最终总结；不要重复执行已经完成的命令或修改。`;
+
+function hasCodexActionTool(toolCalls) {
+  return Array.isArray(toolCalls) && toolCalls.some((call) => (
+    call
+    && call.kind !== 'reasoning'
+    && call.meta?.kind !== 'reasoning'
+    && call.name !== 'Reasoning'
+  ));
+}
+
+function markCodexEmptyFinalMessage(sessionId) {
+  const session = loadSession(sessionId);
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== 'assistant') continue;
+    if (message.kind === 'codex-empty-final' || !String(message.content || '').trim()) {
+      message.kind = 'codex-empty-final';
+      session.updated = new Date().toISOString();
+      saveSession(session);
+    }
+    return;
+  }
+}
+
 function formatRuntimeError(agent, raw, context = {}) {
   const condensed = condenseRuntimeError(raw);
   const exitInfo = typeof context.exitCode === 'number' ? `（退出码 ${context.exitCode}）` : '';
@@ -2921,6 +2948,8 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     : null;
 
   const pendingRetry = pendingCompactRetries.get(sessionId) || null;
+  const pendingSlash = pendingSlashCommands.get(sessionId) || null;
+  let session = loadSession(sessionId);
   let contextLimitExceeded = false;
 
   // Read stderr for error clues
@@ -2944,6 +2973,28 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   let completionError = rawCompletionError ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal }) : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
+  // Codex can finish a tool-driven turn without emitting an agent_message. Treat
+  // that specific shape as recoverable once: resume the same thread and ask for
+  // the conclusion from work already done. Empty prose replies and injected turns
+  // are excluded so this cannot become a general auto-retry loop.
+  const codexEmptyFinal = !!(
+    entry.agent === 'codex'
+    && !completionError
+    && !intentionalAbort
+    && !contextLimitExceeded
+    && !pendingSlash
+    && entry.codexLastOutputWasText === false
+    && hasCodexActionTool(entry.toolCalls)
+  );
+  const shouldRetryCodexEmptyFinal = codexEmptyFinal
+    && !entry.hideInHistory
+    && !entry.codexEmptyFinalRetry
+    && !!session
+    && !!getRuntimeSessionId(session)
+    && !!entry.ws
+    && entry.ws.readyState === 1;
+  const codexEmptyFinalFailed = codexEmptyFinal && entry.codexEmptyFinalRetry;
+
   plog(exitCode === 0 || exitCode === null ? 'INFO' : 'WARN', 'process_complete', {
     sessionId: sessionId.slice(0, 8),
     pid: entry.pid,
@@ -2960,6 +3011,8 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     error: rawCompletionError,
     stderr: stderrSnippet || null,
     requestTooLarge: contextLimitExceeded,
+    codexLastOutputWasText: entry.codexLastOutputWasText,
+    codexEmptyFinalAction: shouldRetryCodexEmptyFinal ? 'retry' : (codexEmptyFinalFailed ? 'failed' : 'none'),
   });
 
   // Final read
@@ -2968,14 +3021,12 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     entry.tailer.stop();
   }
 
-  const pendingSlash = pendingSlashCommands.get(sessionId) || null;
   if (pendingSlash) pendingSlashCommands.delete(sessionId);
   // P2 护栏解除：一次正常（非 slash 注入）运行完成 = 预防压缩 → 重放 的完整闭环走通，
   // 后续消息可再次按水位触发预防压缩；压缩运行本身不清除（防 compact→重放→再预防死循环）
   else preemptCompactGuard.delete(sessionId);
 
   // Save result to session
-  const session = loadSession(sessionId);
   const retryCodexWithoutResume = !!(
     session
     && entry.agent === 'codex'
@@ -2989,7 +3040,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     saveSession(session);
     completionError = null;
   }
-  if (session && entry.fullText) {
+  if (session && (entry.fullText || shouldRetryCodexEmptyFinal)) {
     const msg = {
       role: 'assistant',
       content: entry.fullText,
@@ -3044,12 +3095,19 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       shouldAutoCompact = true;
     }
 
+    if (shouldRetryCodexEmptyFinal) {
+      wsSend(entry.ws, { type: 'system_message', message: '◎ Codex 已执行工具但没有返回最终回答，正在基于已完成结果自动重试一次。' });
+    } else if (codexEmptyFinalFailed && !entry.errorSent) {
+      entry.errorSent = true;
+      wsSend(entry.ws, { type: 'error', message: 'Codex 执行完工具后仍未返回最终回答；本轮结果可能不完整。请直接发送“请总结以上结果”后重试。' });
+    }
+
     if (completionError && !entry.errorSent && !shouldAutoCompact) {
       entry.errorSent = true;
       wsSend(entry.ws, { type: 'error', message: completionError });
     }
 
-    const willContinue = !!(retryCodexWithoutResume || shouldReturnForFollowup || shouldAutoCompact);
+    const willContinue = !!(retryCodexWithoutResume || shouldReturnForFollowup || shouldAutoCompact || shouldRetryCodexEmptyFinal);
     wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null, willContinue });
     sendSessionList(entry.ws);
     // 同步给其他客户端，避免只有发起的那个标签页知道任务完成
@@ -3057,7 +3115,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     // 必须排在 done 之后：前端要先 finishGenerating 把流式气泡封口成普通 .msg，
     // DOM 里的条数才对得上 previousTotal。紧接着还要再起一轮的（codex 重试 /
     // compact 重放 / goal 续跑）跳过，等那一轮自己收尾时再重排。
-    if (!retryCodexWithoutResume && !shouldReturnForFollowup && !shouldAutoCompact) {
+    if (!retryCodexWithoutResume && !shouldReturnForFollowup && !shouldAutoCompact && !shouldRetryCodexEmptyFinal) {
       resyncNativeHistoryAfterRun(sessionId, entry.ws);
     }
     // Push notification when trigger='always' (user online but still wants notification)
@@ -3088,6 +3146,21 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       agent: 'codex',
     }, { hideInHistory: true, codexResumeFallbackAttempted: true });
     return;
+  }
+
+  if (shouldRetryCodexEmptyFinal && entry.ws && entry.ws.readyState === 1 && session) {
+    handleMessage(entry.ws, {
+      text: CODEX_EMPTY_FINAL_RETRY_PROMPT,
+      sessionId,
+      mode: entry.mode || session.permissionMode || 'yolo',
+      agent: 'codex',
+    }, { hideInHistory: true, codexEmptyFinalRetry: true });
+    return;
+  }
+
+  if (codexEmptyFinalFailed) {
+    markCodexEmptyFinalMessage(sessionId);
+    resyncNativeHistoryAfterRun(sessionId, entry.ws);
   }
 
   if (!shouldReturnForFollowup && !shouldAutoCompact && !contextLimitExceeded && pendingRetry && pendingRetry.text === (entry.fullText || '').trim()) {
@@ -3164,7 +3237,7 @@ function recoverProcesses() {
       const agent = getSessionAgent(session);
 
       if (!fs.existsSync(pidPath)) {
-        try { fs.rmSync(dir, { recursive: true }); } catch {}
+        cleanRunDir(sessionId);
         continue;
       }
 
@@ -3190,27 +3263,59 @@ function recoverProcesses() {
         console.log(`[recovery] Processing completed output for session ${sessionId}`);
         plog('INFO', 'recovery_dead', { sessionId: sessionId.slice(0, 8), pid, agent });
         if (fs.existsSync(outputPath)) {
-          const tempEntry = { pid: 0, ws: null, agent, fullText: '', toolCalls: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null };
-          const content = fs.readFileSync(outputPath, 'utf8');
-          for (const line of content.split('\n')) {
-            if (!line.trim()) continue;
-            try {
-              const event = JSON.parse(line);
-              processRuntimeEvent(tempEntry, event, sessionId);
-            } catch {}
+          const tempEntry = { pid: 0, ws: null, agent, fullText: '', toolCalls: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null, recoveryReplay: true };
+          // A detached Claude process can leave thousands of system events in
+          // output.jsonl. Decode complete lines incrementally so recovery stays
+          // bounded and cannot stall startup before listen().
+          const fd = fs.openSync(outputPath, 'r');
+          let carry = '';
+          const decoder = new StringDecoder('utf8');
+          const chunk = Buffer.alloc(64 * 1024);
+          try {
+            while (true) {
+              const bytes = fs.readSync(fd, chunk, 0, chunk.length, null);
+              if (!bytes) break;
+              const lines = (carry + decoder.write(chunk.subarray(0, bytes))).split('\n');
+              carry = lines.pop() || '';
+              for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                  const event = JSON.parse(line);
+                  processRuntimeEvent(tempEntry, event, sessionId);
+                } catch {}
+              }
+            }
+            carry += decoder.end();
+            if (carry.trim()) {
+              try { processRuntimeEvent(tempEntry, JSON.parse(carry), sessionId); } catch {}
+            }
+          } finally {
+            fs.closeSync(fd);
           }
-          if (session && tempEntry.fullText) {
-            session.messages.push({
-              role: 'assistant',
-              content: tempEntry.fullText,
-              toolCalls: tempEntry.toolCalls || [],
-              timestamp: new Date().toISOString(),
-            });
+          if (session && (tempEntry.fullText || tempEntry.recoveredRuntimeSessionId || tempEntry.lastCost || tempEntry.lastUsage)) {
+            if (tempEntry.fullText) {
+              session.messages.push({
+                role: 'assistant',
+                content: tempEntry.fullText,
+                toolCalls: tempEntry.toolCalls || [],
+                timestamp: new Date().toISOString(),
+              });
+            }
+            const recoveredRuntimeId = tempEntry.recoveredRuntimeSessionId;
+            if (recoveredRuntimeId) setRuntimeSessionId(session, recoveredRuntimeId);
+            if (tempEntry.lastCost) session.totalCost = (session.totalCost || 0) + tempEntry.lastCost;
+            if (tempEntry.lastUsage) {
+              session.totalUsage = {
+                inputTokens: (session.totalUsage?.inputTokens || 0) + (tempEntry.lastUsage.input_tokens || 0),
+                cachedInputTokens: (session.totalUsage?.cachedInputTokens || 0) + (tempEntry.lastUsage.cached_input_tokens || 0),
+                outputTokens: (session.totalUsage?.outputTokens || 0) + (tempEntry.lastUsage.output_tokens || 0),
+              };
+            }
             session.updated = new Date().toISOString();
             saveSession(session);
           }
         }
-        try { fs.rmSync(dir, { recursive: true }); } catch {}
+        cleanRunDir(sessionId);
       }
     }
   } catch (err) {
@@ -4855,7 +4960,7 @@ function handleAbort(ws) {
  */
 function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
-  const { hideInHistory = false } = options;
+  const { hideInHistory = false, codexEmptyFinalRetry = false } = options;
   const textValue = typeof text === 'string' ? text : '';
   const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const normalizedText = textValue.trim();
@@ -5168,6 +5273,8 @@ function handleMessage(ws, msg, options = {}) {
     mode: session.permissionMode || 'yolo',
     codexResumed: !!spawnSpec.resume,
     codexResumeFallbackAttempted: !!options.codexResumeFallbackAttempted,
+    codexEmptyFinalRetry,
+    hideInHistory,
     fullText: '',
     attachments: resolvedAttachments,
     toolCalls: [],

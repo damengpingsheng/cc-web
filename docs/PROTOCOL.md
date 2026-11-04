@@ -6,7 +6,7 @@
 
 ### 客户端 → 服务端
 
-`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 38 个 case = **39 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
+`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 39 个 case = **40 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
 
 | 类型 | 用途 |
 |---|---|
@@ -41,7 +41,7 @@
 
 ### 服务端 → 客户端
 
-`public/app.js` 中 `handleServerMessage` 函数，共 **38 个 case**：
+`public/app.js` 中 `handleServerMessage` 函数，共 **39 个 case**：
 
 | 类型 | 用途 |
 |---|---|
@@ -51,6 +51,7 @@
 | `session_list` | 会话列表。每个会话对象含 `group` 字段（所属分组 id，`''`=未分组） |
 | `group_list` | 分组列表 `[{ id, name }]`。①每个客户端 auth 成功后推一次 ②任何分组增删改名/归组后向**所有已认证连接**广播（随发 `group_list` + `session_list`，多设备同步） |
 | `session_info` | 会话元信息。运行中会话额外附带 `activeOutput`（string，内存实时全量输出，用于断线补齐，见 [RUNTIME.md](./RUNTIME.md#ws-心跳与断线内容补齐)）；任务结束后该键省略 |
+| Session `assistant` message | 正常回复含 `content` / `toolCalls`；`kind: 'codex-empty-final'` 表示 Codex 工具已完成但两次都没有最终文本，前端保留工具记录并显示不完整提示 |
 | `session_history_chunk` | 历史分块（懒加载，详见 [RUNTIME.md](./RUNTIME.md#懒加载历史)） |
 | `resume_generating` | 恢复生成态 |
 | `session_renamed` | 重命名通知。`source: 'manual'` 表示用户命名，`source: 'auto'` 表示每轮完成后的自动整理 |
@@ -60,7 +61,7 @@
 | `text_delta` | 文本流增量（**经 DOMPurify sanitize 后注入 DOM**，详见 [ARCHITECTURE.md](./ARCHITECTURE.md)） |
 | `tool_start` / `tool_end` | 工具调用起止 |
 | `cost` / `usage` | 成本/用量更新 |
-| `done` | 一轮进程结束。`willContinue: true` 表示服务端还会自动重试或续跑，前端不应在该事件后立即发送排队消息 |
+| `done` | 一轮进程结束。`willContinue: true` 表示服务端还会自动重试或续跑（含 Codex 空最终回答的一次恢复），前端不应在该事件后立即发送排队消息 |
 | `background_done` | 后台完成（推送通知触发） |
 | `notify_config` / `notify_test_result` | 通知配置回执 |
 | `password_changed` | 改密通知。成功时返回新 `token`，前端必须用新 token 替换旧 token；改密副作用：**踢掉所有其他已认证 WS 连接**（详见 [CONFIG.md](./CONFIG.md#鉴权与安全)） |
