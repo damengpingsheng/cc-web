@@ -248,6 +248,7 @@ function callSummaryApi(creds, prompt, options = {}) {
         timeout: options.timeoutMs || 20000,
       }, (res) => {
         let data = '';
+        res.setEncoding('utf8');
         res.on('data', c => data += c);
         res.on('end', () => {
           try {

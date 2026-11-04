@@ -1921,7 +1921,11 @@ async function testSessionTitleAudit() {
       setTimeout(() => {
         if (res.destroyed) return;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+        const responseBody = Buffer.from(JSON.stringify({ choices: [{ message: { content } }] }), 'utf8');
+        const splitAt = responseBody.indexOf(Buffer.from('整')) + 1;
+        assert(splitAt > 0, 'Title API mock must find a multi-byte character to split');
+        res.write(responseBody.subarray(0, splitAt));
+        res.end(responseBody.subarray(splitAt));
       }, 20500);
     });
   });
@@ -1986,6 +1990,7 @@ async function testSessionTitleAudit() {
       assert(titleApiRequest?.max_tokens === 4096, `Title API should request 4096 output tokens (got ${titleApiRequest?.max_tokens})`);
       assert(titleApiRequest?.model === 'test-model', `Title API should use configured model (got ${titleApiRequest?.model})`);
       assert(audit.candidates.length === 2, `Audit should find exactly two prompt-derived titles (got ${audit.candidates.length})`);
+      assert(audit.candidates.every((item) => item.suggestion.includes('整理后的标题') && !item.suggestion.includes('\uFFFD')), 'UTF-8 split across HTTP chunks must not corrupt title suggestions');
       assert(!audit.candidates.some((item) => item.id === semanticId), 'Semantic title must not be an audit candidate');
       assert(audit.candidates.find((item) => item.id === activeId)?.active === true, 'Running session must be marked active');
       assert(audit.candidates.find((item) => item.id === inactiveId)?.users.length === 2, 'Audit should expose later user intent as context');
