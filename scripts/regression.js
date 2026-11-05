@@ -59,6 +59,10 @@ const SERVER_PATH = path.join(REPO_DIR, 'server.js');
 const MOCK_CLAUDE = path.join(REPO_DIR, 'scripts', 'mock-claude.js');
 const MOCK_CODEX = path.join(REPO_DIR, 'scripts', 'mock-codex.js');
 const { createAgentRuntime } = require(path.join(REPO_DIR, 'lib', 'agent-runtime.js'));
+const {
+  mergeCodexHistoryByUserTurn,
+  needsCodexToolLayoutMigration,
+} = require(path.join(REPO_DIR, 'lib', 'codex-history-migration.js'));
 
 function mkdirp(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -84,6 +88,95 @@ function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
   }
+}
+
+function testCodexHistoryMigration() {
+  const snapshot = [
+    { role: 'user', content: 'first migration prompt', attachments: [{ id: 'keep-attachment' }] },
+    { role: 'assistant', content: 'first visible answer with a long stable tail', toolCalls: [{ name: 'exec', id: 'old-1' }] },
+    { role: 'user', content: 'second migration prompt' },
+    { role: 'assistant', content: 'old compact streamed answer', toolCalls: [{ name: 'exec', id: 'old-2' }] },
+    { role: 'user', content: 'browser only prompt' },
+    { role: 'assistant', content: 'browser only answer', toolCalls: [] },
+  ];
+  const native = [
+    { role: 'user', content: 'first migration prompt' },
+    {
+      role: 'assistant',
+      content: 'first visible answer with a long stable tail\n\nexpanded native detail',
+      toolCalls: [{ name: 'exec', id: 'native-1', input: 'native one' }],
+      segments: [
+        { type: 'text', content: 'first visible answer with a long stable tail' },
+        { type: 'tools', toolCalls: [{ name: 'exec', id: 'native-1', input: 'native one' }] },
+        { type: 'text', content: 'expanded native detail' },
+      ],
+    },
+    { role: 'user', content: 'second migration prompt' },
+    {
+      role: 'assistant',
+      content: 'old compact streamed answer',
+      toolCalls: [{ name: 'exec', id: 'native-2', input: 'native two' }],
+      segments: [
+        { type: 'text', content: 'old compact streamed answer' },
+        { type: 'tools', toolCalls: [{ name: 'exec', id: 'native-2', input: 'native two' }] },
+      ],
+    },
+    { role: 'user', content: 'native only prompt' },
+    { role: 'assistant', content: 'native only answer', toolCalls: [], segments: [{ type: 'text', content: 'native only answer' }] },
+  ];
+
+  assert(needsCodexToolLayoutMigration(snapshot, native), 'Codex legacy snapshot should migrate when user turns and text anchors agree');
+  const merged = mergeCodexHistoryByUserTurn(snapshot, native);
+  assert(merged.length === 8, `Codex migration should replace matched turns and retain unmatched turns (got ${merged.length})`);
+  assert(merged[0] === snapshot[0], 'Codex migration must preserve cc-web-only user fields');
+  assert(merged[1].segments?.map((segment) => segment.type).join(',') === 'text,tools,text', 'First matched assistant turn must adopt native ordered segments');
+  assert(merged[3].segments?.map((segment) => segment.type).join(',') === 'text,tools', 'Second matched assistant turn must adopt native ordered segments');
+  assert(merged[4].content === 'native only prompt', 'Codex migration must retain native-only terminal turns');
+  assert(merged[4].segments === undefined, 'Unmatched native user turns must not receive fabricated segments');
+  assert(merged[6].content === 'browser only prompt' && merged[7].content === 'browser only answer', 'Codex migration must retain cc-web-only turns');
+
+  const unrelated = [
+    { role: 'user', content: 'first migration prompt' },
+    { role: 'assistant', content: 'completely unrelated native response', toolCalls: [], segments: [{ type: 'text', content: 'completely unrelated native response' }] },
+    { role: 'user', content: 'native only prompt' },
+    { role: 'assistant', content: 'native only answer', toolCalls: [], segments: [{ type: 'text', content: 'native only answer' }] },
+  ];
+  assert(!needsCodexToolLayoutMigration(snapshot, unrelated), 'Codex migration must reject unanchored assistant text');
+
+  const shorterUnrelated = [
+    { role: 'user', content: 'different first prompt' },
+    { role: 'assistant', content: 'first visible answer with a long stable tail', toolCalls: [], segments: [{ type: 'text', content: 'first visible answer with a long stable tail' }] },
+  ];
+  assert(!needsCodexToolLayoutMigration(snapshot, shorterUnrelated), 'Shorter unrelated rollout must not truncate cc-web history');
+
+  const trailingSnapshot = [
+    { role: 'user', content: 'trailing migration prompt' },
+    { role: 'assistant', content: 'trailing stable answer', toolCalls: [] },
+    { role: 'user', content: 'new turn already persisted by cc-web' },
+    { role: 'assistant', content: 'new turn answer still absent from rollout', toolCalls: [] },
+  ];
+  const trailingNative = [
+    { role: 'user', content: 'trailing migration prompt' },
+    { role: 'assistant', content: 'trailing stable answer', toolCalls: [], segments: [{ type: 'text', content: 'trailing stable answer' }] },
+    { role: 'user', content: 'new turn already persisted by cc-web' },
+  ];
+  assert(needsCodexToolLayoutMigration(trailingSnapshot, trailingNative), 'Codex migration should handle a rollout lagging one completed cc-web turn');
+  const trailingMerged = mergeCodexHistoryByUserTurn(trailingSnapshot, trailingNative);
+  assert(trailingMerged.length === 4 && trailingMerged[3].content === 'new turn answer still absent from rollout', 'Trailing native lag must preserve the completed cc-web answer');
+
+  const localBoundarySnapshot = [
+    { role: 'user', content: 'local boundary prompt' },
+    { role: 'assistant', content: 'same short reply', toolCalls: [] },
+    { role: 'system', kind: 'compact', content: 'local boundary notice' },
+  ];
+  const localBoundaryNative = [
+    { role: 'user', content: 'local boundary prompt' },
+    { role: 'assistant', content: 'same short reply', toolCalls: [], segments: [{ type: 'text', content: 'same short reply' }] },
+  ];
+  const localBoundaryMerged = mergeCodexHistoryByUserTurn(localBoundarySnapshot, localBoundaryNative);
+  assert(localBoundaryMerged[1].segments?.[0]?.content === 'same short reply', 'Exact short assistant replies should migrate');
+  assert(localBoundaryMerged.some((message) => message.content === 'local boundary notice'), 'Codex migration must retain local system messages inside a turn');
+  console.log('Codex history migration checks passed.');
 }
 
 function sql(dbPath, statement) {
@@ -467,15 +560,58 @@ async function testRecoveryReplayRuntime() {
   assert(entry.fullText === 'recovered answer', 'Recovery must collect the final assistant text in memory');
   assert(entry.lastCost === 1.5, 'Recovery must collect final cost without persisting per event');
 
+  const segmentEntry = { agent: 'claude', ws: null, fullText: '', toolCalls: [], segments: [], lastError: null, recoveryReplay: true };
+  runtime.processClaudeEvent(segmentEntry, {
+    type: 'assistant', message: { content: [{ type: 'text', text: 'Text A' }] },
+  }, 'session');
+  runtime.processClaudeEvent(segmentEntry, {
+    type: 'assistant', message: { content: [
+      { type: 'tool_use', id: 'segment-tool-1', name: 'Bash', input: { command: 'printf 1' } },
+      { type: 'tool_use', id: 'segment-tool-2', name: 'Bash', input: { command: 'printf 2' } },
+    ] },
+  }, 'session');
+  runtime.processClaudeEvent(segmentEntry, {
+    type: 'assistant', message: { content: [{ type: 'text', text: 'Text B' }] },
+  }, 'session');
+  runtime.processClaudeEvent(segmentEntry, {
+    type: 'assistant', message: { content: [
+      { type: 'tool_use', id: 'segment-tool-3', name: 'Bash', input: { command: 'printf 3' } },
+    ] },
+  }, 'session');
+  assert(segmentEntry.segments.map((segment) => segment.type).join(',') === 'text,tools,text,tools', 'Runtime must split tools at every text boundary');
+  assert(segmentEntry.segments[1].toolCalls.map((tool) => tool.id).join(',') === 'segment-tool-1,segment-tool-2', 'Adjacent runtime tools must share one segment');
+  assert(segmentEntry.segments[3].toolCalls.map((tool) => tool.id).join(',') === 'segment-tool-3', 'Runtime tool after text must stay in a later segment');
+
   const codexEntry = { agent: 'codex', ws: null, fullText: '', toolCalls: [], lastError: null, recoveryReplay: true };
   runtime.processCodexEvent(codexEntry, { type: 'thread.started', thread_id: 'recovered-codex-id' }, 'session');
   runtime.processCodexEvent(codexEntry, { type: 'turn.completed', usage: { input_tokens: 4, output_tokens: 2 } }, 'session');
   assert(codexEntry.recoveredRuntimeSessionId === 'recovered-codex-id', 'Recovery must collect the Codex thread ID in memory');
   assert(codexEntry.lastUsage?.input_tokens === 4, 'Recovery must retain usage for one final session write');
+
+  const codexSegmentEntry = { agent: 'codex', ws: null, fullText: '', toolCalls: [], segments: [], lastError: null, recoveryReplay: true };
+  runtime.processCodexEvent(codexSegmentEntry, {
+    type: 'item.completed', item: { id: 'segment-message-1', type: 'agent_message', text: 'Text A' },
+  }, 'session');
+  runtime.processCodexEvent(codexSegmentEntry, {
+    type: 'item.completed', item: { id: 'segment-codex-1', type: 'command_execution', command: 'printf 1', status: 'completed' },
+  }, 'session');
+  runtime.processCodexEvent(codexSegmentEntry, {
+    type: 'item.completed', item: { id: 'segment-codex-2', type: 'command_execution', command: 'printf 2', status: 'completed' },
+  }, 'session');
+  runtime.processCodexEvent(codexSegmentEntry, {
+    type: 'item.completed', item: { id: 'segment-message-2', type: 'agent_message', text: 'Text B' },
+  }, 'session');
+  runtime.processCodexEvent(codexSegmentEntry, {
+    type: 'item.completed', item: { id: 'segment-codex-3', type: 'command_execution', command: 'printf 3', status: 'completed' },
+  }, 'session');
+  assert(codexSegmentEntry.segments.map((segment) => segment.type).join(',') === 'text,tools,text,tools', 'Codex runtime must split tools at every text boundary');
+  assert(codexSegmentEntry.segments[1].toolCalls.map((tool) => tool.id).join(',') === 'segment-codex-1,segment-codex-2', 'Adjacent Codex runtime tools must share one segment');
+  assert(codexSegmentEntry.segments[3].toolCalls.map((tool) => tool.id).join(',') === 'segment-codex-3', 'Codex runtime tool after text must stay in a later segment');
   console.log('Recovery replay runtime checks passed.');
 }
 
 async function main() {
+  testCodexHistoryMigration();
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
   const sessionsDir = path.join(tempRoot, 'sessions');
@@ -940,11 +1076,59 @@ async function main() {
         timestamp: '2026-03-12T00:00:05.000Z',
         message: { content: [{ type: 'text', text: 'Claude live answer' }] },
       }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-03-12T00:00:06.000Z',
+        message: { content: [{ type: 'tool_use', id: 'live-tool-1', name: 'Bash', input: { command: 'printf 1' } }] },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-03-12T00:00:07.000Z',
+        message: { content: [{ type: 'tool_use', id: 'live-tool-2', name: 'Bash', input: { command: 'printf 2' } }] },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-03-12T00:00:08.000Z',
+        message: { content: [{ type: 'text', text: 'After tools' }] },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-03-12T00:00:09.000Z',
+        message: { content: [{ type: 'tool_use', id: 'live-tool-3', name: 'Bash', input: { command: 'printf 3' } }] },
+      }),
     ].join('\n') + '\n');
     const claudeLiveUpdate = await nextMessage(messages, ws, (msg) => (
-      msg.type === 'imported_messages_appended' && msg.sessionId === importedClaude.sessionId
+      (msg.type === 'imported_messages_appended' || msg.type === 'imported_messages_replaced')
+      && msg.sessionId === importedClaude.sessionId
     ));
-    assert(claudeLiveUpdate.messages?.map((item) => item.content).join('|') === 'Claude live prompt|Claude live answer', 'Claude imported session did not sync appended messages');
+    if (claudeLiveUpdate.type === 'imported_messages_appended') {
+      const syncedClaude = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${importedClaude.sessionId}.json`), 'utf8'));
+      const start = syncedClaude.messages.findIndex((item) => item.content === 'Claude live prompt');
+      const liveMessages = start >= 0 ? syncedClaude.messages.slice(start) : claudeLiveUpdate.messages;
+      assert(liveMessages.map((item) => item.content).join('|') === 'Claude live prompt|Claude live answer\n\nAfter tools', 'Claude imported session did not sync appended messages');
+    } else {
+      const syncedClaude = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${importedClaude.sessionId}.json`), 'utf8'));
+      const start = syncedClaude.messages.findIndex((item) => item.content === 'Claude live prompt');
+      assert(syncedClaude.messages.slice(start).map((item) => item.content).join('|') === 'Claude live prompt|Claude live answer\n\nAfter tools', 'Claude replacement sync lost the text/tool sequence');
+    }
+    const syncedClaude = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${importedClaude.sessionId}.json`), 'utf8'));
+    const liveStart = syncedClaude.messages.findIndex((item) => item.content === 'Claude live prompt');
+    const liveAssistant = syncedClaude.messages.slice(liveStart).find((item) => item.role === 'assistant');
+    const liveSegments = liveAssistant?.segments || [];
+    assert(liveSegments.map((segment) => segment.type).join(',') === 'text,tools,text,tools', 'Claude sync must preserve text/tool/text/tool segments');
+    assert(liveSegments[0].content === 'Claude live answer', 'Claude first text segment changed');
+    assert(liveSegments[1].toolCalls.map((tool) => tool.id).join(',') === 'live-tool-1,live-tool-2', 'Adjacent Claude tools must share one segment in tool order');
+    assert(liveSegments[2].content === 'After tools', 'Claude second text segment changed');
+    assert(liveSegments[3].toolCalls.map((tool) => tool.id).join(',') === 'live-tool-3', 'A tool after text must stay in a later segment');
+    assert(liveSegments.filter((segment) => segment.type === 'text').map((segment) => segment.content).join('\n\n') === liveAssistant.content, 'Claude segment text must match the visible assistant content');
+
+    // Two adjacent tools fold in their own segment; one later tool stays visible.
+    // Text is a hard boundary, so the tool after it cannot join the first group.
+    const appSource = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+    assert(/const TOOL_FOLD_AT = 2;/.test(appSource), 'Tool fold threshold must be 2');
+    assert(appSource.includes('streamingSegments') && !appSource.includes('streamingToolCards'), 'Live rendering must use ordered text/tool segments');
+    assert(!appSource.includes('const FOLD_AT = 3'), 'Legacy per-card fold threshold must not remain');
+    assert(!appSource.includes('insertBefore(toolsDiv, bubble.firstChild)'), 'Tool groups must not be moved ahead of all assistant text');
 
     // P2 行为级：预防性水位压缩。导入一个 transcript 带高水位 usage（200k tokens ≥ 200k
     // 窗口 × 80%）的会话，再发消息：期望 通知 → /compact 运行（含 P1 boundary 透传）→
@@ -1034,6 +1218,45 @@ async function main() {
         payload: { type: 'function_call_output', call_id: 'call-live', output: 'live' },
       }),
       JSON.stringify({
+        timestamp: '2026-03-12T00:00:08.500Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'shell_command',
+          call_id: 'call-live-2',
+          arguments: JSON.stringify({ command: 'printf live2' }),
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:08.600Z',
+        type: 'response_item',
+        payload: { type: 'function_call_output', call_id: 'call-live-2', output: 'live2' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:08.700Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Codex after tools' }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:08.800Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'shell_command',
+          call_id: 'call-live-3',
+          arguments: JSON.stringify({ command: 'printf live3' }),
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-12T00:00:08.900Z',
+        type: 'response_item',
+        payload: { type: 'function_call_output', call_id: 'call-live-3', output: 'live3' },
+      }),
+      JSON.stringify({
         timestamp: '2026-03-12T00:00:09.000Z',
         type: 'event_msg',
         payload: {
@@ -1052,6 +1275,14 @@ async function main() {
     const syncedCodexSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${importedCodex.sessionId}.json`), 'utf8'));
     assert(syncedCodexSession.messages?.length === 4, 'Codex synchronized snapshot has the wrong message count');
     assert(syncedCodexSession.totalUsage?.outputTokens === 20, 'Codex synchronized snapshot did not persist usage');
+    const liveCodexAssistant = syncedCodexSession.messages.find((item) => item.role === 'assistant' && item.content?.startsWith('Codex live answer'));
+    const codexSegments = liveCodexAssistant?.segments || [];
+    assert(codexSegments.map((segment) => segment.type).join(',') === 'text,tools,text,tools', 'Codex sync must preserve text/tool/text/tool segments');
+    assert(codexSegments[0].content === 'Codex live answer', 'Codex first text segment changed');
+    assert(codexSegments[1].toolCalls.map((tool) => tool.id).join(',') === 'call-live,call-live-2', 'Adjacent Codex tools must share one segment in tool order');
+    assert(codexSegments[2].content === 'Codex after tools', 'Codex second text segment changed');
+    assert(codexSegments[3].toolCalls.map((tool) => tool.id).join(',') === 'call-live-3', 'A Codex tool after text must stay in a later segment');
+    assert(codexSegments.filter((segment) => segment.type === 'text').map((segment) => segment.content).join('\n\n') === liveCodexAssistant.content, 'Codex segment text must match the visible assistant content');
 
     // Codex custom tool calls are persisted with custom_tool_call records.
     fs.appendFileSync(codexFixture.rolloutPath, [

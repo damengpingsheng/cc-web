@@ -35,6 +35,10 @@ const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('./lib/c
 const { createAuthStore } = require('./lib/auth');
 const { createCodexRolloutStore, CODEX_EMPTY_FINAL_RETRY_MARKER } = require('./lib/codex-rollouts');
 const { createClientIpResolver } = require('./lib/client-ip');
+const {
+  mergeCodexHistoryByUserTurn,
+  needsCodexToolLayoutMigration,
+} = require('./lib/codex-history-migration');
 
 // Load .env
 const envPath = path.join(__dirname, '.env');
@@ -1715,6 +1719,78 @@ function splitHistoryMessages(messages) {
   return { recentMessages, olderChunks };
 }
 
+function appendAssistantSegment(segments, segment) {
+  if (!segment) return;
+  const previous = segments[segments.length - 1];
+  if (segment.type === 'tools') {
+    const toolCalls = Array.isArray(segment.toolCalls) ? segment.toolCalls : [];
+    if (toolCalls.length === 0) return;
+    if (previous?.type === 'tools') {
+      previous.toolCalls.push(...toolCalls);
+    } else {
+      segments.push({ type: 'tools', toolCalls: [...toolCalls] });
+    }
+    return;
+  }
+  const content = String(segment.content || '');
+  if (!content.trim()) return;
+  if (previous?.type === 'text') previous.content += content;
+  else segments.push({ type: 'text', content });
+}
+
+function collectMessageSegments(message) {
+  if (Array.isArray(message?.segments) && message.segments.length > 0) return message.segments;
+  const segments = [];
+  appendAssistantSegment(segments, { type: 'text', content: message?.content || '' });
+  appendAssistantSegment(segments, { type: 'tools', toolCalls: message?.toolCalls || [] });
+  return segments;
+}
+
+// Keep one assistant container per user turn, but preserve text/tool boundaries.
+// Adjacent tool entries become one segment; any text segment closes that group.
+function mergeAssistantSegmentsByTurn(messages) {
+  const merged = [];
+  let turn = null;
+  const flushTurn = () => {
+    if (!turn) return;
+    const segments = [];
+    const toolCalls = [];
+    for (const message of turn) {
+      for (const segment of collectMessageSegments(message)) {
+        if (segment.type === 'text' && segments[segments.length - 1]?.type === 'text') {
+          appendAssistantSegment(segments, { type: 'text', content: `\n\n${segment.content}` });
+        } else {
+          appendAssistantSegment(segments, segment);
+        }
+      }
+      toolCalls.push(...(message.toolCalls || []));
+    }
+    const texts = segments
+      .filter((segment) => segment.type === 'text')
+      .map((segment) => segment.content);
+    merged.push({
+      role: 'assistant',
+      content: texts.join('\n\n'),
+      toolCalls,
+      timestamp: turn[0]?.timestamp || null,
+      segments,
+    });
+    turn = null;
+  };
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role === 'assistant') {
+      if (!turn) turn = [];
+      turn.push(message);
+      continue;
+    }
+    // Text, user messages and system summaries are hard segment boundaries.
+    flushTurn();
+    merged.push(message);
+  }
+  flushTurn();
+  return merged;
+}
+
 const IS_WIN = process.platform === 'win32';
 
 function isProcessRunning(pid) {
@@ -2556,7 +2632,7 @@ function parseImportedSessionSource(source) {
   let content;
   try { content = fs.readFileSync(source.filePath, 'utf8'); } catch { return null; }
   return {
-    messages: parseJsonlToMessages(content.split('\n')),
+    messages: mergeAssistantSegmentsByTurn(parseJsonlToMessages(content.split('\n'))),
     totalUsage: null,
     meta: { cwd: source.cwd, updatedAt: null },
   };
@@ -2584,6 +2660,41 @@ function firstChangedMessageIndex(previous, next) {
   return previous.length === next.length ? -1 : commonLength;
 }
 
+// A native sync may regroup assistant messages without changing the visible
+// conversation. Compare the ordered non-assistant entries, assistant text and
+// tool IDs as prefixes so old snapshots can adopt the segmented layout while a
+// shorter, unrelated rollout still cannot truncate cc-web-only history.
+function isClaudeToolLayoutMigration(previous, next) {
+  if (!Array.isArray(previous) || !Array.isArray(next) || previous.length === 0) return false;
+  const normalizedText = (value) => String(value || '').replace(/\s+/g, '').trim();
+  const boundaries = (messages) => (messages || []).filter((message) => message?.role !== 'assistant').map((message) => ({
+    role: message?.role || '',
+    kind: message?.kind || '',
+    content: normalizedText(message?.content),
+    localCommand: message?.localCommand || null,
+  }));
+  const assistantText = (messages) => normalizedText((messages || [])
+    .filter((message) => message?.role === 'assistant')
+    .map((message) => (message.segments || []).length > 0
+      ? message.segments.filter((segment) => segment.type === 'text').map((segment) => segment.content || '').join('')
+      : message.content || '')
+    .join(''));
+  const toolIds = (messages) => (messages || [])
+    .filter((message) => message?.role === 'assistant')
+    .flatMap((message) => (message.toolCalls || []).map((tool) => tool?.id || ''));
+  const isPrefix = (oldItems, newItems) => oldItems.length <= newItems.length
+    && oldItems.every((item, index) => JSON.stringify(item) === JSON.stringify(newItems[index]));
+
+  const oldText = assistantText(previous);
+  const newText = assistantText(next);
+  const oldTools = toolIds(previous);
+  const newTools = toolIds(next);
+  if (!oldText && oldTools.length === 0) return false;
+  return isPrefix(boundaries(previous), boundaries(next))
+    && newText.startsWith(oldText)
+    && isPrefix(oldTools, newTools);
+}
+
 function syncImportedSession(sessionId, { diffChanged = false } = {}) {
   const session = loadSession(sessionId);
   const source = resolveImportedSessionSource(session);
@@ -2604,10 +2715,32 @@ function syncImportedSession(sessionId, { diffChanged = false } = {}) {
   }
 
   let fromIndex = -1;
+  const exactNativePrefix = next.length >= previousTotal
+    && previous.every((message, index) => JSON.stringify(message) === JSON.stringify(next[index]));
+  const claudeToolLayoutMigration = source.agent === 'claude'
+    && isClaudeToolLayoutMigration(previous, next);
+  const codexToolLayoutMigration = source.agent === 'codex'
+    && needsCodexToolLayoutMigration(previous, next);
+  let messagesToSave = next;
+  if (codexToolLayoutMigration) {
+    messagesToSave = mergeCodexHistoryByUserTurn(previous, next);
+    fromIndex = 0;
+  }
   if (source.agent === 'claude' && !diffChanged) {
     // Claude history is append-only in the existing sync contract.
-    if (next.length > previousTotal) fromIndex = previousTotal;
-  } else if (next.length >= previousTotal) {
+    if (claudeToolLayoutMigration && exactNativePrefix) {
+      if (next.length > previousTotal) fromIndex = previousTotal;
+    } else if (claudeToolLayoutMigration) {
+      // Only container/segment boundaries changed: rebuild the visible history
+      // from the first message instead of treating it as an unsafe stale rollout.
+      fromIndex = 0;
+    }
+    else if (next.length > previousTotal) fromIndex = previousTotal;
+  } else if (codexToolLayoutMigration) {
+    // Codex 历史可能因分段重建或压缩而少于旧快照；逐轮匹配后只替换能确认
+    // 属于同一用户输入的助手轮次，cc-web-only 轮次和尾部消息继续保留。
+    fromIndex = 0;
+  } else if (next.length >= previousTotal || claudeToolLayoutMigration) {
     // Codex 会在不增加条数的情况下更新当前 assistant/工具消息，故同长度也需 diff；
     // claude 带 diffChanged 时（刚落盘过合并版轮次，快照已不是原生历史的前缀）同理。
     // 但当解析出的原生历史比已落盘的更短时（例如浏览器下发的轮次经隔离 CODEX_HOME
@@ -2623,16 +2756,17 @@ function syncImportedSession(sessionId, { diffChanged = false } = {}) {
   const usageChanged = !usageTotalsEqual(previousUsage, nextUsage);
   if (fromIndex < 0 && !usageChanged) return { session, change: null };
 
-  if (fromIndex >= 0) session.messages = next;
+  if (fromIndex >= 0) session.messages = messagesToSave;
   if (source.agent === 'codex') session.totalUsage = nextUsage;
   if (!session.cwd && (parsed.meta?.cwd || source.cwd)) session.cwd = parsed.meta?.cwd || source.cwd;
   if (!session.importedFrom && source.projectDir) session.importedFrom = source.projectDir;
   session.updated = parsed.meta?.updatedAt || new Date().toISOString();
   saveSession(session);
 
-  const effectiveFromIndex = fromIndex >= 0 ? fromIndex : next.length;
-  const changedMessages = fromIndex >= 0 ? next.slice(fromIndex) : [];
-  const added = Math.max(0, next.length - previousTotal);
+  const effectiveMessageCount = messagesToSave.length;
+  const effectiveFromIndex = fromIndex >= 0 ? fromIndex : effectiveMessageCount;
+  const changedMessages = fromIndex >= 0 ? messagesToSave.slice(fromIndex) : [];
+  const added = Math.max(0, effectiveMessageCount - previousTotal);
 
   plog('INFO', 'imported_session_synced', {
     sessionId: sessionId.slice(0, 8),
@@ -2642,6 +2776,8 @@ function syncImportedSession(sessionId, { diffChanged = false } = {}) {
     fromIndex: effectiveFromIndex,
     added,
     usageChanged,
+    claudeToolLayoutMigration,
+    codexToolLayoutMigration,
   });
 
   return {
@@ -2679,9 +2815,8 @@ function sendImportedSessionChange(client, sessionId, synced, change) {
 }
 
 // 一轮跑完后把气泡重排回原生历史里的真实顺序。
-// 流式通道的气泡只有 .msg-text / .msg-tools 两个固定容器，整轮文本必然拼成一段、
-// 工具卡片必然堆在末尾；而 Claude 原生 jsonl 把每个 text / tool_use 各写成一条独立
-// assistant 条目，交替顺序只有过一遍 parseJsonlToMessages 才还原得出来。运行期间
+// 实时通道已按 text/tools 段保存原生事件顺序；Claude 原生 jsonl 还会把同一段文本和
+// 工具拆成独立 assistant 条目，合并边界与工具完成状态仍以解析结果为准。运行期间
 // startImportedSync 的 onChange 被 activeProcesses 挡掉，收尾后又没人补一次，
 // 于是这个顺序只能靠手动刷新页面才回得来。
 function resyncNativeHistoryAfterRun(sessionId, ws) {
@@ -3053,6 +3188,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       role: 'assistant',
       content: entry.fullText,
       toolCalls: entry.toolCalls || [],
+      segments: entry.segments || [],
       timestamp: new Date().toISOString(),
     };
     if (entry.fullTextTruncated) msg.truncated = true;
@@ -4735,6 +4871,7 @@ function handleLoadSession(ws, sessionId) {
       sessionId,
       text: entry.fullText || '',
       toolCalls: entry.toolCalls || [],
+      segments: entry.segments || [],
     });
   }
 
@@ -5305,6 +5442,7 @@ function handleMessage(ws, msg, options = {}) {
     fullText: '',
     attachments: resolvedAttachments,
     toolCalls: [],
+    segments: [],
     lastCost: null,
     lastUsage: null,
     lastError: null,
@@ -5774,16 +5912,20 @@ function parseJsonlToMessages(lines) {
       if (!Array.isArray(blocks)) continue;
       let content = '';
       const toolCalls = [];
+      const segments = [];
       for (const b of blocks) {
         if (b.type === 'text' && b.text) {
           content += b.text;
+          appendAssistantSegment(segments, { type: 'text', content: b.text });
         } else if (b.type === 'tool_use') {
-          toolCalls.push({ name: b.name, id: b.id, input: b.input, done: true });
+          const toolCall = { name: b.name, id: b.id, input: b.input, done: true };
+          toolCalls.push(toolCall);
+          appendAssistantSegment(segments, { type: 'tools', toolCalls: [toolCall] });
         }
         // skip thinking blocks
       }
       if (content.trim() || toolCalls.length > 0) {
-        messages.push({ role: 'assistant', content, toolCalls, timestamp: entry.timestamp || null });
+        messages.push({ role: 'assistant', content, toolCalls, segments, timestamp: entry.timestamp || null });
       }
     }
     // skip other types
@@ -5892,7 +6034,7 @@ function handleImportNativeSession(ws, msg) {
     return wsSend(ws, { type: 'error', message: '无法读取会话文件' });
   }
   const lines = content.split('\n');
-  const messages = parseJsonlToMessages(lines);
+  const messages = mergeAssistantSegmentsByTurn(parseJsonlToMessages(lines));
 
   // Find or create cc-web session with this claudeSessionId
   let existingSession = null;

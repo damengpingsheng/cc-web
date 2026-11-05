@@ -135,8 +135,8 @@
   let renderPendingResize = false;  // 拖会话列宽度期间被跳过的流式渲染，松手时补一次
   let scrollBottomRaf = 0;          // scrollToBottom 的 rAF 去重句柄
   let activeToolCalls = new Map();
-  let toolGroupCount = 0;   // 当前 .msg-tools 直接子节点数（含已有父目录）
-  let hasGrouped = false;  // 本次输出是否已触发过折叠
+  let streamingSegments = [];
+  const TOOL_FOLD_AT = 2;
   let pendingBackgroundTasks = [];  // 本轮出现过的 run_in_background 调用（收尾时补状态条）
   let cmdMenuIndex = -1;
   let currentMode = 'yolo';
@@ -2912,7 +2912,7 @@
 
       case 'text_delta':
         if (!isGenerating || !document.getElementById('streaming-msg')) startGenerating();
-        pendingText += msg.text;
+        appendStreamingText(msg.text);
         scheduleRender();
         break;
 
@@ -3034,17 +3034,43 @@
         } else {
           sendBtn.hidden = true;
           abortBtn.hidden = false;
-          toolGroupCount = 0;
-          hasGrouped = false;
           activeToolCalls.clear();
-          const toolsDiv = document.querySelector('#streaming-msg .msg-tools');
-          if (toolsDiv) toolsDiv.innerHTML = '';
+          const bubble = document.querySelector('#streaming-msg .msg-bubble');
+          if (bubble) {
+            bubble.textContent = '';
+            ensureTypingIndicator(bubble);
+          }
+          streamingSegments = [];
         }
         syncComposerAction();
-        pendingText = msg.text || '';
-        flushRender();
-        if (msg.toolCalls && msg.toolCalls.length > 0) {
-          for (const tc of msg.toolCalls) {
+        pendingText = '';
+        streamingSegments = [];
+        if (Array.isArray(msg.segments) && msg.segments.length > 0) {
+          msg.segments.forEach((segment) => {
+            if (segment.type === 'text') {
+              appendStreamingText(segment.content || '');
+              return;
+            }
+            for (const tc of segment.toolCalls || []) {
+              activeToolCalls.set(tc.id, {
+                name: tc.name,
+                input: tc.input,
+                result: tc.result,
+                kind: tc.kind || null,
+                meta: tc.meta || null,
+                done: tc.done,
+              });
+              appendToolCall(tc.id, tc.name, tc.input, tc.done, tc.kind || null, tc.meta || null);
+              rememberBackgroundTask(tc.id, tc.name, tc.input);
+              attachBackgroundTaskId(tc.id, tc.result);
+              if (tc.done && tc.result) updateToolCall(tc.id, tc.result);
+            }
+          });
+        } else {
+          appendStreamingText(msg.text || '');
+          // Without segments, the legacy snapshot only tells us that text came
+          // before tools. Keep that order; never move the group ahead of text.
+          for (const tc of (msg.toolCalls || [])) {
             activeToolCalls.set(tc.id, {
               name: tc.name,
               input: tc.input,
@@ -3061,6 +3087,7 @@
             }
           }
         }
+        flushRender();
         break;
 
       case 'claude_recovery_required':
@@ -3200,8 +3227,7 @@
     setCurrentSessionRunningState(true);
     pendingText = '';
     activeToolCalls.clear();
-    toolGroupCount = 0;
-    hasGrouped = false;
+    streamingSegments = [];
     pendingBackgroundTasks = [];
     sendBtn.hidden = true;
     abortBtn.hidden = false;
@@ -3214,15 +3240,9 @@
     // finishGenerating 再按落盘时刻校准一次
     const msgEl = createMsgElement('assistant', '', [], Date.now());
     msgEl.id = 'streaming-msg';
-    // 流式消息 bubble 拆为 .msg-text 和 .msg-tools 两个子容器
+    // 实时气泡按原生事件顺序追加 `文本 → 工具段 → 文本`。
     const bubble = msgEl.querySelector('.msg-bubble');
     bubble.innerHTML = '';
-    const textDiv = document.createElement('div');
-    textDiv.className = 'msg-text';
-    const toolsDiv = document.createElement('div');
-    toolsDiv.className = 'msg-tools';
-    bubble.appendChild(textDiv);
-    bubble.appendChild(toolsDiv);
     ensureTypingIndicator(bubble);
     virtAttachStream(msgEl);
     scrollToBottom();
@@ -3240,6 +3260,29 @@
     bubble.appendChild(dots);
   }
 
+  function insertBeforeTypingIndicator(bubble, el) {
+    const typing = bubble?.querySelector(':scope > .typing-indicator');
+    bubble.insertBefore(el, typing || null);
+  }
+
+  function appendStreamingText(text) {
+    if (!text) return;
+    const streamEl = document.getElementById('streaming-msg');
+    const bubble = streamEl?.querySelector('.msg-bubble');
+    if (!bubble) return;
+    let segment = streamingSegments[streamingSegments.length - 1];
+    if (segment?.type !== 'text') {
+      const textDiv = document.createElement('div');
+      textDiv.className = 'msg-text';
+      insertBeforeTypingIndicator(bubble, textDiv);
+      segment = { type: 'text', el: textDiv, content: '' };
+      streamingSegments.push(segment);
+    }
+    segment.content += text;
+    segment.dirty = true;
+    pendingText = segment.content;
+  }
+
   function finishGenerating(sessionId) {
     isGenerating = false;
     sendBtn.hidden = false;
@@ -3255,35 +3298,6 @@
 
     const streamEl = document.getElementById('streaming-msg');
     if (streamEl) {
-      // 若本轮出现过父目录，把末尾散落的 .tool-call 也一并收入同一父节点
-      if (hasGrouped) {
-        const toolsDiv = streamEl.querySelector('.msg-tools');
-        if (toolsDiv) {
-          const loose = Array.from(toolsDiv.children).filter(c => c.classList.contains('tool-call'));
-          if (loose.length > 0) {
-            let group = toolsDiv.querySelector(':scope > .tool-group');
-            if (!group) {
-              group = document.createElement('details');
-              group.className = 'tool-group';
-              const gs = document.createElement('summary');
-              gs.className = 'tool-group-summary';
-              group.appendChild(gs);
-              const inner = document.createElement('div');
-              inner.className = 'tool-group-inner';
-              group.appendChild(inner);
-              toolsDiv.insertBefore(group, toolsDiv.firstChild);
-            }
-            const inner = group.querySelector('.tool-group-inner');
-            loose.forEach(c => inner.appendChild(c));
-            _refreshGroupSummary(group);
-          }
-          // 折叠成组后把工具容器提到文本前面：历史重建（buildMsgElement）走的是
-          // bubble.insertBefore(group, bubble.firstChild)，这里不对齐的话刷新一次
-          // 工具组就会从气泡下方跳到上方。
-          const bubble = toolsDiv.parentNode;
-          if (bubble && bubble.firstChild !== toolsDiv) bubble.insertBefore(toolsDiv, bubble.firstChild);
-        }
-      }
       // 服务端是在进程收尾时给这条 assistant 消息打 timestamp 的，
       // 这里同步校准，刷新页面后气泡上的时间不会往前跳
       const time = streamEl.querySelector(':scope > .msg-time');
@@ -3298,8 +3312,6 @@
     if (sessionId) currentSessionId = sessionId;
     pendingText = '';
     activeToolCalls.clear();
-    toolGroupCount = 0;
-    hasGrouped = false;
     pendingBackgroundTasks = [];
     // /goal: process exited, mark goal inactive (B+); done is authoritative — clear optimism too
     const goalSid = sessionId || currentSessionId;
@@ -3337,17 +3349,15 @@
     if (!streamEl) return;
     const bubble = streamEl.querySelector('.msg-bubble');
     if (!bubble) return;
-    let textDiv = bubble.querySelector('.msg-text');
-    if (!textDiv) { textDiv = bubble; }
-    if (pendingText) {
-      renderStreamingText(textDiv, pendingText);
-    } else {
-      // 空文本走 renderMarkdown 会再吐一个 typing-indicator 到 .msg-text 里，
-      // 和气泡末尾那个撞成两串点（resume_generating 带空 text 时就会踩到）。
-      textDiv.innerHTML = '';
-      textDiv._ccStream = null;
+    for (const segment of streamingSegments) {
+      if (segment.type !== 'text' || !segment.dirty) continue;
+      renderStreamingText(segment.el, segment.content);
+      segment.dirty = false;
     }
-    streamEl._ccRawText = pendingText || '';
+    streamEl._ccRawText = streamingSegments
+      .filter((segment) => segment.type === 'text')
+      .map((segment) => segment.content)
+      .join('\n\n');
     scrollToBottom();
   }
 
@@ -3863,59 +3873,82 @@
 	    if (m.kind === 'local-command' && m.localCommand) return buildLocalCommandElement(m);
 	    if (m.kind === 'compact-summary') return buildCompactSummaryElement(m);
 	    const el = createMsgElement(m.role, m.content, m.attachments || [], m.timestamp || null);
-	    if (m.kind === 'codex-empty-final') {
-	      const notice = document.createElement('div');
-	      notice.className = 'tool-call-empty';
-	      notice.style.padding = '6px 10px';
-	      notice.textContent = '本轮 Codex 已执行工具，但没有生成最终回答；已保留已完成的工具记录。';
-	      el.querySelector('.msg-bubble').appendChild(notice);
-	    }
-	    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
-	      const bubble = el.querySelector('.msg-bubble');
-	      const FOLD_AT = 3;
-	      let grouped = false;
-	      for (const tc of m.toolCalls) {
-	        const details = createToolCallElement(tc.id || `saved-${Math.random().toString(36).slice(2)}`, tc, true);
-
-	        // 散落的 .tool-call 达到 FOLD_AT 个时，移入唯一 .tool-group
-        const loose = Array.from(bubble.children).filter(c => c.classList.contains('tool-call'));
-        if (loose.length >= FOLD_AT) {
-          let group = bubble.querySelector(':scope > .tool-group');
-          if (!group) {
-            group = document.createElement('details');
-            group.className = 'tool-group';
-            const gs = document.createElement('summary');
-            gs.className = 'tool-group-summary';
-            group.appendChild(gs);
-            const inner = document.createElement('div');
-            inner.className = 'tool-group-inner';
-            group.appendChild(inner);
-            bubble.insertBefore(group, bubble.firstChild);
-            grouped = true;
-          }
-          const inner = group.querySelector('.tool-group-inner');
-          loose.forEach(c => inner.appendChild(c));
+    if (m.role === 'assistant' && Array.isArray(m.segments) && m.segments.length > 0) {
+      const bubble = el.querySelector('.msg-bubble');
+      const rendered = new Set();
+      bubble.innerHTML = '';
+      m.segments.forEach((segment) => {
+        if (segment.type === 'text') {
+          if (!String(segment.content || '').trim()) return;
+          const textDiv = document.createElement('div');
+          textDiv.className = 'msg-text';
+          textDiv.innerHTML = renderMarkdown(segment.content);
+          bubble.appendChild(textDiv);
+          decorateCodeBlocks(textDiv);
+          return;
+        }
+        const toolCards = (segment.toolCalls || []).map((tc) => {
+          rendered.add(tc.id);
+          return createToolCallElement(tc.id || `saved-${Math.random().toString(36).slice(2)}`, tc, true);
+        });
+        if (toolCards.length === 0) return;
+        if (toolCards.length >= TOOL_FOLD_AT) {
+          const group = document.createElement('details');
+          group.className = 'tool-group';
+          const gs = document.createElement('summary');
+          gs.className = 'tool-group-summary';
+          group.appendChild(gs);
+          const inner = document.createElement('div');
+          inner.className = 'tool-group-inner';
+          toolCards.forEach((card) => inner.appendChild(card));
+          group.appendChild(inner);
+          bubble.appendChild(group);
           _refreshGroupSummary(group);
+        } else {
+          toolCards.forEach((card) => bubble.appendChild(card));
         }
-        bubble.appendChild(details);
+      });
+      const unrendered = (m.toolCalls || []).filter((tc) => !rendered.has(tc.id));
+      if (unrendered.length > 0) {
+        unrendered.forEach((tc) => bubble.appendChild(
+          createToolCallElement(tc.id || `saved-${Math.random().toString(36).slice(2)}`, tc, true)
+        ));
       }
-      // 结束时若出现过父目录，收尾散落项
-      if (grouped) {
-        const loose = Array.from(bubble.children).filter(c => c.classList.contains('tool-call'));
-        if (loose.length > 0) {
-          const group = bubble.querySelector(':scope > .tool-group');
-          if (group) {
-            const inner = group.querySelector('.tool-group-inner');
-            loose.forEach(c => inner.appendChild(c));
-            _refreshGroupSummary(group);
-          }
-        }
+      syncToolFoldAction(el);
+    }
+    else if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+      const bubble = el.querySelector('.msg-bubble');
+      const toolCards = m.toolCalls.map((tc) => (
+        createToolCallElement(tc.id || `saved-${Math.random().toString(36).slice(2)}`, tc, true)
+      ));
+      if (toolCards.length >= TOOL_FOLD_AT) {
+        // 旧快照没有段边界，只能把所有工具放在已有正文之后。
+        const group = document.createElement('details');
+        group.className = 'tool-group';
+        const gs = document.createElement('summary');
+        gs.className = 'tool-group-summary';
+        group.appendChild(gs);
+        const inner = document.createElement('div');
+        inner.className = 'tool-group-inner';
+        toolCards.forEach((card) => inner.appendChild(card));
+        group.appendChild(inner);
+        bubble.appendChild(group);
+        _refreshGroupSummary(group);
+      } else {
+        toolCards.forEach((card) => bubble.appendChild(card));
       }
       syncToolFoldAction(el);
     }
     // 后台任务状态条：口径与实时收尾一致，刷新 / 切回会话后仍然在
     if (m.role === 'assistant') {
       appendBackgroundNote(el.querySelector('.msg-bubble'), collectBackgroundTasks(m.toolCalls));
+      if (m.kind === 'codex-empty-final') {
+        const notice = document.createElement('div');
+        notice.className = 'tool-call-empty';
+        notice.style.padding = '6px 10px';
+        notice.textContent = '本轮 Codex 已执行工具，但没有生成最终回答；已保留已完成的工具记录。';
+        el.querySelector('.msg-bubble').appendChild(notice);
+      }
     }
     return el;
   }
@@ -5055,8 +5088,19 @@
     if (!streamEl) return;
     const bubble = streamEl.querySelector('.msg-bubble');
     if (!bubble) return;
-    let toolsDiv = bubble.querySelector('.msg-tools');
-    if (!toolsDiv) { toolsDiv = bubble; }
+
+    let segment = streamingSegments[streamingSegments.length - 1];
+    if (!segment || segment.type !== 'tools') {
+      segment = {
+        type: 'tools',
+        container: document.createElement('div'),
+        group: null,
+        toolCalls: [],
+      };
+      segment.container.className = 'msg-tools';
+      insertBeforeTypingIndicator(bubble, segment.container);
+      streamingSegments.push(segment);
+    }
 
     const tool = { id: toolUseId, name, input, kind, meta, done };
 
@@ -5065,16 +5109,14 @@
     // 本轮卡片按 toolUseId 直接记账（存在 activeToolCalls 的条目上，随本轮结束一起清）。
     // DOM id 不能当身份用：Codex 的 item id 每轮从 item_0 重新计数，与页面上早先轮次
     // 同 id 的卡片重名，getElementById 只会命中最早那张，本轮卡片就永远停在 Running。
+    tool.el = details;
     const record = activeToolCalls.get(toolUseId);
     if (record) record.el = details;
 
-    // 折叠策略：只维护唯一一个 .tool-group 父节点
-    // 散落的 .tool-call 直接子节点达到3个时，将它们全部移入父节点；之后继续散落，再达3个再移入
-    const FOLD_AT = 3;
-    const looseBefore = Array.from(toolsDiv.children).filter(c => c.classList.contains('tool-call'));
-    if (looseBefore.length >= FOLD_AT) {
-      // 确保存在唯一的 .tool-group
-      let group = toolsDiv.querySelector(':scope > .tool-group');
+    segment.toolCalls.push(tool);
+    segment.container.appendChild(details);
+    if (segment.toolCalls.length >= TOOL_FOLD_AT) {
+      let group = segment.group;
       if (!group) {
         group = document.createElement('details');
         group.className = 'tool-group';
@@ -5084,14 +5126,16 @@
         const inner = document.createElement('div');
         inner.className = 'tool-group-inner';
         group.appendChild(inner);
-        toolsDiv.insertBefore(group, toolsDiv.firstChild);
-        hasGrouped = true;
+        segment.container.insertBefore(group, segment.container.firstChild);
+        segment.group = group;
       }
       const inner = group.querySelector('.tool-group-inner');
-      looseBefore.forEach(c => inner.appendChild(c));
+      segment.toolCalls.forEach((call) => {
+        const card = call.el || document.getElementById(`tool-${call.id}`);
+        if (card) inner.appendChild(card);
+      });
       _refreshGroupSummary(group);
     }
-    toolsDiv.appendChild(details);
     syncToolFoldAction(streamEl);
     scrollToBottom();
   }
@@ -5122,36 +5166,75 @@
     btn.setAttribute('aria-label', btn.title);
   }
 
-  // 单条回复只保留一个最上级工具组。已完成的卡片收进去，仍在运行的留在组外，
-  // 避免一键收起把用户正在观察的实时输出一起藏掉。
+  // 每个连续的 tools 段各自维护一个工具组，正文是段边界。已完成的卡片收进
+  // 本段工具组，仍在运行的留在组外，不能跨正文把后一段工具拖到前一段。
   function foldCompletedToolCalls(msgEl) {
     const bubble = msgEl?.querySelector(':scope > .msg-bubble');
-    const completed = getCompletedToolCalls(bubble);
-    if (completed.length === 0) return false;
-    const toolsDiv = bubble.querySelector(':scope > .msg-tools') || bubble;
-    let group = toolsDiv.querySelector(':scope > .tool-group');
-    if (!group) {
-      group = document.createElement('details');
-      group.className = 'tool-group';
-      const gs = document.createElement('summary');
-      gs.className = 'tool-group-summary';
-      group.appendChild(gs);
-      const inner = document.createElement('div');
-      inner.className = 'tool-group-inner';
-      group.appendChild(inner);
+    if (!bubble) return false;
+    const segments = [];
+    let current = null;
+    for (const child of Array.from(bubble.children)) {
+      const isTools = child.classList.contains('msg-tools')
+        || child.classList.contains('tool-call')
+        || child.classList.contains('tool-group');
+      if (!isTools) {
+        current = null;
+        continue;
+      }
+      if (!current) {
+        const container = child.classList.contains('msg-tools') ? child : bubble;
+        current = {
+          container,
+          nodes: container === bubble
+            ? []
+            : Array.from(container.children).filter((node) => (
+              node.classList.contains('tool-call') || node.classList.contains('tool-group')
+            )),
+        };
+        segments.push(current);
+      }
+      if (current.container === bubble && !current.nodes.includes(child)) current.nodes.push(child);
     }
 
-    const inner = group.querySelector('.tool-group-inner');
-    // 已有分组里若混着运行中卡片，先把它们移回组外，再收拢已完成项。
-    Array.from(inner.children).filter((c) => (
-      c.classList.contains('tool-call') && !isCompletedToolCall(c)
-    )).forEach((c) => toolsDiv.insertBefore(c, group));
-    completed.forEach((c) => inner.appendChild(c));
+    let folded = false;
+    for (const segment of segments) {
+      const cards = segment.nodes.flatMap((node) => {
+        if (node.classList.contains('tool-call')) return [node];
+        return Array.from(node.querySelectorAll(':scope > .tool-group-inner > .tool-call'));
+      });
+      const completed = cards.filter(isCompletedToolCall);
+      if (completed.length === 0) continue;
+      let group = segment.nodes.find((node) => node.classList.contains('tool-group'));
+      if (!group) {
+        group = document.createElement('details');
+        group.className = 'tool-group';
+        const summary = document.createElement('summary');
+        summary.className = 'tool-group-summary';
+        group.appendChild(summary);
+        const inner = document.createElement('div');
+        inner.className = 'tool-group-inner';
+        group.appendChild(inner);
+      }
+      const inner = group.querySelector(':scope > .tool-group-inner');
+      const anchor = segment.container === bubble
+        ? (segment.nodes[0] || null)
+        : null;
+      if (group.parentNode !== segment.container || (anchor && group !== anchor && group.nextSibling !== anchor)) {
+        segment.container.insertBefore(group, anchor);
+      }
 
-    group.open = false;
-    toolsDiv.insertBefore(group, toolsDiv.firstChild);
-    _refreshGroupSummary(group);
-    if (msgEl.id === 'streaming-msg') hasGrouped = true;
+      // Keep running cards in their original text/tool segment, outside the
+      // collapsed group. Also repair an old group that contains a running card.
+      cards.filter((card) => !isCompletedToolCall(card)).forEach((card) => {
+        segment.container.insertBefore(card, group);
+      });
+      completed.forEach((card) => inner.appendChild(card));
+      group.open = false;
+      _refreshGroupSummary(group);
+      folded = true;
+    }
+
+    if (!folded) return false;
     syncToolFoldAction(msgEl);
     return true;
   }
@@ -6108,7 +6191,7 @@
       chatTitle.style.overflow = '';
       chatTitle.style.textOverflow = '';
       const newTitle = chatTitle.textContent.trim() || originalText;
-      chatTitle.textContent = newTitle;
+      setCurrentSessionTitle(newTitle);
       if (save && newTitle !== originalText && currentSessionId) {
         send({ type: 'rename_session', sessionId: currentSessionId, title: newTitle });
       }
