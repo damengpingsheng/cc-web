@@ -30,6 +30,8 @@
 
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const RENDER_DEBOUNCE = 100;
+  const PAGE_TITLE_SUFFIX = 'CC-Web';
+  const DEFAULT_SESSION_TITLE = '新会话';
 
   const SLASH_COMMANDS = [
     { cmd: '/clear', desc: '清除当前会话' },
@@ -883,6 +885,12 @@
 
   function getSessionMeta(sessionId) {
     return sessions.find((s) => s.id === sessionId) || null;
+  }
+
+  function setCurrentSessionTitle(title) {
+    const normalizedTitle = String(title || DEFAULT_SESSION_TITLE).replace(/\s+/g, ' ').trim() || DEFAULT_SESSION_TITLE;
+    chatTitle.textContent = normalizedTitle;
+    document.title = `${normalizedTitle} · ${PAGE_TITLE_SUFFIX}`;
   }
 
   function deepClone(value) {
@@ -2091,7 +2099,7 @@
     activeToolCalls.clear();
     sendBtn.hidden = false;
     abortBtn.hidden = true;
-    chatTitle.textContent = '新会话';
+    setCurrentSessionTitle();
     updateCwdBadge();
     updateGatewayBadge();
     updateModelBadge();
@@ -2118,7 +2126,7 @@
     currentSessionId = snapshot.sessionId;
     loadedHistorySessionId = snapshot.sessionId;
     setLastSessionForAgent(snapshot.agent, currentSessionId);
-    chatTitle.textContent = snapshot.title || '新会话';
+    setCurrentSessionTitle(snapshot.title);
     setCurrentAgent(snapshot.agent);
     setCurrentSessionRunningState(snapshot.isRunning);
     setStatsDisplay(snapshot);
@@ -2259,6 +2267,8 @@
 
   function openSession(sessionId, options = {}) {
     if (!sessionId) return;
+    const meta = getSessionMeta(sessionId);
+    if (meta?.title) setCurrentSessionTitle(meta.title);
     if (options.forceSync) {
       beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: true, label: options.label });
       return;
@@ -2649,6 +2659,10 @@
         sessions = msg.sessions || [];
         reconcileSessionCacheWithSessions();
         renderSessionList();
+        if (currentSessionId) {
+          const currentTitle = getSessionMeta(currentSessionId)?.title;
+          if (currentTitle) setCurrentSessionTitle(currentTitle);
+        }
         // B+: clear stale goal active flag for any session no longer running.
         // Skip optimistic states (still in "kicked off but not yet confirmed" window) so the
         // pre-activeProcesses.set session_list snapshot does not wipe a freshly-set goal.
@@ -2794,7 +2808,7 @@
         sessions = sessions.map((session) => session.id === msg.sessionId ? { ...session, title: msg.title } : session);
         updateCachedSession(msg.sessionId, (snapshot) => { snapshot.title = msg.title; });
         if (msg.sessionId === currentSessionId) {
-          chatTitle.textContent = msg.title;
+          setCurrentSessionTitle(msg.title);
         }
         renderSessionList();
         break;
