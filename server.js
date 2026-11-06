@@ -1905,6 +1905,27 @@ function normalizeSessionTitleText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
+function validateSessionTitleSuggestion(title, candidate) {
+  const value = normalizeSessionTitleText(title);
+  if (!value) return 'empty';
+  if (/[\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f]/.test(value)) return 'japanese-kana';
+  if (value.includes('\ufffd')) return 'invalid-unicode';
+  if (/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i.test(value)) return 'session-id';
+  if (/记录\s*[0-9a-f]{8}\s*会话/i.test(value)) return 'session-id-fragment';
+  const ids = new Set();
+  for (const context of [candidate?.id, candidate?.title, candidate?.firstLine, ...(candidate?.users || []), ...(candidate?.assistantTail || [])]) {
+    for (const match of String(context || '').matchAll(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi)) {
+      ids.add(match[0].toLowerCase());
+      ids.add(match[0].slice(0, 8).toLowerCase());
+    }
+  }
+  const lower = value.toLowerCase();
+  for (const id of ids) {
+    if (new RegExp(`(^|[^0-9a-z])${id}(?=$|[^0-9a-z])`, 'i').test(lower)) return 'session-id';
+  }
+  return '';
+}
+
 function classifyPromptDerivedSessionTitle(session) {
   const messages = Array.isArray(session?.messages) ? session.messages : [];
   const firstUser = messages.find((message) => message?.role === 'user' && getSessionTitleMessageText(message));
@@ -1981,11 +2002,12 @@ function buildSessionTitleSuggestionPrompt(candidates) {
 
 规则：
 1. 阅读 userMessages 的需求顺序和 assistantTail 的最终有效结论，标题概括整段对话实际完成或调查的内容。
-2. 优先使用 12-30 个中文字符的短名词或动作短语，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。
+2. 使用简体中文，优先使用 12-30 个中文字符的短名词或动作短语，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。
 3. 去掉“帮我、我想、是否可以、可行吗、为什么、请”等提问外壳和问号。
 4. 后续实现或诊断改变了范围时，标题要覆盖最终范围；只有证据支持时才写“完成/修复”，否则用“分析、核查、排查、评审”等中性动词。
-5. 不复制日志、密钥、长路径或个人数据，不使用 Markdown，不换行。运行中的会话也给建议，但客户端不会应用。
-6. 只输出 JSON 数组，每项严格为 {"id":"原 id","title":"新标题"}，不要解释。
+5. 不使用日文假名；UUID 和内部会话 ID 只用于定位上下文，不能写进标题，也不能生成“记录某个会话”这类指令残片。
+6. 不复制日志、密钥、长路径或个人数据，不使用 Markdown，不换行。运行中的会话也给建议，但客户端不会应用。
+7. 只输出 JSON 数组，每项严格为 {"id":"原 id","title":"新标题"}，不要解释。
 
 候选：
 ${JSON.stringify(input)}`;
@@ -2007,6 +2029,7 @@ function parseSessionTitleSuggestions(text, candidates) {
     const title = normalizeSessionTitleText(item?.title).replace(/^["'“”]+|["'“”]+$/g, '').slice(0, 100);
     if (!title || title === candidates.find((entry) => entry.id === id)?.title) continue;
     const candidate = candidates.find((entry) => entry.id === id);
+    if (validateSessionTitleSuggestion(title, candidate)) continue;
     if (classifyPromptDerivedSessionTitle({
       title,
       messages: candidate?.firstLine ? [{ role: 'user', content: candidate.firstLine }] : [],

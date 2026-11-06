@@ -2337,7 +2337,12 @@ async function testAutoSessionTitle() {
       apiRequests += 1;
       const prompt = JSON.parse(body).messages?.[0]?.content || '';
       const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
-      const content = JSON.stringify([{ id: candidates[0]?.id, title: '自动生成的会话标题' }]);
+      const badTitles = [
+        '排查verify触发需审批提示への成因 记录01a1aaba会话',
+        '排查会话审批问题 记录01a1ac91会话',
+      ];
+      const title = apiRequests <= badTitles.length ? badTitles[apiRequests - 1] : '自动生成的会话标题';
+      const content = JSON.stringify([{ id: candidates[0]?.id, title }]);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
     });
@@ -2377,11 +2382,24 @@ async function testAutoSessionTitle() {
       const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
       ws.send(JSON.stringify({ type: 'message', text: '自动标题回归测试', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+      await sleep(150);
+      const rejected = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
+      assert(rejected.title === '自动标题回归测试', `Kana title must not overwrite the prompt title (got ${rejected.title})`);
+      assert(rejected.titleSource !== 'auto', 'Rejected title must not be marked as auto');
+
+      ws.send(JSON.stringify({ type: 'message', text: '再次测试自动标题校验', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+      await sleep(150);
+      const idRejected = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
+      assert(idRejected.title === '自动标题回归测试', `Title containing an internal session id must be rejected (got ${idRejected.title})`);
+
+      ws.send(JSON.stringify({ type: 'message', text: '第三次测试自动标题校验', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
       await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'auto');
       const saved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
       assert(saved.title === '自动生成的会话标题', `Auto title should be persisted (got ${saved.title})`);
       assert(saved.titleSource === 'auto', 'Auto title source should be persisted');
-      assert(apiRequests === 1, `Auto title should call API once (got ${apiRequests})`);
+      assert(apiRequests === 3, `Auto title should call API three times (got ${apiRequests})`);
 
       ws.send(JSON.stringify({ type: 'rename_session', sessionId: session.sessionId, title: '保留手工命名' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'manual');
@@ -2411,7 +2429,7 @@ async function testAutoSessionTitle() {
       await sleep(150);
       const disabledSaved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${disabledSession.sessionId}.json`), 'utf8'));
       assert(disabledSaved.title === '关闭开关后不应自动整理', `Disabled auto-title must keep prompt title (got ${disabledSaved.title})`);
-      assert(apiRequests === 1, `Disabled auto-title must not call API (got ${apiRequests})`);
+      assert(apiRequests === 3, `Disabled auto-title must not call API (got ${apiRequests})`);
       ws.close();
     });
   } finally {
