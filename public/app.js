@@ -110,6 +110,12 @@
     },
   ];
 
+  const SEND_SHORTCUT_STORAGE_KEY = 'cc-web-send-shortcut';
+  const SEND_SHORTCUT_OPTIONS = [
+    { value: 'enter', label: 'Enter 发送（Shift+Enter 换行）', summary: 'Enter 发送' },
+    { value: 'ctrl-enter', label: 'Ctrl+Enter 发送（Enter 换行）', summary: 'Ctrl+Enter 发送' },
+  ];
+
   // --- State ---
   let ws = null;
   let authToken = localStorage.getItem('cc-web-token');
@@ -182,6 +188,7 @@
   let sessionTitleAuditCandidates = [];
   let sessionTitleAuditLoading = false;
   let currentTheme = (document.documentElement.dataset.theme || localStorage.getItem('cc-web-theme') || 'washi');
+  let sendShortcut = normalizeSendShortcut(localStorage.getItem(SEND_SHORTCUT_STORAGE_KEY));
   let codexConfigCache = null;
   let loadedHistorySessionId = null;
   let activeSessionLoad = null;
@@ -301,8 +308,16 @@
     return THEME_OPTIONS.some((item) => item.value === theme) ? theme : 'washi';
   }
 
+  function normalizeSendShortcut(shortcut) {
+    return SEND_SHORTCUT_OPTIONS.some((item) => item.value === shortcut) ? shortcut : 'enter';
+  }
+
   function getThemeOption(theme) {
     return THEME_OPTIONS.find((item) => item.value === normalizeTheme(theme)) || THEME_OPTIONS[0];
+  }
+
+  function getSendShortcutOption(shortcut) {
+    return SEND_SHORTCUT_OPTIONS.find((item) => item.value === normalizeSendShortcut(shortcut)) || SEND_SHORTCUT_OPTIONS[0];
   }
 
   function refreshThemeSummaries() {
@@ -317,6 +332,19 @@
     document.documentElement.dataset.theme = currentTheme;
     localStorage.setItem('cc-web-theme', currentTheme);
     refreshThemeSummaries();
+  }
+
+  function refreshSendShortcutSummaries() {
+    const label = getSendShortcutOption(sendShortcut).summary;
+    document.querySelectorAll('[data-send-shortcut-summary]').forEach((node) => {
+      node.textContent = label;
+    });
+  }
+
+  function applySendShortcut(shortcut) {
+    sendShortcut = normalizeSendShortcut(shortcut);
+    localStorage.setItem(SEND_SHORTCUT_STORAGE_KEY, sendShortcut);
+    refreshSendShortcutSummaries();
   }
 
   function buildThemePickerHtml(options = {}) {
@@ -353,8 +381,8 @@
       <div class="settings-section-title">外观</div>
       <button class="settings-nav-card" type="button" data-open-theme-page>
         <span class="settings-nav-card-main">
-          <span class="settings-nav-card-title">界面主题</span>
-          <span class="settings-nav-card-meta">当前：<span data-theme-summary>${escapeHtml(getThemeOption(currentTheme).label)}</span></span>
+          <span class="settings-nav-card-title">外观与输入</span>
+          <span class="settings-nav-card-meta">主题：<span data-theme-summary>${escapeHtml(getThemeOption(currentTheme).label)}</span> · <span data-send-shortcut-summary>${escapeHtml(getSendShortcutOption(sendShortcut).summary)}</span></span>
         </span>
         <span class="settings-nav-card-arrow" aria-hidden="true">›</span>
       </button>
@@ -839,18 +867,30 @@
       <div class="settings-header settings-subpage-header">
         <button class="settings-back" type="button" aria-label="返回">‹</button>
         <div class="settings-subpage-copy">
-          <div class="settings-subpage-kicker">Appearance</div>
-          <h3>界面主题</h3>
+          <div class="settings-subpage-kicker">Appearance &amp; Input</div>
+          <h3>外观与输入</h3>
         </div>
         <button class="settings-close" type="button" title="关闭">&times;</button>
       </div>
       ${buildThemePickerHtml({ showSectionTitle: false })}
+      <div class="settings-section-title">输入框发送方式</div>
+      <div class="settings-field">
+        <label for="send-shortcut-select">确认快捷键</label>
+        <select class="settings-select" id="send-shortcut-select">
+          ${SEND_SHORTCUT_OPTIONS.map((option) => `
+            <option value="${option.value}"${option.value === sendShortcut ? ' selected' : ''}>${option.label}</option>
+          `).join('')}
+        </select>
+      </div>
+      <div class="settings-inline-note">移动端仍使用发送按钮；macOS 也可用 ⌘+Enter 发送。</div>
     `;
 
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
     mountThemePicker(panel);
     refreshThemeSummaries();
+    const shortcutSelect = panel.querySelector('#send-shortcut-select');
+    shortcutSelect.addEventListener('change', () => applySendShortcut(shortcutSelect.value));
 
     const closeSubpage = () => {
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
@@ -7148,22 +7188,20 @@
       e.preventDefault();
       return;
     }
+    if (e.key === 'Enter' && !cmdMenu.hidden && !e.shiftKey) {
+      e.preventDefault();
+      selectCmdMenuItem();
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       if (isMobileInputMode()) {
-        if (!cmdMenu.hidden) {
-          e.preventDefault();
-          selectCmdMenuItem();
-        }
         return;
       }
 
+      if (sendShortcut === 'ctrl-enter' && !(e.ctrlKey || e.metaKey)) return;
+
       e.preventDefault();
-      if (!cmdMenu.hidden) {
-        // If menu is open and user presses Enter, select the item
-        selectCmdMenuItem();
-      } else {
-        sendMessage();
-      }
+      sendMessage();
     }
   });
 
