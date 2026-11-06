@@ -1910,6 +1910,8 @@ function validateSessionTitleSuggestion(title, candidate) {
   if (!value) return 'empty';
   if (/[\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f]/.test(value)) return 'japanese-kana';
   if (value.includes('\ufffd')) return 'invalid-unicode';
+  const jiraIdPattern = /\b[A-Z][A-Z0-9]{1,9}-\d+\b/g;
+  if (jiraIdPattern.test(value) && !/\p{L}|\p{N}/u.test(value.replace(jiraIdPattern, ''))) return 'jira-id-only';
   if (/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i.test(value)) return 'session-id';
   if (/记录\s*[0-9a-f]{8}\s*会话/i.test(value)) return 'session-id-fragment';
   const ids = new Set();
@@ -2002,7 +2004,7 @@ function buildSessionTitleSuggestionPrompt(candidates) {
 
 规则：
 1. 阅读 userMessages 的需求顺序和 assistantTail 的最终有效结论，标题概括整段对话实际完成或调查的内容。
-2. 使用简体中文，优先使用 12-30 个中文字符的短名词或动作短语，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。
+2. 使用简体中文，优先使用 12-30 个中文字符的短名词或动作短语，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。对话涉及 Jira ID 时，标题要同时包含该 Jira ID 和实际工作摘要；太长可缩略摘要，但不能只输出一个 Jira ID。
 3. 去掉“帮我、我想、是否可以、可行吗、为什么、请”等提问外壳和问号。
 4. 后续实现或诊断改变了范围时，标题要覆盖最终范围；只有证据支持时才写“完成/修复”，否则用“分析、核查、排查、评审”等中性动词。
 5. 不使用日文假名；UUID 和内部会话 ID 只用于定位上下文，不能写进标题，也不能生成“记录某个会话”这类指令残片。
@@ -3115,6 +3117,13 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   const pendingRetry = pendingCompactRetries.get(sessionId) || null;
   const pendingSlash = pendingSlashCommands.get(sessionId) || null;
+  // Drain the final output before reading the session. thread.started and
+  // turn.failed are persisted by this pass; calculations below and the later
+  // save must observe those events rather than overwrite them with stale state.
+  if (entry.tailer) {
+    entry.tailer.readNew();
+    entry.tailer.stop();
+  }
   let session = loadSession(sessionId);
   let contextLimitExceeded = false;
 
@@ -3181,23 +3190,19 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     codexEmptyFinalAction: shouldRetryCodexEmptyFinal ? 'retry' : (codexEmptyFinalFailed ? 'failed' : 'none'),
   });
 
-  // Final read
-  if (entry.tailer) {
-    entry.tailer.readNew();
-    entry.tailer.stop();
-  }
-
   if (pendingSlash) pendingSlashCommands.delete(sessionId);
   // P2 护栏解除：一次正常（非 slash 注入）运行完成 = 预防压缩 → 重放 的完整闭环走通，
   // 后续消息可再次按水位触发预防压缩；压缩运行本身不清除（防 compact→重放→再预防死循环）
   else preemptCompactGuard.delete(sessionId);
 
-  // Save result to session
+  // resumed rollout 可能留下历史宿主导出工具 output 缺失的 stderr，即使当前轮已正常结束。
+  // 只有本轮没有最终文本时才重建上下文；否则保留原 thread 和有效回答。
   const retryCodexWithoutResume = !!(
     session
     && entry.agent === 'codex'
     && entry.codexResumed
     && !entry.codexResumeFallbackAttempted
+    && !String(entry.fullText || '').trim()
     && /custom tool call output is missing/i.test(`${stderrSnippet}\n${rawCompletionError || ''}`)
   );
   if (retryCodexWithoutResume) {

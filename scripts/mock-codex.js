@@ -42,6 +42,16 @@ function readStdin() {
     process.stderr.write('2026-11-04T08:28:05.057427Z ERROR codex_memories_write::phase2: Phase 2 no changes\n');
   }
 
+  if (input === 'trigger codex missing tool output with answer') {
+    process.stderr.write('ERROR custom tool call output is missing for call id: call_historical\n');
+  }
+
+  if (input === 'trigger codex missing tool output' && isResume) {
+    process.stderr.write('ERROR custom tool call output is missing for call id: call_historical\n');
+    process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 0 } })}\n`);
+    return;
+  }
+
   const emitEmptyFinal = () => {
     const itemId = `item_empty_final_tool_${Date.now()}`;
     process.stdout.write(`${JSON.stringify({
@@ -171,7 +181,7 @@ function readStdin() {
         ? 'Codex recovered final summary.'
         : `Codex mock handled (${imageCount} image): ${input}`;
 
-  process.stdout.write(`${JSON.stringify({
+  if (input !== 'trigger codex context limit' || state.compacted) process.stdout.write(`${JSON.stringify({
     type: 'item.completed',
     item: {
       id: 'item_msg',
@@ -184,7 +194,7 @@ function readStdin() {
     try { fs.unlinkSync(statePath); } catch {}
   }
 
-  process.stdout.write(`${JSON.stringify({
+  if (input !== 'trigger codex context limit' || state.compacted) process.stdout.write(`${JSON.stringify({
     type: 'turn.completed',
     usage: { input_tokens: 10, cached_input_tokens: 2, output_tokens: 5 },
   })}\n`);

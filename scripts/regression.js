@@ -1466,6 +1466,7 @@ async function main() {
   await testSessionTitleAudit();
   await testAutoSessionTitle();
   await testBenignCodexStderrExit();
+  await testCodexHistoricalToolOutputWarning();
   await testCodexEmptyFinalRecovery();
 
   // Claude transcript 过期后必须在 spawn 前拦截，并由显式选择决定恢复方式
@@ -2329,6 +2330,7 @@ async function testAutoSessionTitle() {
   const password = 'AutoTitle!234';
   const port = await getFreePort();
   let apiRequests = 0;
+  let titlePrompt = '';
   const titleApiServer = http.createServer((req, res) => {
     let body = '';
     req.setEncoding('utf8');
@@ -2336,12 +2338,14 @@ async function testAutoSessionTitle() {
     req.on('end', () => {
       apiRequests += 1;
       const prompt = JSON.parse(body).messages?.[0]?.content || '';
+      titlePrompt = prompt;
       const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
       const badTitles = [
         '排查verify触发需审批提示への成因 记录01a1aaba会话',
         '排查会话审批问题 记录01a1ac91会话',
+        'LAGSW-9877',
       ];
-      const title = apiRequests <= badTitles.length ? badTitles[apiRequests - 1] : '自动生成的会话标题';
+      const title = apiRequests <= badTitles.length ? badTitles[apiRequests - 1] : 'LAGSW-9877 自动标题校验';
       const content = JSON.stringify([{ id: candidates[0]?.id, title }]);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
@@ -2393,13 +2397,20 @@ async function testAutoSessionTitle() {
       const idRejected = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
       assert(idRejected.title === '自动标题回归测试', `Title containing an internal session id must be rejected (got ${idRejected.title})`);
 
-      ws.send(JSON.stringify({ type: 'message', text: '第三次测试自动标题校验', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      ws.send(JSON.stringify({ type: 'message', text: '第三次测试 LAGSW-9877 自动标题校验', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+      await sleep(150);
+      const jiraIdRejected = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
+      assert(jiraIdRejected.title === '自动标题回归测试', `Title containing only a Jira ID must be rejected (got ${jiraIdRejected.title})`);
+
+      ws.send(JSON.stringify({ type: 'message', text: '第四次测试带 Jira ID 的自动标题', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
       await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'auto');
       const saved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
-      assert(saved.title === '自动生成的会话标题', `Auto title should be persisted (got ${saved.title})`);
+      assert(saved.title === 'LAGSW-9877 自动标题校验', `Auto title with a Jira ID should be persisted (got ${saved.title})`);
       assert(saved.titleSource === 'auto', 'Auto title source should be persisted');
-      assert(apiRequests === 3, `Auto title should call API three times (got ${apiRequests})`);
+      assert(apiRequests === 4, `Auto title should call API four times (got ${apiRequests})`);
+      assert(titlePrompt.includes('不能只输出一个 Jira ID'), 'Auto-title prompt must require Jira ID plus work summary');
 
       ws.send(JSON.stringify({ type: 'rename_session', sessionId: session.sessionId, title: '保留手工命名' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'manual');
@@ -2429,7 +2440,7 @@ async function testAutoSessionTitle() {
       await sleep(150);
       const disabledSaved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${disabledSession.sessionId}.json`), 'utf8'));
       assert(disabledSaved.title === '关闭开关后不应自动整理', `Disabled auto-title must keep prompt title (got ${disabledSaved.title})`);
-      assert(apiRequests === 3, `Disabled auto-title must not call API (got ${apiRequests})`);
+      assert(apiRequests === 4, `Disabled auto-title must not call API (got ${apiRequests})`);
       ws.close();
     });
   } finally {
@@ -2485,6 +2496,75 @@ async function testBenignCodexStderrExit() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Benign Codex stderr exit checks passed.');
+}
+
+// resumed Codex rollout 可能保留历史宿主工具 output 缺失的 stderr。当前轮已有
+// 最终回答时 thread 仍可用，必须保留 codexThreadId；只有空回答才走原有的一次重试。
+async function testCodexHistoricalToolOutputWarning() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-codex-historical-tool-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  const password = 'HistoricalTool!234';
+  const port = await getFreePort();
+
+  await withServer({
+    PORT: String(port),
+    CC_WEB_PASSWORD: password,
+    CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir,
+    CC_WEB_LOGS_DIR: logsDir,
+    HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE,
+    CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
+    const sessionPath = path.join(sessionsDir, `${session.sessionId}.json`);
+
+    ws.send(JSON.stringify({ type: 'message', text: 'seed historical tool warning test', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+    const seeded = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    assert(seeded.codexThreadId, 'Seed turn must persist a Codex thread id');
+
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger codex missing tool output with answer', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+    const answeredDone = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+    assert(answeredDone.willContinue === false, 'A valid answer must not start automatic context recovery');
+    await sleep(150);
+    const answered = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    assert(answered.codexThreadId === seeded.codexThreadId, 'A valid answer must retain the resumed Codex thread id');
+    assert(answered.messages.some((msg) => msg.role === 'assistant' && /Codex mock handled/.test(msg.content || '')), 'A valid answer must remain in session history');
+    assert(!messages.some((msg) => msg.type === 'system_message' && /已自动新建上下文/.test(msg.message || '')), 'A valid answer must not announce context replacement');
+
+    ws.send(JSON.stringify({ type: 'message', text: 'trigger codex missing tool output', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+    const fallbackNotice = await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /已自动新建上下文/.test(msg.message || ''));
+    assert(/无法由 cc-web 回放/.test(fallbackNotice.message || ''), 'Empty final with the warning must use the existing recovery notice');
+    const firstEmptyDone = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+    assert(firstEmptyDone.willContinue === true, 'Empty final recovery must mark the first done as continuing');
+    const recoveredDone = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+    assert(recoveredDone.willContinue === false, 'New-context replay must finish normally');
+    await sleep(150);
+    const recovered = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+    assert(recovered.codexThreadId && recovered.codexThreadId !== seeded.codexThreadId, 'Empty final recovery must establish a new Codex thread');
+    const replayAnswerCount = recovered.messages.filter((msg) => msg.role === 'assistant' && /Codex mock handled/.test(msg.content || '')).length;
+    assert(replayAnswerCount === 3, `Seed, valid answer, and recovered answer should each be retained once (got ${replayAnswerCount})`);
+
+    const spawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8').split('\n').filter(Boolean)
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter((item) => item?.event === 'process_spawn' && item.sessionId === session.sessionId.slice(0, 8));
+    assert(spawns.length === 4, `Two valid turns and one recovery replay should spawn four processes (got ${spawns.length})`);
+    assert(spawns[1].resume === true, 'The valid completed turn must resume the original thread');
+    assert(spawns[3].resume === false, 'Only the empty-final recovery replay may start without resume');
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Codex historical tool-output warning checks passed.');
 }
 
 // Codex can finish after a tool call without emitting an AgentMessage. cc-web
