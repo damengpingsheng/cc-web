@@ -111,6 +111,7 @@
   ];
 
   const SEND_SHORTCUT_STORAGE_KEY = 'cc-web-send-shortcut';
+  const COMPOSER_DRAFTS_STORAGE_KEY = 'cc-web-composer-drafts';
   const SEND_SHORTCUT_OPTIONS = [
     { value: 'enter', label: 'Enter 发送（Shift+Enter 换行）', summary: 'Enter 发送' },
     { value: 'ctrl-enter', label: 'Ctrl+Enter 发送（Enter 换行）', summary: 'Ctrl+Enter 发送' },
@@ -196,6 +197,8 @@
   let sidebarCollapsed = localStorage.getItem('cc-web-sidebar-collapsed') === '1';
   let pendingAttachments = [];
   let uploadingAttachments = [];
+  let composerDraftTimer = null;
+  let pendingComposerDraftMigration = null;
   // 待发送队列只保存在当前标签页内，按会话隔离。普通任务结束前不会自动跨会话发送。
   const messageQueues = new Map();
   const pausedMessageQueues = new Map();
@@ -923,6 +926,77 @@
     localStorage.setItem('cc-web-session', sessionId);
   }
 
+  function getComposerDraftKey(agent, sessionId) {
+    return `${normalizeAgent(agent)}:${sessionId || 'new'}`;
+  }
+
+  function loadComposerDrafts() {
+    try {
+      const value = JSON.parse(localStorage.getItem(COMPOSER_DRAFTS_STORAGE_KEY) || '{}');
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function persistComposerDrafts(drafts) {
+    try {
+      localStorage.setItem(COMPOSER_DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
+    } catch (err) {
+      console.warn('保存输入草稿失败', err);
+    }
+  }
+
+  function saveComposerDraft(agent = currentAgent, sessionId = currentSessionId) {
+    if (!msgInput) return;
+    clearTimeout(composerDraftTimer);
+    composerDraftTimer = null;
+    const key = getComposerDraftKey(agent, sessionId);
+    const drafts = loadComposerDrafts();
+    if (msgInput.value) drafts[key] = msgInput.value;
+    else delete drafts[key];
+    persistComposerDrafts(drafts);
+  }
+
+  function scheduleComposerDraftSave() {
+    clearTimeout(composerDraftTimer);
+    composerDraftTimer = setTimeout(() => saveComposerDraft(), 200);
+  }
+
+  function restoreComposerDraft(agent = currentAgent, sessionId = currentSessionId) {
+    if (!msgInput) return;
+    const draft = loadComposerDrafts()[getComposerDraftKey(agent, sessionId)];
+    msgInput.value = typeof draft === 'string' ? draft : '';
+    autoResize();
+    syncComposerAction();
+  }
+
+  function clearComposerDraft(agent = currentAgent, sessionId = currentSessionId) {
+    clearTimeout(composerDraftTimer);
+    composerDraftTimer = null;
+    const drafts = loadComposerDrafts();
+    delete drafts[getComposerDraftKey(agent, sessionId)];
+    persistComposerDrafts(drafts);
+  }
+
+  function migratePendingComposerDraft(sessionId, agent) {
+    if (!pendingComposerDraftMigration || !sessionId) return;
+    const targetAgent = normalizeAgent(agent);
+    if (pendingComposerDraftMigration.agent !== targetAgent) return;
+    const drafts = loadComposerDrafts();
+    const sourceKey = getComposerDraftKey(targetAgent, null);
+    const targetKey = getComposerDraftKey(targetAgent, sessionId);
+    if (typeof drafts[sourceKey] === 'string') {
+      drafts[targetKey] = drafts[sourceKey];
+      delete drafts[sourceKey];
+      persistComposerDrafts(drafts);
+      // 恢复逻辑只在会话/agent 变化时触发；新会话沿用当前输入框，不重复覆盖刚输入的内容。
+      pendingComposerDraftMigration = null;
+      return;
+    }
+    pendingComposerDraftMigration = null;
+  }
+
   function getSessionMeta(sessionId) {
     return sessions.find((s) => s.id === sessionId) || null;
   }
@@ -1371,6 +1445,7 @@
     });
     messageQueues.set(key, queue);
     msgInput.value = '';
+    clearComposerDraft();
     pendingAttachments = [];
     renderPendingAttachments();
     renderMessageQueue();
@@ -2151,11 +2226,17 @@
     renderMessageQueue();
     syncComposerAction();
     highlightActiveSession();
+    restoreComposerDraft(agent, null);
   }
 
   function applySessionSnapshot(snapshot, options = {}) {
     if (!snapshot) return;
     const preserveStreaming = !!(options.preserveStreaming && isGenerating && snapshot.sessionId === currentSessionId && snapshot.isRunning);
+    const previousSessionId = currentSessionId;
+    const previousAgent = currentAgent;
+    if (previousSessionId !== snapshot.sessionId) {
+      saveComposerDraft(previousAgent, previousSessionId);
+    }
     if (isGenerating && !preserveStreaming) {
       isGenerating = false;
       sendBtn.hidden = false;
@@ -2168,6 +2249,10 @@
     setLastSessionForAgent(snapshot.agent, currentSessionId);
     setCurrentSessionTitle(snapshot.title);
     setCurrentAgent(snapshot.agent);
+    migratePendingComposerDraft(snapshot.sessionId, snapshot.agent);
+    if (previousSessionId !== currentSessionId || previousAgent !== currentAgent) {
+      restoreComposerDraft(currentAgent, currentSessionId);
+    }
     setCurrentSessionRunningState(snapshot.isRunning);
     setStatsDisplay(snapshot);
     currentCwd = snapshot.cwd || null;
@@ -2200,6 +2285,7 @@
   function syncViewForAgent(agent, options = {}) {
     const targetAgent = normalizeAgent(agent);
     const { preserveCurrent = true, loadLast = true } = options;
+    if (targetAgent !== currentAgent) saveComposerDraft(currentAgent, currentSessionId);
     setCurrentAgent(targetAgent);
     renderSessionList();
 
@@ -2287,6 +2373,7 @@
     const force = options.force === true;
     if (!force && activeSessionLoad?.sessionId === sessionId) return;
     if (!force && sessionId === currentSessionId && !activeSessionLoad) return;
+    if (sessionId !== currentSessionId) saveComposerDraft(currentAgent, currentSessionId);
     renderEpoch++;
     loadedHistorySessionId = null;
     setSessionLoading(sessionId, { blocking, label: options.label });
@@ -3138,6 +3225,7 @@
           if (action === 'cancel') {
             if (pending) {
               msgInput.value = pending.text;
+              scheduleComposerDraftSave();
               pendingAttachments = pending.attachments;
               renderPendingAttachments();
               autoResize();
@@ -3556,6 +3644,7 @@
       editBtn.setAttribute('aria-label', '把这条输入放回输入框重新编辑');
       editBtn.addEventListener('click', () => {
         msgInput.value = div._ccRawText || '';
+        scheduleComposerDraftSave();
         autoResize();
         msgInput.focus();
         const end = msgInput.value.length;
@@ -3654,6 +3743,7 @@
       autoResize();
       sendMessage();
       msgInput.value = draft;
+      scheduleComposerDraftSave();
       autoResize();
       msgInput.focus();
     });
@@ -4901,6 +4991,7 @@
     const line = `【${header}】${option?.label || ''}`;
     const current = msgInput.value.trim();
     msgInput.value = current ? `${current}\n${line}` : line;
+    scheduleComposerDraftSave();
     autoResize();
     msgInput.focus();
   }
@@ -5839,6 +5930,7 @@
       if (target.classList.contains('delete')) {
         e.stopPropagation();
         const doDelete = () => {
+          clearComposerDraft(normalizeAgent(s.agent), s.id);
           if (getLastSessionForAgent(currentAgent) === s.id) {
             localStorage.removeItem(getAgentSessionStorageKey(currentAgent));
             sessionStorage.removeItem(getAgentSessionStorageKey(currentAgent));
@@ -6809,6 +6901,7 @@
       if (text === '/model' || text === '/model ') {
         showModelPicker();
         msgInput.value = '';
+        clearComposerDraft();
         autoResize();
         return;
       }
@@ -6816,6 +6909,7 @@
       if (text === '/effort' || text === '/effort ') {
         showEffortPicker();
         msgInput.value = '';
+        clearComposerDraft();
         autoResize();
         return;
       }
@@ -6823,6 +6917,7 @@
       if (text === '/mode' || text === '/mode ') {
         showModePicker();
         msgInput.value = '';
+        clearComposerDraft();
         autoResize();
         return;
       }
@@ -6836,6 +6931,7 @@
       }
       send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
       msgInput.value = '';
+      clearComposerDraft();
       autoResize();
       return;
     }
@@ -6850,6 +6946,7 @@
     pendingClaudeRecoveryUi = { sessionId: currentSessionId, text, attachments: attachments.map((attachment) => ({ ...attachment })) };
     send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
     msgInput.value = '';
+    clearComposerDraft();
     pendingAttachments = [];
     renderPendingAttachments();
     autoResize();
@@ -7161,6 +7258,7 @@
   msgInput.addEventListener('input', () => {
     autoResize();
     syncComposerAction();
+    scheduleComposerDraftSave();
     promptHistoryIndex = -1;   // 用户一改动内容就退出历史回溯
     const val = msgInput.value;
     // Show slash command menu
@@ -7216,6 +7314,8 @@
       handleSelectedImageFiles(files);
     }
   });
+
+  window.addEventListener('pagehide', () => saveComposerDraft());
 
   // Close cmd menu on outside click
   document.addEventListener('click', (e) => {
@@ -8831,6 +8931,7 @@
           alert('请选择或输入工作目录');
           return;
         }
+        pendingComposerDraftMigration = { agent: targetAgent };
         close();
         saveRecentCwd(cwd);
         send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local', codexGateway: overlay.querySelector('#ns-gateway-select')?.value || 'apirouter' });
@@ -8841,6 +8942,7 @@
           return;
         }
         const remoteCwd = remoteView.querySelector('#ns-remote-cwd')?.value?.trim() || '';
+        pendingComposerDraftMigration = { agent: targetAgent };
         close();
         send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd, codexGateway: overlay.querySelector('#ns-gateway-select')?.value || 'apirouter' });
       }
@@ -9147,6 +9249,7 @@
   // --- Init ---
   applyTheme(currentTheme);
   setCurrentAgent(currentAgent);
+  restoreComposerDraft();
   renderSessionList();
   connect();
   window.addEventListener('resize', updateCwdBadge);

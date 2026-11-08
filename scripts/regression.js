@@ -1447,6 +1447,9 @@ async function main() {
   // WS reconnect must not re-render the chat area (Goal 4: 症状 1)
   await testWsReconnectPreservesState();
 
+  // 输入框草稿按会话隔离，并在刷新/切换后恢复
+  await testComposerDraftPersistence();
+
   // WS 心跳 + 运行中任务断线内容补齐（Goal 6）
   await testWsHeartbeatAndActiveOutput();
 
@@ -1793,6 +1796,20 @@ async function testWsReconnectPreservesState() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('WS reconnect state preservation checks passed.');
+}
+
+async function testComposerDraftPersistence() {
+  const appSource = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  assert(/const COMPOSER_DRAFTS_STORAGE_KEY = 'cc-web-composer-drafts';/.test(appSource), 'Composer drafts must use a dedicated localStorage key');
+  assert(/function getComposerDraftKey\(agent, sessionId\)[\s\S]{0,160}sessionId \|\| 'new'/.test(appSource), 'Composer draft keys must isolate new sessions');
+  assert(/function saveComposerDraft\([\s\S]{0,600}persistComposerDrafts\(drafts\)/.test(appSource), 'Composer drafts must persist through the storage helper');
+  assert(/function persistComposerDrafts\(drafts\)[\s\S]{0,300}localStorage\.setItem\(COMPOSER_DRAFTS_STORAGE_KEY/.test(appSource), 'Composer drafts must persist to localStorage');
+  assert(/function restoreComposerDraft\([\s\S]{0,300}msgInput\.value = typeof draft === 'string'/.test(appSource), 'Composer drafts must restore into the message input');
+  assert(/function applySessionSnapshot\([\s\S]{0,600}saveComposerDraft\(previousAgent, previousSessionId\)/.test(appSource), 'Switching sessions must save the previous composer draft');
+  assert(/function applySessionSnapshot\([\s\S]{0,2500}restoreComposerDraft\(currentAgent, currentSessionId\)/.test(appSource), 'Switching sessions must restore the target composer draft');
+  assert(/msgInput\.addEventListener\('input',[\s\S]{0,300}scheduleComposerDraftSave\(\)/.test(appSource), 'Typing must schedule a composer draft save');
+  assert(/window\.addEventListener\('pagehide', \(\) => saveComposerDraft\(\)\)/.test(appSource), 'pagehide must flush the current composer draft');
+  assert(/function sendMessage\([\s\S]{0,5000}msgInput\.value = '';[\s\S]{0,100}clearComposerDraft\(\)/.test(appSource), 'Sending a message must clear its composer draft');
 }
 
 // Goal 6: WS 心跳 + 断线内容补齐。
