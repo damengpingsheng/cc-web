@@ -1988,6 +1988,31 @@
     return !!(state && state.ccWebView === 'session-overview');
   }
 
+  function getHistorySessionId(state = history.state) {
+    return state && typeof state === 'object' && typeof state.ccWebSessionId === 'string'
+      ? state.ccWebSessionId
+      : null;
+  }
+
+  function buildSessionHistoryState(sessionId) {
+    const currentState = history.state && typeof history.state === 'object' ? history.state : {};
+    const nextState = { ...currentState, ccWebSessionId: sessionId };
+    delete nextState.ccWebView;
+    return nextState;
+  }
+
+  function pushSessionHistory(sessionId) {
+    if (!sessionId || getHistorySessionId() === sessionId) return;
+    history.pushState(buildSessionHistoryState(sessionId), '', location.href);
+  }
+
+  function replaceSessionHistory(sessionId) {
+    if (!sessionId) return;
+    const currentState = history.state && typeof history.state === 'object' ? history.state : {};
+    if (currentState.ccWebSessionId === sessionId && !currentState.ccWebView) return;
+    history.replaceState(buildSessionHistoryState(sessionId), '', location.href);
+  }
+
   function openSessionOverview(options = {}) {
     if (!sessionOverview || sessionOverviewOpen) return;
     if (!options.fromHistory && !isSessionOverviewHistoryState(history.state)) {
@@ -2025,11 +2050,18 @@
     const meta = getSessionMeta(sessionId);
     if (!meta) return;
     const targetAgent = normalizeAgent(meta.agent);
-    closeSessionOverview({ restoreFocus: false });
+    if (getHistorySessionId() === sessionId) {
+      closeSessionOverview({ restoreFocus: false });
+    } else {
+      // Replace the overview entry so Back returns to the session that opened it,
+      // not the overview that was just dismissed.
+      closeSessionOverview({ fromHistory: true, restoreFocus: false });
+      replaceSessionHistory(sessionId);
+    }
     if (targetAgent !== currentAgent) {
       syncViewForAgent(targetAgent, { preserveCurrent: false, loadLast: false });
     }
-    openSession(sessionId);
+    openSession(sessionId, { fromHistory: true });
   }
 
   function shouldOverlayRuntimeBadge() {
@@ -2396,6 +2428,11 @@
     if (!sessionId) return;
     const meta = getSessionMeta(sessionId);
     if (meta?.title) setCurrentSessionTitle(meta.title);
+    if (options.recordHistory) {
+      pushSessionHistory(sessionId);
+    } else if (!options.fromHistory && !getHistorySessionId() && !history.state?.ccWebView) {
+      replaceSessionHistory(sessionId);
+    }
     if (options.forceSync) {
       beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: true, label: options.label });
       return;
@@ -5960,7 +5997,7 @@
         showGroupPicker(s);
         return;
       }
-      openSession(s.id);
+      openSession(s.id, { recordHistory: true });
     });
 
     // 桌面拖拽归组：dragstart 携带 sessionId，drop 目标为分组头
@@ -7174,6 +7211,10 @@
     } else if (sessionOverviewOpen) {
       closeSessionOverview({ fromHistory: true });
     }
+    const sessionId = getHistorySessionId(event.state);
+    if (sessionId && sessionId !== currentSessionId) {
+      openSession(sessionId, { fromHistory: true });
+    }
   });
   document.addEventListener('click', (e) => {
     if (!newChatDropdown.hidden &&
@@ -7332,7 +7373,7 @@
     if (sessionId) {
       toast.style.cursor = 'pointer';
       toast.addEventListener('click', () => {
-        openSession(sessionId);
+        openSession(sessionId, { recordHistory: true });
         toast.remove();
       });
     }
