@@ -1994,10 +1994,15 @@
       : null;
   }
 
-  function buildSessionHistoryState(sessionId) {
+  function buildSessionHistoryState(sessionId, options = {}) {
     const currentState = history.state && typeof history.state === 'object' ? history.state : {};
-    const nextState = { ...currentState, ccWebSessionId: sessionId };
-    delete nextState.ccWebView;
+    const nextState = { ...currentState };
+    if (sessionId) {
+      nextState.ccWebSessionId = sessionId;
+    } else {
+      delete nextState.ccWebSessionId;
+    }
+    if (!options.preserveView) delete nextState.ccWebView;
     return nextState;
   }
 
@@ -2006,11 +2011,17 @@
     history.pushState(buildSessionHistoryState(sessionId), '', location.href);
   }
 
-  function replaceSessionHistory(sessionId) {
-    if (!sessionId) return;
+  function replaceSessionHistory(sessionId, options = {}) {
     const currentState = history.state && typeof history.state === 'object' ? history.state : {};
-    if (currentState.ccWebSessionId === sessionId && !currentState.ccWebView) return;
-    history.replaceState(buildSessionHistoryState(sessionId), '', location.href);
+    const hasSameSession = sessionId
+      ? currentState.ccWebSessionId === sessionId
+      : !Object.prototype.hasOwnProperty.call(currentState, 'ccWebSessionId');
+    if (hasSameSession && (options.preserveView || !currentState.ccWebView)) return;
+    history.replaceState(buildSessionHistoryState(sessionId, options), '', location.href);
+  }
+
+  function syncSessionHistory(sessionId) {
+    replaceSessionHistory(sessionId || null, { preserveView: true });
   }
 
   function openSessionOverview(options = {}) {
@@ -2232,6 +2243,7 @@
   function resetChatView(agent) {
     setCurrentAgent(agent);
     currentSessionId = null;
+    syncSessionHistory(null);
     loadedHistorySessionId = null;
     clearSessionLoading();
     setCurrentSessionRunningState(false);
@@ -2277,6 +2289,7 @@
       activeToolCalls.clear();
     }
     currentSessionId = snapshot.sessionId;
+    syncSessionHistory(currentSessionId);
     loadedHistorySessionId = snapshot.sessionId;
     setLastSessionForAgent(snapshot.agent, currentSessionId);
     setCurrentSessionTitle(snapshot.title);

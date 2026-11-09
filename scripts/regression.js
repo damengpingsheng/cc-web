@@ -179,6 +179,35 @@ function testCodexHistoryMigration() {
   console.log('Codex history migration checks passed.');
 }
 
+function testSessionHistorySync() {
+  const source = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  const start = source.indexOf('  function getHistorySessionId');
+  const end = source.indexOf('  function openSessionOverview', start);
+  assert(start >= 0 && end > start, 'Session history helpers must be extractable from public/app.js');
+  const history = { state: null };
+  history.pushState = (state) => { history.state = state; };
+  history.replaceState = (state) => { history.state = state; };
+  const location = { href: 'http://localhost/' };
+  const helpers = new Function('history', 'location', `${source.slice(start, end)}
+    return { pushSessionHistory, replaceSessionHistory, syncSessionHistory, getHistorySessionId };`)(history, location);
+
+  helpers.pushSessionHistory('session-a');
+  assert(history.state.ccWebSessionId === 'session-a', 'Opening a session must record its id in browser history');
+
+  history.state = { ...history.state, ccWebView: 'session-overview' };
+  helpers.syncSessionHistory('session-b');
+  assert(history.state.ccWebSessionId === 'session-b', 'Confirmed session changes must update the current history entry');
+  assert(history.state.ccWebView === 'session-overview', 'Session history sync must preserve the overview view marker');
+
+  helpers.syncSessionHistory(null);
+  assert(!Object.prototype.hasOwnProperty.call(history.state, 'ccWebSessionId'), 'Leaving a session must clear its stale history id');
+  assert(history.state.ccWebView === 'session-overview', 'Clearing a session must preserve the overview view marker');
+  assert(/function resetChatView\(agent\)[\s\S]{0,200}syncSessionHistory\(null\)/.test(source), 'Resetting chat view must clear the stale history session id');
+  assert(/function applySessionSnapshot\(snapshot[\s\S]{0,1000}syncSessionHistory\(currentSessionId\)/.test(source), 'Applying a session snapshot must sync the current history session id');
+
+  console.log('Session history sync checks passed.');
+}
+
 function sql(dbPath, statement) {
   const result = spawnSync('sqlite3', [dbPath, statement], { encoding: 'utf8' });
   if (result.status !== 0) throw new Error(result.stderr || `sqlite3 failed: ${statement}`);
@@ -612,6 +641,7 @@ async function testRecoveryReplayRuntime() {
 
 async function main() {
   testCodexHistoryMigration();
+  testSessionHistorySync();
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
   const sessionsDir = path.join(tempRoot, 'sessions');
