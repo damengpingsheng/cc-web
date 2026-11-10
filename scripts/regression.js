@@ -63,6 +63,10 @@ const {
   mergeCodexHistoryByUserTurn,
   needsCodexToolLayoutMigration,
 } = require(path.join(REPO_DIR, 'lib', 'codex-history-migration.js'));
+const {
+  createSessionBodySearch,
+  extractMessageText,
+} = require(path.join(REPO_DIR, 'lib', 'session-body-search.js'));
 
 function mkdirp(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -177,6 +181,104 @@ function testCodexHistoryMigration() {
   assert(localBoundaryMerged[1].segments?.[0]?.content === 'same short reply', 'Exact short assistant replies should migrate');
   assert(localBoundaryMerged.some((message) => message.content === 'local boundary notice'), 'Codex migration must retain local system messages inside a turn');
   console.log('Codex history migration checks passed.');
+}
+
+function testSessionOverviewMatcher() {
+  const source = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  const start = source.indexOf('  function createSessionOverviewMatcher');
+  const end = source.indexOf('  function getSessionOverviewMatches', start);
+  assert(start >= 0 && end > start, 'Session overview matcher must be extractable from public/app.js');
+  const createMatcher = new Function(`${source.slice(start, end)}\nreturn createSessionOverviewMatcher;`)();
+
+  const plain = createMatcher('foo.*', false);
+  assert(!plain.error && plain.matches(['literal foo.* text']), 'Plain search must treat regex metacharacters literally');
+  assert(!plain.matches(['fooxx text']), 'Plain search must not interpret .* as a wildcard');
+  assert(createMatcher('ALPHA', false).matches(['alpha']), 'Plain search must remain case-insensitive');
+
+  const regex = createMatcher('^sensor/(\\d+)$', true);
+  assert(!regex.error && regex.matches(['sensor/42']), 'Regex search must match a full field');
+  assert(regex.matches(['sensor/42']), 'Regex matcher must be reusable across renders');
+  assert(!regex.matches(['prefix sensor/42']), 'Regex anchors must apply to each field independently');
+  assert(!createMatcher('sensor/42\\nother', true).matches(['sensor/42', 'other']), 'Regex must not match across joined fields');
+  assert(createMatcher('codex', true).matches(['Codex']), 'Regex search must be case-insensitive');
+
+  const invalid = createMatcher('[unclosed', true);
+  assert(invalid.error === '正则无效' && !invalid.matches(['[unclosed']), 'Invalid regex must report an error and match nothing');
+  const tooLong = createMatcher('a'.repeat(257), true);
+  assert(tooLong.error === '搜索词过长' && !tooLong.matches(['a'.repeat(257)]), 'Oversized query must be rejected');
+  assert(createMatcher('', true).matches(['anything']), 'Empty query must match every session');
+
+  console.log('Session overview matcher checks passed.');
+}
+
+function testSessionBodySearch() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-body-search-'));
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  mkdirp(sessionsDir);
+  const writeSession = (id, messages) => {
+    fs.writeFileSync(path.join(sessionsDir, `${id}.json`), JSON.stringify({ id, messages }));
+  };
+
+  try {
+    assert(extractMessageText({ role: 'user', content: '  user body  ' }) === 'user body', 'User body extraction must trim text');
+    assert(extractMessageText({ role: 'assistant', content: [{ type: 'text', text: 'answer' }, { type: 'tool_use', input: 'secret' }] }) === 'answer', 'Assistant extraction must ignore non-text blocks');
+    assert(extractMessageText({ role: 'assistant', content: [{ type: 'tool_result', content: 'secret' }] }) === '', 'Tool result blocks must not be searchable');
+    assert(!extractMessageText({ role: 'system', content: 'system body' }), 'System messages must not be searchable');
+    assert(!extractMessageText({ role: 'user', kind: 'local-command', content: 'local body' }), 'Local commands must not be searchable');
+    assert(!extractMessageText({ role: 'system', kind: 'compact-summary', content: 'summary body' }), 'Compact summaries must not be searchable');
+
+    writeSession('alpha', [
+      { role: 'user', content: 'Needle in user body' },
+      { role: 'assistant', content: 'needle in assistant body', toolCalls: [{ input: 'tool-only-needle' }] },
+      { role: 'system', content: 'needle in system' },
+      { role: 'user', kind: 'local-command', content: 'needle in local command' },
+      { role: 'system', kind: 'compact-summary', content: 'needle in compact summary' },
+    ]);
+    writeSession('tool-only', [
+      { role: 'assistant', content: '', toolCalls: [{ name: 'exec', input: 'tool-only-needle' }], segments: [{ type: 'tools', toolCalls: [{ input: 'tool-only-needle' }] }] },
+    ]);
+    writeSession('regex', [{ role: 'assistant', content: 'sensor/42 and SENSOR/7' }]);
+    writeSession('whitespace', [{ role: 'user', content: `${'a'.repeat(90)}\n\t  target phrase ${'b'.repeat(90)}` }]);
+    writeSession('slow-regex', [{ role: 'user', content: `${'a'.repeat(5000)}!` }]);
+
+    const search = createSessionBodySearch({ sessionsDir });
+    const plain = search.search('NEEDLE');
+    assert(plain.ok && plain.results.length === 1, 'Plain body search must find only user/assistant bodies');
+    assert(plain.results[0].sessionId === 'alpha' && plain.results[0].matchCount === 2, 'Plain body search must count user and assistant matches');
+    assert(!plain.results.some((result) => result.sessionId === 'tool-only'), 'Tool calls must not be searchable');
+    assert(search.search('tool-only-needle').results.length === 0, 'Tool-only content must not match');
+    assert(search.search('system').results.length === 0, 'System content must not match');
+    assert(search.search('local command').results.length === 0, 'Local commands must not match');
+    assert(search.search('compact summary').results.length === 0, 'Compact summaries must not match');
+
+    const regex = search.search('^sensor/\\d+$', true);
+    assert(regex.ok && regex.results.length === 0, 'Regex anchors must not span a whole multi-hit message');
+    const regexHits = search.search('sensor/\\d+', true);
+    assert(regexHits.ok && regexHits.results[0]?.sessionId === 'regex' && regexHits.results[0]?.matchCount === 2, 'Regex body search must count all case-insensitive matches');
+    assert(!search.search('[unclosed', true).ok, 'Invalid regex must return an error');
+    assert(search.search('a'.repeat(257)).error === '搜索词过长', 'Oversized body query must be rejected');
+    assert(search.search('').results.length === 0, 'Empty body query must return no results');
+
+    const snippet = search.search('target phrase').results[0];
+    assert(snippet.snippet.includes('target phrase') && snippet.snippet.includes('\n') === false, 'Snippet must retain the hit and collapse whitespace');
+    assert(snippet.snippet.slice(snippet.snippetStart, snippet.snippetEnd) === 'target phrase', 'Snippet offsets must point at the normalized hit');
+
+    const before = search.search('needle').results.find((result) => result.sessionId === 'alpha').matchCount;
+    writeSession('many-matches', [{ role: 'user', content: 'needle '.repeat(1001) }]);
+    const capped = search.search('needle').results.find((result) => result.sessionId === 'many-matches');
+    assert(capped?.matchCount === 1000 && capped.matchCountCapped, 'Per-session match count must cap at 1000');
+    writeSession('alpha', [{ role: 'user', content: 'needle needle needle' }]);
+    const updated = search.search('needle').results.find((result) => result.sessionId === 'alpha');
+    assert(before === 2 && updated.matchCount === 3, 'Changed session files must be parsed again');
+    fs.rmSync(path.join(sessionsDir, 'alpha.json'));
+    assert(!search.search('needle').results.some((result) => result.sessionId === 'alpha'), 'Deleted sessions must disappear from results');
+
+    const timeout = search.search('^(a+)+$', true);
+    assert(!timeout.ok && timeout.error === '正则执行超时', 'Catastrophic regex must be stopped by the timeout');
+    console.log('Session body search checks passed.');
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
 }
 
 function testSessionHistorySync() {
@@ -641,6 +743,8 @@ async function testRecoveryReplayRuntime() {
 
 async function main() {
   testCodexHistoryMigration();
+  testSessionOverviewMatcher();
+  testSessionBodySearch();
   testSessionHistorySync();
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
@@ -1494,6 +1598,7 @@ async function main() {
 
   // 会话分组协议（group_create/rename/delete + session_move）
   await testSessionGroups();
+  await testSessionBodySearchProtocol();
 
   // 会话标题（首问候选识别 + 运行中保护 + 自动整理 + 手工标题来源保护）
   await testSessionTitleAudit();
@@ -2218,6 +2323,57 @@ async function testSessionGroups() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Session group checks passed.');
+}
+
+async function testSessionBodySearchProtocol() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-body-protocol-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir]) mkdirp(dir);
+  const password = 'BodySearch!234';
+  const port = await getFreePort();
+  const now = new Date().toISOString();
+  fs.writeFileSync(path.join(sessionsDir, 'body-protocol.json'), JSON.stringify({
+    id: 'body-protocol',
+    title: 'Body protocol',
+    agent: 'claude',
+    created: now,
+    updated: now,
+    messages: [
+      { role: 'user', content: 'needle in user body' },
+      { role: 'assistant', content: 'needle in assistant body', toolCalls: [{ name: 'exec', input: 'needle in tool input' }] },
+      { role: 'system', kind: 'compact-summary', content: 'needle in compact summary' },
+    ],
+  }));
+
+  await withServer({
+    PORT: String(port), CC_WEB_PASSWORD: password, CC_WEB_CONFIG_DIR: configDir,
+    CC_WEB_SESSIONS_DIR: sessionsDir, CC_WEB_LOGS_DIR: logsDir, HOME: homeDir,
+    CLAUDE_PATH: MOCK_CLAUDE, CODEX_PATH: MOCK_CODEX,
+  }, async () => {
+    const { ws, messages } = await connectWs(port, password);
+    await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+    ws.send(JSON.stringify({ type: 'search_session_bodies', requestId: 'body-request-1', query: 'NEEDLE', regex: false }));
+    const result = await nextMessage(messages, ws, (msg) => msg.type === 'session_body_search_result' && msg.requestId === 'body-request-1');
+    assert(result.ok && result.query === 'NEEDLE' && result.regex === false, 'Body search response must echo request metadata');
+    assert(result.results.length === 1 && result.results[0].sessionId === 'body-protocol', 'Body search must return the matching session');
+    assert(result.results[0].matchCount === 2, 'Body search must count user and assistant text only');
+    assert(result.results[0].snippet.includes('needle') && result.results[0].snippetStart >= 0, 'Body search must return a snippet');
+
+    ws.send(JSON.stringify({ type: 'search_session_bodies', requestId: 'body-request-2', query: 'tool input', regex: false }));
+    const toolResult = await nextMessage(messages, ws, (msg) => msg.type === 'session_body_search_result' && msg.requestId === 'body-request-2');
+    assert(toolResult.ok && toolResult.results.length === 0, 'Tool call content must not be searchable');
+
+    ws.send(JSON.stringify({ type: 'search_session_bodies', requestId: 'body-request-3', query: '[unclosed', regex: true }));
+    const invalid = await nextMessage(messages, ws, (msg) => msg.type === 'session_body_search_result' && msg.requestId === 'body-request-3');
+    assert(!invalid.ok && invalid.error === '正则无效' && invalid.results.length === 0, 'Invalid regex errors must propagate over WebSocket');
+    ws.close();
+  });
+
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  console.log('Session body search protocol checks passed.');
 }
 
 // 会话标题：手动体检+自动整理。自动整理只接管首问/此前自动标题，手动标题不可覆盖。

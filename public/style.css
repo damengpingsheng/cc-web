@@ -3406,6 +3406,11 @@ mark.search-hit.current {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-light);
 }
+.session-overview-search.invalid { border-color: var(--danger); }
+.session-overview-search.invalid:focus-within {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 14%, transparent);
+}
 .session-overview-search svg {
   width: 17px;
   height: 17px;
@@ -3424,12 +3429,39 @@ mark.search-hit.current {
   color: var(--text-primary);
   font-size: 14px;
 }
+.session-overview-search input:focus-visible { outline: 0; }
 .session-overview-search input::placeholder { color: var(--text-muted); }
+.session-overview-search-mode {
+  flex-shrink: 0;
+  min-width: 28px;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.session-overview-search-mode:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.session-overview-search-mode.active {
+  border-color: var(--accent);
+  background: var(--accent-light);
+  color: var(--accent);
+}
+.session-overview-regex {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
 .session-overview-match-count {
   flex-shrink: 0;
   color: var(--text-muted);
   font-size: 11px;
 }
+.session-overview-match-count.invalid { color: var(--danger); }
 .session-overview-actions {
   display: flex;
   align-items: center;
@@ -3962,6 +3994,31 @@ mark.search-hit.current {
 .session-overview-preview.empty {
   color: var(--text-muted);
   font-size: 11px;
+}
+.session-overview-body-hit {
+  align-items: center;
+  gap: 7px;
+}
+.session-overview-body-hit-label {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--accent-light);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 800;
+}
+.session-overview-body-hit-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-overview-body-hit mark {
+  padding: 0 1px;
+  border-radius: 2px;
+  background: #ffd83d;
+  box-shadow: inset 0 0 0 1px rgba(160, 104, 0, 0.45);
+  color: inherit;
 }
 .session-overview-item-meta {
   display: flex;

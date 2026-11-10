@@ -7,7 +7,7 @@
  *   636-798   session LRU 缓存
  *   799-1043  附件与图片上传
  *   1044-1448 agent/session 视图切换 + marked/hljs 配置
- *   1449-1870 socket 通信 + handleServerMessage（30 case 无 default）
+ *   1449-1870 socket 通信 + handleServerMessage（无 default）
  *   1870-2500 流式渲染（flushRender / renderMarkdown / createMsgElement）
  *             + tool 渲染（command_execution/reasoning/file_change/mcp_tool_call/AskUserQuestion 分流）
  *   2500-2700 Goal 状态机 + 系统消息 + 错误
@@ -17,8 +17,8 @@
  *   3691-4453 设置面板（含模板编辑 / Codex Profile / Claude 本地配置 modal）
  *   4659-5100 新建会话 modal + Native/Codex 导入 modal
  *
- * 协议契约：服务端→客户端 30 个 type 在 handleServerMessage 处理；
- * 客户端→服务端消息见 server.js switch + auth 分支（共 31 type）。
+ * 协议契约：服务端→客户端消息统一在 handleServerMessage 处理；
+ * 客户端→服务端消息见 server.js switch + auth 分支。
  * 详见 docs/PROTOCOL.md。
  *
  * 安全注意：renderMarkdown 经 DOMPurify sanitize + decorateCodeBlocks DOM API 注入受信任 UI。
@@ -186,6 +186,13 @@
   let sessionOverviewAgent = 'all';
   let sessionOverviewStatus = 'all';
   let sessionOverviewQuery = '';
+  let sessionOverviewRegex = false;
+  let sessionOverviewBodySearch = false;
+  let sessionOverviewBodyResults = new Map();
+  let sessionOverviewBodyTimer = null;
+  let sessionOverviewBodyRequestId = 0;
+  let sessionOverviewBodyLoading = false;
+  let sessionOverviewBodyError = '';
   let sessionTitleAuditCandidates = [];
   let sessionTitleAuditLoading = false;
   let currentTheme = (document.documentElement.dataset.theme || localStorage.getItem('cc-web-theme') || 'washi');
@@ -286,6 +293,8 @@
   const searchWholeWord = $('#msg-search-whole-word');
   const sessionOverview = $('#session-overview');
   const sessionOverviewSearch = $('#session-overview-search');
+  const sessionOverviewBodyToggle = $('#session-overview-body-search');
+  const sessionOverviewRegexToggle = $('#session-overview-regex');
   const sessionOverviewMatchCount = $('#session-overview-match-count');
   const sessionOverviewFocus = $('#session-overview-focus');
   const sessionOverviewList = $('#session-overview-list');
@@ -1627,8 +1636,82 @@
     return new Date(b.updated || 0) - new Date(a.updated || 0);
   }
 
-  function getSessionOverviewMatches() {
-    const query = sessionOverviewQuery.trim().toLocaleLowerCase();
+  function createSessionOverviewMatcher(query, useRegex) {
+    const value = String(query || '').trim();
+    if (!value) return { matches: () => true, error: '' };
+    if (value.length > 256) return { matches: () => false, error: '搜索词过长' };
+    if (!useRegex) {
+      const needle = value.toLocaleLowerCase();
+      return {
+        matches: (texts) => texts.some((text) => String(text || '').toLocaleLowerCase().includes(needle)),
+        error: '',
+      };
+    }
+    try {
+      const regex = new RegExp(value, 'iu');
+      return {
+        matches: (texts) => texts.some((text) => {
+          regex.lastIndex = 0;
+          return regex.test(String(text || ''));
+        }),
+        error: '',
+      };
+    } catch {
+      return { matches: () => false, error: '正则无效' };
+    }
+  }
+
+  function clearSessionOverviewBodySearch() {
+    if (sessionOverviewBodyTimer) clearTimeout(sessionOverviewBodyTimer);
+    sessionOverviewBodyTimer = null;
+    sessionOverviewBodyRequestId++;
+    sessionOverviewBodyResults = new Map();
+    sessionOverviewBodyLoading = false;
+    sessionOverviewBodyError = '';
+  }
+
+  function scheduleSessionOverviewBodySearch() {
+    if (sessionOverviewBodyTimer) clearTimeout(sessionOverviewBodyTimer);
+    sessionOverviewBodyTimer = null;
+    sessionOverviewBodyRequestId++;
+    const requestId = String(sessionOverviewBodyRequestId);
+    const query = sessionOverviewQuery.trim();
+    const useRegex = sessionOverviewRegex;
+    const matcher = createSessionOverviewMatcher(query, sessionOverviewRegex);
+    if (!sessionOverviewBodySearch || !query || matcher.error) {
+      clearSessionOverviewBodySearch();
+      return;
+    }
+    sessionOverviewBodyResults = new Map();
+    sessionOverviewBodyError = '';
+    sessionOverviewBodyLoading = true;
+    renderSessionOverview();
+    sessionOverviewBodyTimer = setTimeout(() => {
+      sessionOverviewBodyTimer = null;
+      if (requestId !== String(sessionOverviewBodyRequestId)
+          || !sessionOverviewBodySearch
+          || sessionOverviewQuery.trim() !== query
+          || sessionOverviewRegex !== useRegex) return;
+      if (!isWsConnected()) {
+        sessionOverviewBodyLoading = false;
+        sessionOverviewBodyError = '连接已断开，正文搜索暂不可用';
+        renderSessionOverview();
+        return;
+      }
+      send({
+        type: 'search_session_bodies',
+        requestId,
+        query,
+        regex: useRegex,
+      });
+    }, 300);
+  }
+
+  function getSessionOverviewBodyResult(sessionId) {
+    return sessionOverviewBodySearch ? sessionOverviewBodyResults.get(sessionId) : null;
+  }
+
+  function getSessionOverviewMatches(matcher = createSessionOverviewMatcher(sessionOverviewQuery, sessionOverviewRegex)) {
     return sessions
       .filter((session) => sessionOverviewAgent === 'all' || normalizeAgent(session.agent) === sessionOverviewAgent)
       .filter((session) => sessionOverviewStatus === 'all'
@@ -1636,8 +1719,7 @@
         || (sessionOverviewStatus === 'unread' && session.hasUnread)
         || (sessionOverviewStatus === 'favorite' && isSessionOverviewFavorite(session.id)))
       .filter((session) => {
-        if (!query) return true;
-        const haystack = [
+        const searchableFields = [
           session.title,
           session.cwd,
           session.lastMessage,
@@ -1645,13 +1727,27 @@
           session.codexThreadId,
           AGENT_LABELS[normalizeAgent(session.agent)],
           getSessionOverviewGroupName(session),
-        ].filter(Boolean).join('\n').toLocaleLowerCase();
-        return haystack.includes(query);
+        ].filter(Boolean);
+        return matcher.matches(searchableFields) || !!getSessionOverviewBodyResult(session.id);
       })
       .sort(compareSessionOverviewItems);
   }
 
   function buildSessionOverviewPreview(session, agentLabel) {
+    const bodyResult = getSessionOverviewBodyResult(session.id);
+    if (bodyResult) {
+      const text = String(bodyResult.snippet || '');
+      const start = Math.max(0, Math.min(Number(bodyResult.snippetStart) || 0, text.length));
+      const end = Math.max(start, Math.min(Number(bodyResult.snippetEnd) || 0, text.length));
+      const highlighted = start < end
+        ? `${escapeHtml(text.slice(0, start))}<mark>${escapeHtml(text.slice(start, end))}</mark>${escapeHtml(text.slice(end))}`
+        : escapeHtml(text);
+      const count = Number(bodyResult.matchCount) || 0;
+      return `<span class="session-overview-preview session-overview-body-hit" title="${escapeHtml(text)}">
+        <span class="session-overview-body-hit-label">正文命中 ${count}${bodyResult.matchCountCapped ? '+' : ''} 处</span>
+        <span class="session-overview-body-hit-text">${highlighted}</span>
+      </span>`;
+    }
     if (!session.lastMessage) {
       return '<span class="session-overview-preview empty">还没有消息</span>';
     }
@@ -1777,7 +1873,23 @@
       button.setAttribute('aria-pressed', active ? 'true' : 'false');
     });
 
-    const matches = getSessionOverviewMatches();
+    const searchMatcher = createSessionOverviewMatcher(sessionOverviewQuery, sessionOverviewRegex);
+    const matches = getSessionOverviewMatches(searchMatcher);
+    const searchError = searchMatcher.error || sessionOverviewBodyError;
+    const searchBox = sessionOverviewSearch?.closest('.session-overview-search');
+    searchBox?.classList.toggle('invalid', !!searchError);
+    if (sessionOverviewRegexToggle) {
+      sessionOverviewRegexToggle.classList.toggle('active', sessionOverviewRegex);
+      sessionOverviewRegexToggle.setAttribute('aria-pressed', sessionOverviewRegex ? 'true' : 'false');
+      sessionOverviewRegexToggle.title = sessionOverviewRegex ? '关闭正则表达式搜索' : '使用正则表达式搜索';
+      sessionOverviewRegexToggle.setAttribute('aria-label', sessionOverviewRegexToggle.title);
+    }
+    if (sessionOverviewBodyToggle) {
+      sessionOverviewBodyToggle.classList.toggle('active', sessionOverviewBodySearch);
+      sessionOverviewBodyToggle.setAttribute('aria-pressed', sessionOverviewBodySearch ? 'true' : 'false');
+      sessionOverviewBodyToggle.title = sessionOverviewBodySearch ? '关闭正文搜索' : '搜索用户和 Agent 正文';
+      sessionOverviewBodyToggle.setAttribute('aria-label', sessionOverviewBodyToggle.title);
+    }
     const favoriteMatches = matches.filter((session) => isSessionOverviewFavorite(session.id));
     const focusSessions = matches
       .filter((session) => !isSessionOverviewFavorite(session.id))
@@ -1786,15 +1898,24 @@
     const regularMatches = matches.filter((session) => !isSessionOverviewFavorite(session.id) && !focusIds.has(session.id));
     renderSessionOverviewFocus(focusSessions);
     if (sessionOverviewMatchCount) {
-      sessionOverviewMatchCount.textContent = (sessionOverviewQuery.trim() || sessionOverviewStatus !== 'all' || sessionOverviewAgent !== 'all')
-        ? `${matches.length} 条` : '';
+      sessionOverviewMatchCount.classList.toggle('invalid', !!searchError);
+      sessionOverviewMatchCount.textContent = searchError
+        || (sessionOverviewBodyLoading ? '搜索正文…'
+          : ((sessionOverviewQuery.trim() || sessionOverviewStatus !== 'all' || sessionOverviewAgent !== 'all')
+            ? `${matches.length} 条` : ''));
     }
     if (matches.length === 0) {
       const filtered = sessionOverviewQuery.trim() || sessionOverviewStatus !== 'all' || sessionOverviewAgent !== 'all';
+      const emptyTitle = searchError
+        ? (searchMatcher.error ? '正则表达式无效' : '正文搜索失败')
+        : (filtered ? '没有匹配的会话' : '还没有会话');
+      const emptyHint = searchError
+        ? (searchMatcher.error ? '修正表达式后再试，或关闭“.*”使用普通搜索。' : searchError)
+        : (filtered ? '调整搜索词或筛选条件后再试。' : '新开会话后，Claude 和 Codex 的会话都会汇总到这里。');
       sessionOverviewList.innerHTML = `
         <div class="session-overview-empty">
-          <h2>${filtered ? '没有匹配的会话' : '还没有会话'}</h2>
-          <p>${filtered ? '调整搜索词或筛选条件后再试。' : '新开会话后，Claude 和 Codex 的会话都会汇总到这里。'}</p>
+          <h2>${emptyTitle}</h2>
+          <p>${emptyHint}</p>
           ${filtered ? '<button type="button" data-overview-clear>清除筛选</button>' : ''}
         </div>`;
       return;
@@ -2037,6 +2158,7 @@
     if (app) app.inert = true;
     if (window.matchMedia('(max-width: 768px)').matches) closeSidebar();
     renderSessionOverview();
+    if (sessionOverviewBodySearch && sessionOverviewQuery.trim()) scheduleSessionOverviewBodySearch();
     requestAnimationFrame(() => sessionOverviewSearch?.focus());
   }
 
@@ -2052,6 +2174,7 @@
     sessionOverviewOpen = false;
     sessionOverview.hidden = true;
     sessionOverview.setAttribute('aria-hidden', 'true');
+    clearSessionOverviewBodySearch();
     if (app) app.inert = false;
     if (options.restoreFocus !== false) sessionOverviewBtn?.focus();
     if (shouldRestoreHistory) history.back();
@@ -2770,7 +2893,7 @@
 
   // --- Server Message Handler ---
   /**
-   * 服务端→客户端消息分发（30 个 case，无 default）。
+   * 服务端→客户端消息分发（无 default）。
    *
    * 职责混合：鉴权 / 会话同步 / 流式渲染 / 配置同步 / Goal 状态机。
    * 完整 type 清单与契约见 docs/PROTOCOL.md "服务端 → 客户端"。
@@ -2979,6 +3102,19 @@
           setSessionTitleAuditStatus(msg.message || '标题更新失败，请重试。', 'warning');
           updateSessionTitleAuditApplyState();
         }
+        break;
+
+      case 'session_body_search_result':
+        if (!sessionOverviewOpen || !sessionOverviewBodySearch || msg.requestId !== String(sessionOverviewBodyRequestId)) break;
+        sessionOverviewBodyLoading = false;
+        sessionOverviewBodyError = msg.ok ? '' : (msg.error || '正文搜索失败');
+        sessionOverviewBodyResults = new Map();
+        if (msg.ok && Array.isArray(msg.results)) {
+          for (const result of msg.results) {
+            if (result?.sessionId) sessionOverviewBodyResults.set(result.sessionId, result);
+          }
+        }
+        renderSessionOverview();
         break;
 
       case 'session_renamed':
@@ -7166,7 +7302,21 @@
   });
   sessionOverviewSearch?.addEventListener('input', () => {
     sessionOverviewQuery = sessionOverviewSearch.value;
+    if (sessionOverviewBodySearch) scheduleSessionOverviewBodySearch();
     renderSessionOverview();
+  });
+  sessionOverviewBodyToggle?.addEventListener('click', () => {
+    sessionOverviewBodySearch = !sessionOverviewBodySearch;
+    if (sessionOverviewBodySearch) scheduleSessionOverviewBodySearch();
+    else clearSessionOverviewBodySearch();
+    renderSessionOverview();
+    sessionOverviewSearch?.focus();
+  });
+  sessionOverviewRegexToggle?.addEventListener('click', () => {
+    sessionOverviewRegex = !sessionOverviewRegex;
+    if (sessionOverviewBodySearch) scheduleSessionOverviewBodySearch();
+    renderSessionOverview();
+    sessionOverviewSearch?.focus();
   });
   document.querySelectorAll('[data-overview-agent]').forEach((button) => {
     button.addEventListener('click', () => {
@@ -7191,6 +7341,9 @@
       sessionOverviewAgent = 'all';
       sessionOverviewStatus = 'all';
       sessionOverviewQuery = '';
+      sessionOverviewRegex = false;
+      sessionOverviewBodySearch = false;
+      clearSessionOverviewBodySearch();
       if (sessionOverviewSearch) sessionOverviewSearch.value = '';
       renderSessionOverview();
       sessionOverviewSearch?.focus();

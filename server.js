@@ -15,7 +15,7 @@
  *   1198-1311 normalizeSession / loadSession / saveSession
  *   1313-1799 进程生命周期：FileTailer / handleProcessComplete / recoverProcesses
  *   1801-1911 HTTP（仅 3 个端点：附件上传/删除/静态）
- *   1914-2076 WS 握手 + 客户端消息 switch（30 个 type）
+ *   1914-2076 WS 握手 + 客户端消息 switch
  *   2078-3760 WS handler 函数群（handleSlashCommand 2444 / handleMessage 3024 等）
  *   3762-3854 shutdown / killPortOccupant / listen
  *
@@ -35,6 +35,7 @@ const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('./lib/c
 const { createAuthStore } = require('./lib/auth');
 const { createCodexRolloutStore, CODEX_EMPTY_FINAL_RETRY_MARKER } = require('./lib/codex-rollouts');
 const { createClientIpResolver } = require('./lib/client-ip');
+const { createSessionBodySearch } = require('./lib/session-body-search');
 const {
   mergeCodexHistoryByUserTurn,
   needsCodexToolLayoutMigration,
@@ -731,6 +732,8 @@ const LOOP_MAX_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 // Active processes: sessionId -> { pid, ws, fullText, toolCalls, lastCost, tailer }
 const activeProcesses = new Map();
+
+const sessionBodySearch = createSessionBodySearch({ sessionsDir: SESSIONS_DIR });
 
 // Track which session each ws is viewing: ws -> sessionId
 const wsSessionMap = new Map();
@@ -2532,6 +2535,20 @@ function sendSessionList(ws) {
   }
 }
 
+function handleSearchSessionBodies(ws, msg) {
+  const query = typeof msg.query === 'string' ? msg.query.trim() : '';
+  const result = sessionBodySearch.search(query, msg.regex === true);
+  wsSend(ws, {
+    type: 'session_body_search_result',
+    requestId: typeof msg.requestId === 'string' ? msg.requestId : '',
+    query,
+    regex: msg.regex === true,
+    ok: result.ok,
+    error: result.error || '',
+    results: result.results,
+  });
+}
+
 // === 会话分组（groups.json） ===
 // 损坏文件容错：解析失败回退空分组（会话侧仅丢失归组信息，不阻塞启动）
 function loadGroups() {
@@ -3929,6 +3946,9 @@ wss.on('connection', (ws, req) => {
         break;
       case 'list_sessions':
         sendSessionList(ws);
+        break;
+      case 'search_session_bodies':
+        handleSearchSessionBodies(ws, msg);
         break;
       case 'detach_view':
         handleDetachView(ws);
