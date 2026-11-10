@@ -69,6 +69,9 @@ const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
 const GROUPS_CONFIG_PATH = path.join(CONFIG_DIR, 'groups.json');
+const JIRA_BASE_URL = (process.env.JIRA_BASE_URL || 'https://jira.aixin-chip.com').replace(/\/+$/, '');
+const JIRA_TOKEN_FILE = process.env.JIRA_TOKEN_FILE || path.join(process.env.HOME || process.env.USERPROFILE || '', '.jira-cli', 'token');
+const JIRA_TITLE_CACHE_TTL_MS = 10 * 60 * 1000;
 // WS 心跳间隔（毫秒）：每轮 ping 全部客户端，连续两轮无 pong 判定死连接 terminate
 const WS_PING_INTERVAL_MS = parseInt(process.env.CC_WEB_WS_PING_INTERVAL_MS, 10) || 25000;
 const PID_MONITOR_INTERVAL_MS = Math.max(20, parseInt(process.env.CC_WEB_PID_MONITOR_INTERVAL_MS, 10) || 2000);
@@ -1910,7 +1913,7 @@ function validateSessionTitleSuggestion(title, candidate) {
   if (!value) return 'empty';
   if (/[\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f]/.test(value)) return 'japanese-kana';
   if (value.includes('\ufffd')) return 'invalid-unicode';
-  const jiraIdPattern = /\b[A-Z][A-Z0-9]{1,9}-\d+\b/g;
+  const jiraIdPattern = /\b[A-Z][A-Z0-9]{1,9}-\d+\b/gi;
   if (jiraIdPattern.test(value) && !/\p{L}|\p{N}/u.test(value.replace(jiraIdPattern, ''))) return 'jira-id-only';
   if (/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i.test(value)) return 'session-id';
   if (/记录\s*[0-9a-f]{8}\s*会话/i.test(value)) return 'session-id-fragment';
@@ -1951,6 +1954,89 @@ function classifyPromptDerivedSessionTitle(session) {
 function truncateSessionTitleContext(text, limit) {
   const value = String(text || '').replace(/\s+/g, ' ').trim();
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
+const jiraTitleCache = new Map();
+
+function getJiraApiToken() {
+  if (process.env.JIRA_API_TOKEN) return process.env.JIRA_API_TOKEN.trim();
+  try {
+    return fs.readFileSync(JIRA_TOKEN_FILE, 'utf8').replace(/\s+/g, '');
+  } catch {
+    return '';
+  }
+}
+
+function extractJiraIds(candidate) {
+  const text = [candidate?.title, candidate?.firstLine, ...(candidate?.users || []), ...(candidate?.assistantTail || [])].join('\n');
+  return [...new Set((text.match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/gi) || [])
+    .filter((key) => /^[A-Z]+-\d+$/.test(key))
+    .map((key) => key.toUpperCase()))].slice(0, 5);
+}
+
+async function fetchJiraIssueSummary(key) {
+  const cached = jiraTitleCache.get(key);
+  if (cached && Date.now() - cached.ts < JIRA_TITLE_CACHE_TTL_MS) return cached.summary;
+  const token = getJiraApiToken();
+  if (!token) return '';
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5000);
+    let res;
+    try {
+      res = await fetch(`${JIRA_BASE_URL}/rest/api/2/issue/${encodeURIComponent(key)}?fields=summary`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+        signal: ac.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) return '';
+    const body = await res.json();
+    const summary = normalizeSessionTitleText(body?.fields?.summary).slice(0, 240);
+    if (!summary) return '';
+    jiraTitleCache.set(key, { summary, ts: Date.now() });
+    return summary;
+  } catch {
+    return '';
+  }
+}
+
+async function attachJiraIssues(candidate) {
+  const keys = extractJiraIds(candidate);
+  if (keys.length === 0) return candidate;
+  const summaries = await Promise.all(keys.map((key) => fetchJiraIssueSummary(key)));
+  const jiraIssues = keys.map((key, index) => ({ key, summary: summaries[index] })).filter((issue) => issue.summary);
+  return jiraIssues.length > 0 ? { ...candidate, jiraIssues } : candidate;
+}
+
+function buildJiraTitleFallback(candidate) {
+  for (const issue of candidate?.jiraIssues || []) {
+    const summary = normalizeSessionTitleText(issue.summary)
+      .replace(/^(?:【[^】]*】\s*)+/, '')
+      .trim();
+    if (!summary) continue;
+    const title = truncateSessionTitleContext(`${issue.key} ${summary}`, 48);
+    if (!validateSessionTitleSuggestion(title, candidate)) return title;
+  }
+  return '';
+}
+
+function titleIncludesJiraSummary(title, candidate) {
+  if (!candidate?.jiraIssues?.length) return true;
+  const value = normalizeSessionTitleText(title).toLowerCase();
+  return candidate.jiraIssues.some((issue) => {
+    const summary = normalizeSessionTitleText(issue.summary)
+      .replace(/^(?:【[^】]*】\s*)+/, '')
+      .replace(/[\s，,。.:：;；/\\|()（）\[\]【】_-]+/g, '')
+      .toLowerCase();
+    if (!summary) return false;
+    const compactTitle = value.replace(/[\s，,。.:：;；/\\|()（）\[\]【】_-]+/g, '');
+    if (compactTitle.includes(summary)) return true;
+    const terms = summary.match(/[a-z]+|\d+|[\u4e00-\u9fff]{2,}/gi) || [];
+    const matched = terms.filter((term) => compactTitle.includes(term.toLowerCase())).length;
+    return terms.length > 0 && matched >= Math.min(2, terms.length);
+  });
 }
 
 function auditSessionTitles() {
@@ -1999,12 +2085,13 @@ function buildSessionTitleSuggestionPrompt(candidates) {
     agent: candidate.agent,
     userMessages: candidate.users,
     assistantTail: candidate.assistantTail,
+    jiraIssues: candidate.jiraIssues || [],
   }));
   return `请整理 cc-web 会话标题。下面每个候选的旧标题由首条用户提问自动派生，不能直接沿用。
 
 规则：
 1. 阅读 userMessages 的需求顺序和 assistantTail 的最终有效结论，标题概括整段对话实际完成或调查的内容。
-2. 使用简体中文，优先使用 12-30 个中文字符的短名词或动作短语，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。对话涉及 Jira ID 时，标题要同时包含该 Jira ID 和实际工作摘要；太长可缩略摘要，但不能只输出一个 Jira ID。
+2. 使用简体中文，优先使用 12-30 个中文字符的短名词或动作短语，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。对话涉及 Jira ID 时，标题要同时包含该 Jira ID 和 jiraIssues 中对应工单标题的核心内容；工单标题太长可缩略，但不能只输出一个 Jira ID，也不能只写后续操作而丢掉工单主题。
 3. 去掉“帮我、我想、是否可以、可行吗、为什么、请”等提问外壳和问号。
 4. 后续实现或诊断改变了范围时，标题要覆盖最终范围；只有证据支持时才写“完成/修复”，否则用“分析、核查、排查、评审”等中性动词。
 5. 不使用日文假名；UUID 和内部会话 ID 只用于定位上下文，不能写进标题，也不能生成“记录某个会话”这类指令残片。
@@ -2082,11 +2169,12 @@ async function handleAuditSessionTitles(ws) {
     });
   }
 
-  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(candidates), { maxTokens: 4096, timeoutMs: 45000 });
-  const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, candidates) : new Map();
+  const enriched = await Promise.all(candidates.map(attachJiraIssues));
+  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(enriched), { maxTokens: 4096, timeoutMs: 45000 });
+  const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, enriched) : new Map();
   wsSend(ws, {
     type: 'session_title_audit',
-    candidates: candidates.map((candidate) => ({
+    candidates: enriched.map((candidate) => ({
       ...candidate,
       suggestion: suggestions.get(candidate.id) || '',
     })),
@@ -2166,9 +2254,13 @@ function scheduleAutoSessionTitle(sessionId) {
   const expectedMessageCount = session.messages.length;
 
   state.running = (async () => {
-    const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt([candidate]), { maxTokens: 4096, timeoutMs: 45000 });
-    const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, [candidate]) : new Map();
-    const newTitle = suggestions.get(sessionId) || '';
+    const enrichedCandidate = await attachJiraIssues(candidate);
+    const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt([enrichedCandidate]), { maxTokens: 4096, timeoutMs: 45000 });
+    const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, [enrichedCandidate]) : new Map();
+    const suggestedTitle = suggestions.get(sessionId) || '';
+    const newTitle = suggestedTitle && titleIncludesJiraSummary(suggestedTitle, enrichedCandidate)
+      ? suggestedTitle
+      : buildJiraTitleFallback(enrichedCandidate);
     if (!newTitle) return;
 
     // 请求期间若有新一轮、手工改名、会话删除或开关关闭，丢弃这个旧结果。

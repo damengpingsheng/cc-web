@@ -2378,6 +2378,19 @@ async function testAutoSessionTitle() {
   const port = await getFreePort();
   let apiRequests = 0;
   let titlePrompt = '';
+  let jiraRequests = 0;
+  const jiraApiServer = http.createServer((req, res) => {
+    jiraRequests += 1;
+    assert(req.url === '/rest/api/2/issue/LAGSW-9877?fields=summary', `Unexpected Jira request: ${req.url}`);
+    assert(req.headers.authorization === 'Bearer jira-test-token', 'Jira request must use the configured PAT');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ key: 'LAGSW-9877', fields: { summary: '【M57】【X5B】demo双进程，8555出图偏绿' } }));
+  });
+  await new Promise((resolve, reject) => {
+    jiraApiServer.once('error', reject);
+    jiraApiServer.listen(0, '127.0.0.1', resolve);
+  });
+  const jiraApiPort = jiraApiServer.address().port;
   const titleApiServer = http.createServer((req, res) => {
     let body = '';
     req.setEncoding('utf8');
@@ -2392,7 +2405,7 @@ async function testAutoSessionTitle() {
         '排查会话审批问题 记录01a1ac91会话',
         'LAGSW-9877',
       ];
-      const title = apiRequests <= badTitles.length ? badTitles[apiRequests - 1] : 'LAGSW-9877 自动标题校验';
+      const title = apiRequests <= badTitles.length ? badTitles[apiRequests - 1] : 'LAGSW-9877 Jira字段更新与评论规避';
       const content = JSON.stringify([{ id: candidates[0]?.id, title }]);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
@@ -2412,6 +2425,8 @@ async function testAutoSessionTitle() {
       CC_WEB_SESSIONS_DIR: sessionsDir,
       CC_WEB_LOGS_DIR: logsDir,
       HOME: homeDir,
+      JIRA_API_TOKEN: 'jira-test-token',
+      JIRA_BASE_URL: `http://127.0.0.1:${jiraApiPort}`,
       CLAUDE_PATH: MOCK_CLAUDE,
       CODEX_PATH: MOCK_CODEX,
     }, async () => {
@@ -2446,18 +2461,21 @@ async function testAutoSessionTitle() {
 
       ws.send(JSON.stringify({ type: 'message', text: '第三次测试 LAGSW-9877 自动标题校验', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+      await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'auto');
       await sleep(150);
       const jiraIdRejected = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
-      assert(jiraIdRejected.title === '自动标题回归测试', `Title containing only a Jira ID must be rejected (got ${jiraIdRejected.title})`);
+      assert(jiraIdRejected.title === 'LAGSW-9877 demo双进程，8555出图偏绿', `Title containing only a Jira ID must use the issue summary fallback (got ${jiraIdRejected.title})`);
 
       ws.send(JSON.stringify({ type: 'message', text: '第四次测试带 Jira ID 的自动标题', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
-      await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'auto');
+      await sleep(150);
       const saved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
-      assert(saved.title === 'LAGSW-9877 自动标题校验', `Auto title with a Jira ID should be persisted (got ${saved.title})`);
+      assert(saved.title === 'LAGSW-9877 demo双进程，8555出图偏绿', `Auto title must include the Jira issue summary (got ${saved.title})`);
       assert(saved.titleSource === 'auto', 'Auto title source should be persisted');
       assert(apiRequests === 4, `Auto title should call API four times (got ${apiRequests})`);
-      assert(titlePrompt.includes('不能只输出一个 Jira ID'), 'Auto-title prompt must require Jira ID plus work summary');
+      assert(titlePrompt.includes('jiraIssues') && titlePrompt.includes('8555出图偏绿'), 'Auto-title prompt must include the Jira issue summary');
+      assert(titlePrompt.includes('不能只写后续操作而丢掉工单主题'), 'Auto-title prompt must require the Jira issue topic');
+      assert(jiraRequests === 1, `Auto title should fetch each Jira issue once (got ${jiraRequests})`);
 
       ws.send(JSON.stringify({ type: 'rename_session', sessionId: session.sessionId, title: '保留手工命名' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'manual');
@@ -2492,6 +2510,7 @@ async function testAutoSessionTitle() {
     });
   } finally {
     await new Promise((resolve) => titleApiServer.close(resolve));
+    await new Promise((resolve) => jiraApiServer.close(resolve));
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
   console.log('Auto session title checks passed.');

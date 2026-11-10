@@ -8,6 +8,23 @@
 
 ---
 
+## 分叉 v1.5.56
+
+### 新增
+
+自动整理标题识别到 Jira ID 后，会读取对应工单标题并作为生成上下文。模型漏掉工单主题时，服务端改用“Jira ID + 缩略工单标题”兜底，避免标题只描述后续操作或只剩 Jira ID。
+
+### 验证
+
+- 自动标题回归覆盖 Jira 工单标题读取、提示词注入、仅 Jira ID 回退，以及模型只写后续操作时回退到工单主题。
+- `node --check` 覆盖 `server.js`、`scripts/regression.js`，`git diff --check` 通过，全量 `npm run regression` 通过。
+
+### 生效前提
+
+- 本次包含 `server.js` 改动，需要重启 cc-web 服务进程。
+
+---
+
 ## 分叉 v1.5.54
 
 ### 改进
