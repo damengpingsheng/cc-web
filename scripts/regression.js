@@ -2405,7 +2405,12 @@ async function testAutoSessionTitle() {
         '排查会话审批问题 记录01a1ac91会话',
         'LAGSW-9877',
       ];
-      const title = apiRequests <= badTitles.length ? badTitles[apiRequests - 1] : 'LAGSW-9877 Jira字段更新与评论规避';
+      const hasBothTransactions = prompt.includes('事务一：配置 A') && prompt.includes('事务二：配置 B');
+      const title = apiRequests <= badTitles.length
+        ? badTitles[apiRequests - 1]
+        : hasBothTransactions
+          ? '事务一配置A与事务二配置B'
+          : 'LAGSW-9877 Jira字段更新与评论规避';
       const content = JSON.stringify([{ id: candidates[0]?.id, title }]);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
@@ -2470,12 +2475,35 @@ async function testAutoSessionTitle() {
       await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
       await sleep(150);
       const saved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
-      assert(saved.title === 'LAGSW-9877 demo双进程，8555出图偏绿', `Auto title must include the Jira issue summary (got ${saved.title})`);
+      assert(saved.title.startsWith('LAGSW-9877 demo双进程，8555出图偏绿'), `Auto title must include the Jira issue summary (got ${saved.title})`);
       assert(saved.titleSource === 'auto', 'Auto title source should be persisted');
-      assert(apiRequests === 4, `Auto title should call API four times (got ${apiRequests})`);
       assert(titlePrompt.includes('jiraIssues') && titlePrompt.includes('8555出图偏绿'), 'Auto-title prompt must include the Jira issue summary');
       assert(titlePrompt.includes('不能只写后续操作而丢掉工单主题'), 'Auto-title prompt must require the Jira issue topic');
       assert(jiraRequests === 1, `Auto title should fetch each Jira issue once (got ${jiraRequests})`);
+
+      const sendTitleTurn = async (text) => {
+        ws.send(JSON.stringify({ type: 'message', text, sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
+        await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
+        await sleep(150);
+      };
+      await sendTitleTurn('事务一：配置 A 并验证');
+      for (let index = 1; index <= 7; index++) {
+        await sendTitleTurn(`中间事项 ${index}：继续核对配置`);
+      }
+      await sendTitleTurn('事务二：配置 B 并验证');
+      await nextMessage(messages, ws, (msg) => (
+        msg.type === 'session_renamed'
+        && msg.sessionId === session.sessionId
+        && msg.source === 'auto'
+        && msg.title.includes('事务一配置A')
+        && msg.title.includes('事务二配置B')
+      ));
+      const fullConversationTitle = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8')).title;
+      assert(titlePrompt.includes('事务一：配置 A') && titlePrompt.includes('事务二：配置 B'), 'Auto-title prompt must retain first and later transaction intent beyond the recent six turns');
+      assert(titlePrompt.includes('"phases"') && titlePrompt.includes('后段事务不能覆盖或替代前段事务'), 'Auto-title prompt must describe the complete phased conversation');
+      assert(fullConversationTitle.includes('事务一配置A') && fullConversationTitle.includes('事务二配置B'), `Auto title must preserve both conversation phases (got ${fullConversationTitle})`);
+      assert(fullConversationTitle.includes('LAGSW-9877') && fullConversationTitle.includes('8555出图偏绿'), `Auto title fallback must preserve the Jira topic and full conversation summary (got ${fullConversationTitle})`);
+      assert(apiRequests === 13, `Auto title should call API once per completed turn (got ${apiRequests})`);
 
       ws.send(JSON.stringify({ type: 'rename_session', sessionId: session.sessionId, title: '保留手工命名' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'manual');
@@ -2505,7 +2533,7 @@ async function testAutoSessionTitle() {
       await sleep(150);
       const disabledSaved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${disabledSession.sessionId}.json`), 'utf8'));
       assert(disabledSaved.title === '关闭开关后不应自动整理', `Disabled auto-title must keep prompt title (got ${disabledSaved.title})`);
-      assert(apiRequests === 4, `Disabled auto-title must not call API (got ${apiRequests})`);
+      assert(apiRequests === 13, `Disabled auto-title must not call API (got ${apiRequests})`);
       ws.close();
     });
   } finally {

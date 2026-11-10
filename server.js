@@ -1918,7 +1918,7 @@ function validateSessionTitleSuggestion(title, candidate) {
   if (/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i.test(value)) return 'session-id';
   if (/记录\s*[0-9a-f]{8}\s*会话/i.test(value)) return 'session-id-fragment';
   const ids = new Set();
-  for (const context of [candidate?.id, candidate?.title, candidate?.firstLine, ...(candidate?.users || []), ...(candidate?.assistantTail || [])]) {
+  for (const context of getSessionTitleCandidateContextTexts(candidate)) {
     for (const match of String(context || '').matchAll(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi)) {
       ids.add(match[0].toLowerCase());
       ids.add(match[0].slice(0, 8).toLowerCase());
@@ -1956,6 +1956,104 @@ function truncateSessionTitleContext(text, limit) {
   return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
 }
 
+const SESSION_TITLE_MAX_PHASES = 20;
+const SESSION_TITLE_PHASE_REQUEST_LIMIT = 220;
+const SESSION_TITLE_PHASE_RESULT_LIMIT = 260;
+
+function getSessionTitleUserText(message) {
+  if (message?.role !== 'user') return '';
+  if (message.kind === 'local-command' || message.kind === 'compact-summary') return '';
+  const text = getSessionTitleMessageText(message);
+  return text && !text.startsWith('[系统上下文]') ? text : '';
+}
+
+function getSessionTitleAssistantText(message) {
+  if (message?.role !== 'assistant') return '';
+  if (message.kind === 'local-command' || message.kind === 'compact-summary') return '';
+  return getSessionTitleMessageText(message);
+}
+
+// 按用户轮次建立全过程时间线。超长会话按时间均匀分段，每段保留首尾需求
+// 和最后一个有效结论，确保标题上下文不会退化成只包含最后几轮。
+function buildSessionTitlePhases(messages) {
+  const turns = [];
+  for (const message of messages) {
+    const userText = getSessionTitleUserText(message);
+    if (userText) {
+      turns.push({ request: userText, result: '' });
+      continue;
+    }
+    const assistantText = getSessionTitleAssistantText(message);
+    if (assistantText && turns.length > 0) turns[turns.length - 1].result = assistantText;
+  }
+  if (turns.length === 0) return [];
+
+  const phaseCount = Math.min(turns.length, SESSION_TITLE_MAX_PHASES);
+  const phases = [];
+  for (let index = 0; index < phaseCount; index++) {
+    const start = Math.floor(index * turns.length / phaseCount);
+    const end = Math.max(start, Math.floor((index + 1) * turns.length / phaseCount) - 1);
+    const bucket = turns.slice(start, end + 1);
+    const requestTurns = bucket.length <= 3
+      ? bucket
+      : [bucket[0], bucket[Math.floor((bucket.length - 1) / 2)], bucket[bucket.length - 1]];
+    const requests = [];
+    for (const turn of requestTurns) {
+      const request = truncateSessionTitleContext(turn.request, SESSION_TITLE_PHASE_REQUEST_LIMIT);
+      if (request && !requests.includes(request)) requests.push(request);
+    }
+    let result = '';
+    for (let turnIndex = bucket.length - 1; turnIndex >= 0; turnIndex--) {
+      if (!bucket[turnIndex].result) continue;
+      result = truncateSessionTitleContext(bucket[turnIndex].result, SESSION_TITLE_PHASE_RESULT_LIMIT);
+      break;
+    }
+    phases.push({
+      range: start === end ? String(start + 1) : `${start + 1}-${end + 1}`,
+      requests,
+      result,
+    });
+  }
+  return phases;
+}
+
+function collectJiraIdsFromText(text) {
+  return (String(text || '').match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/gi) || [])
+    .filter((key) => /^[A-Z]+-\d+$/.test(key))
+    .map((key) => key.toUpperCase());
+}
+
+function buildSessionTitleContext(messages) {
+  const phases = buildSessionTitlePhases(messages);
+  const jiraIds = new Set();
+  for (const message of messages) {
+    const text = getSessionTitleUserText(message) || getSessionTitleAssistantText(message);
+    for (const key of collectJiraIdsFromText(text)) jiraIds.add(key);
+  }
+  return {
+    phases,
+    users: phases.flatMap((phase) => phase.requests),
+    assistantTail: phases.map((phase) => phase.result).filter(Boolean),
+    jiraIds: [...jiraIds].slice(0, 5),
+  };
+}
+
+function getSessionTitleCandidateContextTexts(candidate) {
+  const phaseTexts = (candidate?.phases || []).flatMap((phase) => [
+    ...(phase?.requests || []),
+    phase?.result || '',
+  ]);
+  return [
+    candidate?.id,
+    candidate?.title,
+    candidate?.firstLine,
+    ...(candidate?.jiraIds || []),
+    ...phaseTexts,
+    ...(candidate?.users || []),
+    ...(candidate?.assistantTail || []),
+  ];
+}
+
 const jiraTitleCache = new Map();
 
 function getJiraApiToken() {
@@ -1968,10 +2066,11 @@ function getJiraApiToken() {
 }
 
 function extractJiraIds(candidate) {
-  const text = [candidate?.title, candidate?.firstLine, ...(candidate?.users || []), ...(candidate?.assistantTail || [])].join('\n');
-  return [...new Set((text.match(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/gi) || [])
-    .filter((key) => /^[A-Z]+-\d+$/.test(key))
-    .map((key) => key.toUpperCase()))].slice(0, 5);
+  const keys = new Set(candidate?.jiraIds || []);
+  for (const context of getSessionTitleCandidateContextTexts(candidate)) {
+    for (const key of collectJiraIdsFromText(context)) keys.add(key);
+  }
+  return [...keys].slice(0, 5);
 }
 
 async function fetchJiraIssueSummary(key) {
@@ -2010,13 +2109,18 @@ async function attachJiraIssues(candidate) {
   return jiraIssues.length > 0 ? { ...candidate, jiraIssues } : candidate;
 }
 
-function buildJiraTitleFallback(candidate) {
+function buildJiraTitleFallback(candidate, suggestedTitle = '') {
   for (const issue of candidate?.jiraIssues || []) {
     const summary = normalizeSessionTitleText(issue.summary)
       .replace(/^(?:【[^】]*】\s*)+/, '')
       .trim();
     if (!summary) continue;
-    const title = truncateSessionTitleContext(`${issue.key} ${summary}`, 48);
+    const issueTitle = `${issue.key} ${summary}`;
+    const suggestion = normalizeSessionTitleText(suggestedTitle)
+      .replace(new RegExp(`\\b${issue.key}\\b`, 'gi'), '')
+      .replace(/^[\s，,。.:：;；/\\|()（）\[\]【】_-]+|[\s，,。.:：;；/\\|()（）\[\]【】_-]+$/g, '')
+      .trim();
+    const title = truncateSessionTitleContext(suggestion ? `${issueTitle}；${suggestion}` : issueTitle, suggestion ? 96 : 48);
     if (!validateSessionTitleSuggestion(title, candidate)) return title;
   }
   return '';
@@ -2026,6 +2130,7 @@ function titleIncludesJiraSummary(title, candidate) {
   if (!candidate?.jiraIssues?.length) return true;
   const value = normalizeSessionTitleText(title).toLowerCase();
   return candidate.jiraIssues.some((issue) => {
+    if (!value.includes(String(issue.key || '').toLowerCase())) return false;
     const summary = normalizeSessionTitleText(issue.summary)
       .replace(/^(?:【[^】]*】\s*)+/, '')
       .replace(/[\s，,。.:：;；/\\|()（）\[\]【】_-]+/g, '')
@@ -2048,18 +2153,7 @@ function auditSessionTitles() {
       const detected = classifyPromptDerivedSessionTitle(session);
       if (!detected) continue;
       const messages = Array.isArray(session.messages) ? session.messages : [];
-      const users = messages
-        .filter((message) => message?.role === 'user')
-        .map((message) => getSessionTitleMessageText(message))
-        .filter((text) => text && !text.startsWith('[系统上下文]'))
-        .slice(-6)
-        .map((text) => truncateSessionTitleContext(text, 360));
-      const assistantTail = messages
-        .filter((message) => message?.role === 'assistant')
-        .map((message) => getSessionTitleMessageText(message))
-        .filter(Boolean)
-        .slice(-3)
-        .map((text) => truncateSessionTitleContext(text, 520));
+      const titleContext = buildSessionTitleContext(messages);
       const id = path.basename(file, '.json');
       candidates.push({
         id,
@@ -2070,8 +2164,7 @@ function auditSessionTitles() {
         active: activeProcesses.has(id),
         matchType: detected.matchType,
         firstLine: detected.firstLine,
-        users,
-        assistantTail,
+        ...titleContext,
       });
     } catch {}
   }
@@ -2083,20 +2176,20 @@ function buildSessionTitleSuggestionPrompt(candidates) {
     id: candidate.id,
     oldTitle: candidate.title,
     agent: candidate.agent,
-    userMessages: candidate.users,
-    assistantTail: candidate.assistantTail,
+    phases: candidate.phases,
     jiraIssues: candidate.jiraIssues || [],
   }));
   return `请整理 cc-web 会话标题。下面每个候选的旧标题由首条用户提问自动派生，不能直接沿用。
 
 规则：
-1. 阅读 userMessages 的需求顺序和 assistantTail 的最终有效结论，标题概括整段对话实际完成或调查的内容。
-2. 使用简体中文，优先使用 12-30 个中文字符的短名词或动作短语，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。对话涉及 Jira ID 时，标题要同时包含该 Jira ID 和 jiraIssues 中对应工单标题的核心内容；工单标题太长可缩略，但不能只输出一个 Jira ID，也不能只写后续操作而丢掉工单主题。
-3. 去掉“帮我、我想、是否可以、可行吗、为什么、请”等提问外壳和问号。
-4. 后续实现或诊断改变了范围时，标题要覆盖最终范围；只有证据支持时才写“完成/修复”，否则用“分析、核查、排查、评审”等中性动词。
-5. 不使用日文假名；UUID 和内部会话 ID 只用于定位上下文，不能写进标题，也不能生成“记录某个会话”这类指令残片。
-6. 不复制日志、密钥、长路径或个人数据，不使用 Markdown，不换行。运行中的会话也给建议，但客户端不会应用。
-7. 只输出 JSON 数组，每项严格为 {"id":"原 id","title":"新标题"}，不要解释。
+1. phases 按时间顺序覆盖完整会话。逐个阶段识别主要事务，标题必须同时保留前段和后续的不同主要事务；不能只总结最后一轮或最后几轮，后段事务不能覆盖或替代前段事务。
+2. 使用简体中文，优先使用 12-48 个中文字符的短名词或动作短语；事务较多时可适度延长并缩略各事务，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。
+3. 对话涉及 Jira ID 时，标题要同时包含该 Jira ID 和 jiraIssues 中对应工单标题的核心内容；工单标题太长可缩略，但不能只输出一个 Jira ID，也不能只写后续操作而丢掉工单主题。
+4. 去掉“帮我、我想、是否可以、可行吗、为什么、请”等提问外壳和问号。
+5. 后续实现或诊断改变了范围时，只补充最终范围，不能删除前段已经完成或调查过的主要事务；只有证据支持时才写“完成/修复”，否则用“分析、核查、排查、评审”等中性动词。
+6. 不使用日文假名；UUID 和内部会话 ID 只用于定位上下文，不能写进标题，也不能生成“记录某个会话”这类指令残片。
+7. 不复制日志、密钥、长路径或个人数据，不使用 Markdown，不换行。运行中的会话也给建议，但客户端不会应用。
+8. 只输出 JSON 数组，每项严格为 {"id":"原 id","title":"新标题"}，不要解释。
 
 候选：
 ${JSON.stringify(input)}`;
@@ -2193,25 +2286,13 @@ const autoTitlePending = new Set();
 
 function buildAutoTitleCandidate(session) {
   const messages = Array.isArray(session?.messages) ? session.messages : [];
-  const users = messages
-    .filter((message) => message?.role === 'user')
-    .map((message) => getSessionTitleMessageText(message))
-    .filter((text) => text && !text.startsWith('[系统上下文]'))
-    .slice(-6)
-    .map((text) => truncateSessionTitleContext(text, 360));
-  const assistantTail = messages
-    .filter((message) => message?.role === 'assistant')
-    .map((message) => getSessionTitleMessageText(message))
-    .filter(Boolean)
-    .slice(-3)
-    .map((text) => truncateSessionTitleContext(text, 520));
+  const titleContext = buildSessionTitleContext(messages);
   return {
     id: session.id,
     title: String(session.title || 'Untitled'),
     agent: getSessionAgent(session),
     firstLine: classifyPromptDerivedSessionTitle(session)?.firstLine || '',
-    users,
-    assistantTail,
+    ...titleContext,
   };
 }
 
@@ -2260,7 +2341,7 @@ function scheduleAutoSessionTitle(sessionId) {
     const suggestedTitle = suggestions.get(sessionId) || '';
     const newTitle = suggestedTitle && titleIncludesJiraSummary(suggestedTitle, enrichedCandidate)
       ? suggestedTitle
-      : buildJiraTitleFallback(enrichedCandidate);
+      : buildJiraTitleFallback(enrichedCandidate, suggestedTitle);
     if (!newTitle) return;
 
     // 请求期间若有新一轮、手工改名、会话删除或开关关闭，丢弃这个旧结果。
