@@ -30,6 +30,7 @@
 
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const RENDER_DEBOUNCE = 100;
+  const LLMPROXY_USAGE_REFRESH_INTERVAL = 20 * 60 * 1000;
   const PAGE_TITLE_SUFFIX = 'CC-Web';
   const DEFAULT_SESSION_TITLE = '新会话';
 
@@ -272,6 +273,18 @@
   const chatCwd = $('#chat-cwd');
   const chatGateway = $('#chat-gateway');
   const chatGatewayMenu = $('#chat-gateway-menu');
+  const llmproxyUsage = $('#llmproxy-usage');
+  const llmproxyUsageMeter = $('.llmproxy-usage-meter');
+  const llmproxyUsageAmount = $('#llmproxy-usage-amount');
+  const llmproxyUsageRemaining = $('#llmproxy-usage-remaining');
+  const llmproxyUsagePercent = $('#llmproxy-usage-percent');
+  const llmproxyUsageFill = $('#llmproxy-usage-fill');
+  const llmproxyUsageDetails = $('#llmproxy-usage-details');
+  const llmproxyUsageToday = $('#llmproxy-usage-today');
+  const llmproxyUsageMonth = $('#llmproxy-usage-month');
+  const llmproxyUsageHistory = $('#llmproxy-usage-history');
+  const llmproxyUsageUpdated = $('#llmproxy-usage-updated');
+  const llmproxyUsageRefresh = $('#llmproxy-usage-refresh');
   const chatModelState = $('#chat-model-state');
   const costDisplay = $('#cost-display');
   const messageQueueEl = $('#message-queue');
@@ -2603,6 +2616,71 @@
     costDisplay.textContent = '';
   }
 
+  function formatUsageUsd(value) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return '--';
+    return `$${amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+
+  function formatUsageMillions(value) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return '--';
+    return `${(amount / 1_000_000).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}M`;
+  }
+
+  function formatUsageUpdated(iso) {
+    const date = new Date(iso);
+    if (!Number.isFinite(date.getTime())) return '';
+    return `更新于 ${date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
+  }
+
+  function setUsageDetails(el, metrics) {
+    if (!el) return;
+    if (!metrics) {
+      el.textContent = '暂不可用';
+      return;
+    }
+    el.textContent = `${formatUsageUsd(metrics.spend)} · ${formatUsageMillions(metrics.totalTokens)} tokens`
+      + `（输入 ${formatUsageMillions(metrics.promptTokens)} / 输出 ${formatUsageMillions(metrics.completionTokens)} / cache ${formatUsageMillions(metrics.cacheReadTokens)}）`;
+  }
+
+  function renderLlmproxyUsage(msg) {
+    if (!llmproxyUsage) return;
+    llmproxyUsage.hidden = false;
+    llmproxyUsage.classList.remove('warning', 'over-budget');
+    if (!msg || msg.ok !== true) {
+      llmproxyUsagePercent.textContent = '--';
+      llmproxyUsageAmount.textContent = msg?.message || '用量暂不可用';
+      llmproxyUsageRemaining.textContent = '';
+      llmproxyUsageFill.style.width = '0%';
+      setUsageDetails(llmproxyUsageToday, null);
+      setUsageDetails(llmproxyUsageMonth, null);
+      setUsageDetails(llmproxyUsageHistory, null);
+      llmproxyUsageUpdated.textContent = formatUsageUpdated(msg?.updatedAt);
+      return;
+    }
+    const used = Number(msg.monthToDate?.spend) || 0;
+    const quota = Number(msg.monthlyQuotaUsd) || 0;
+    const remaining = quota - used;
+    const percent = quota > 0 ? (used / quota) * 100 : 0;
+    llmproxyUsagePercent.textContent = `${percent.toFixed(1)}%`;
+    llmproxyUsageAmount.textContent = `${formatUsageUsd(used)} / ${formatUsageUsd(quota)}`;
+    llmproxyUsageRemaining.textContent = remaining >= 0
+      ? `剩余 ${formatUsageUsd(remaining)}`
+      : `超额 ${formatUsageUsd(Math.abs(remaining))}`;
+    llmproxyUsageFill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+    llmproxyUsage.setAttribute(
+      'aria-label',
+      `llmproxy本月额度，已使用 ${percent.toFixed(1)}%，${formatUsageUsd(used)} / ${formatUsageUsd(quota)}`,
+    );
+    if (percent >= 100) llmproxyUsage.classList.add('over-budget');
+    else if (percent >= 90) llmproxyUsage.classList.add('warning');
+    setUsageDetails(llmproxyUsageToday, msg.today);
+    setUsageDetails(llmproxyUsageMonth, msg.monthToDate);
+    setUsageDetails(llmproxyUsageHistory, msg.history);
+    llmproxyUsageUpdated.textContent = `${formatUsageUpdated(msg.updatedAt)} · ${msg.endUser || ''}`;
+  }
+
 	  function _splitCodexThinkingModel(model) {
 	    const raw = String(model || '').trim();
 	    if (!raw) return { base: '', level: '' };
@@ -3465,6 +3543,11 @@
         codexConfigCache = msg.config || null;
         updateGatewayBadge();
         if (typeof _onCodexConfig === 'function') _onCodexConfig(msg.config);
+        break;
+
+      case 'llmproxy_usage':
+        renderLlmproxyUsage(msg);
+        if (llmproxyUsageRefresh) llmproxyUsageRefresh.disabled = false;
         break;
 
       case 'claude_local_config':
@@ -7259,6 +7342,23 @@
         send({ type: 'set_session_gateway', sessionId: currentSessionId, gateway: btn.dataset.gateway });
       });
     });
+  }
+
+  if (llmproxyUsageRefresh) {
+    llmproxyUsageRefresh.addEventListener('click', () => {
+      if (!isWsConnected()) return;
+      llmproxyUsageRefresh.disabled = true;
+      send({ type: 'get_llmproxy_usage', force: true });
+    });
+  }
+
+  setInterval(() => {
+    if (isWsConnected()) send({ type: 'get_llmproxy_usage', force: true });
+  }, LLMPROXY_USAGE_REFRESH_INTERVAL);
+
+  if (llmproxyUsageMeter) {
+    // 胶囊只用于悬停展示；点击不抢焦点，避免出现文本插入光标和悬停层粘住。
+    llmproxyUsageMeter.addEventListener('pointerdown', (event) => event.preventDefault());
   }
 
   // Split new-chat button

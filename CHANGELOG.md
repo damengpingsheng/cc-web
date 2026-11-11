@@ -8,6 +8,24 @@
 
 ---
 
+## 分叉 v1.5.57
+
+### 新增
+
+聊天页新增 llmproxy 个人本月额度胶囊，按 `end_user` 聚合今日、本月和历史消费及 Token。默认月额度按 $2000 展示当前消费、剩余额度与进度条；胶囊本身作为进度条，悬停或键盘聚焦显示用量明细。用量缓存 3 分钟，每 20 分钟自动刷新并支持手动刷新；达到额度仅提示，不阻断调用。
+
+### 验证
+
+- llmproxy 用量单测覆盖北京时间日/月边界、跨月与跨年、全量分页、`end_user` 过滤、今日/本月/历史归集、缓存失败后重试、额度百分比，以及响应不泄漏 API key；本地 mock 端到端验证认证后 WebSocket 下发与金额、Token 渲染。
+- `node --check` 覆盖 `server.js`、`public/app.js`、`lib/llmproxy-usage.js`、`scripts/regression.js`；`git diff --check` 通过，全量 `npm run regression` 通过。
+
+### 生效前提
+
+- 本次包含 `server.js` 与 `lib/` 改动，需要重启 cc-web 服务进程。
+- 前端静态资源 `?v=` 已打到 `1.5.1-my.74`，刷新页面即可生效。
+
+---
+
 ## 分叉 v1.5.56
 
 ### 新增

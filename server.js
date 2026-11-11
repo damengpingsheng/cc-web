@@ -36,6 +36,7 @@ const { createAuthStore } = require('./lib/auth');
 const { createCodexRolloutStore, CODEX_EMPTY_FINAL_RETRY_MARKER } = require('./lib/codex-rollouts');
 const { createClientIpResolver } = require('./lib/client-ip');
 const { createSessionBodySearch } = require('./lib/session-body-search');
+const { createUsageCollector } = require('./lib/llmproxy-usage');
 const {
   mergeCodexHistoryByUserTurn,
   needsCodexToolLayoutMigration,
@@ -68,6 +69,7 @@ const AUTH_CONFIG_PATH = path.join(CONFIG_DIR, 'auth.json');
 const TOKENS_PATH = path.join(CONFIG_DIR, 'tokens.json');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
+const LLMPROXY_USAGE_CONFIG_PATH = path.join(CONFIG_DIR, 'llmproxy-usage.json');
 const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
 const GROUPS_CONFIG_PATH = path.join(CONFIG_DIR, 'groups.json');
 const JIRA_BASE_URL = (process.env.JIRA_BASE_URL || 'https://jira.aixin-chip.com').replace(/\/+$/, '');
@@ -77,10 +79,25 @@ const JIRA_TITLE_CACHE_TTL_MS = 10 * 60 * 1000;
 const WS_PING_INTERVAL_MS = parseInt(process.env.CC_WEB_WS_PING_INTERVAL_MS, 10) || 25000;
 const PID_MONITOR_INTERVAL_MS = Math.max(20, parseInt(process.env.CC_WEB_PID_MONITOR_INTERVAL_MS, 10) || 2000);
 
+const LLMPROXY_USAGE_REFRESH_MS = 3 * 60 * 1000;
+const LLMPROXY_USAGE_DEFAULT = {
+  enabled: true,
+  baseUrl: 'https://llmproxy.aixin-chip.com',
+  endUser: 'huxiaojie',
+  monthlyQuotaUsd: 2000,
+  timezone: 'Asia/Shanghai',
+  historyStart: '2000-01-01',
+};
+
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 fs.mkdirSync(LOGS_DIR, { recursive: true });
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true });
+
+// 首次启动落盘默认配置；token 只从环境读取，不写入 config/。
+if (!fs.existsSync(LLMPROXY_USAGE_CONFIG_PATH)) {
+  atomicWriteJson(LLMPROXY_USAGE_CONFIG_PATH, JSON.stringify(LLMPROXY_USAGE_DEFAULT, null, 2), 0o600);
+}
 
 // === Process Lifecycle Logger ===
 const LOG_FILE = path.join(LOGS_DIR, 'process.log');
@@ -1307,6 +1324,44 @@ function resolveGatewayCreds() {
   const token = settingsEnv.ANTHROPIC_AUTH_TOKEN || settingsEnv.ANTHROPIC_API_KEY
     || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || '';
   return { base: base.replace(/\/+$/, ''), token };
+}
+
+function resolveLlmproxyUsageToken() {
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+  const codexConfig = loadCodexConfig();
+  const activeProfile = (codexConfig.profiles || []).find((profile) => profile.name === codexConfig.activeProfile);
+  if (codexConfig.mode === 'custom' && activeProfile?.apiKey) return activeProfile.apiKey;
+  return readCodexLocalConfigSnapshot().config.apiKey;
+}
+
+function loadLlmproxyUsageConfig() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(LLMPROXY_USAGE_CONFIG_PATH, 'utf8'));
+    return { ...LLMPROXY_USAGE_DEFAULT, ...raw, authToken: resolveLlmproxyUsageToken() };
+  } catch {
+    return { ...LLMPROXY_USAGE_DEFAULT, authToken: resolveLlmproxyUsageToken() };
+  }
+}
+
+const llmproxyUsageCollector = createUsageCollector({
+  cacheTtlMs: LLMPROXY_USAGE_REFRESH_MS,
+});
+
+async function refreshLlmproxyUsage(force = false) {
+  try {
+    const payload = await llmproxyUsageCollector.refresh(loadLlmproxyUsageConfig(), { force });
+    return payload?.status === 'disabled'
+      ? { ...payload, type: 'llmproxy_usage', ok: false }
+      : { ...payload, type: 'llmproxy_usage' };
+  } catch (error) {
+    plog('WARN', 'llmproxy_usage_failed', { error: error?.message || String(error) });
+    return {
+      type: 'llmproxy_usage',
+      ok: false,
+      message: 'llmproxy 用量暂不可用',
+      updatedAt: new Date().toISOString(),
+    };
+  }
 }
 
 // 读 settings.json 的 modelPicker.options 与 ANTHROPIC_CUSTOM_MODEL_OPTION，
@@ -3879,6 +3934,12 @@ wss.on('connection', (ws, req) => {
         wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
         sendGroupList(ws);
         sendSessionList(ws);
+        const cachedUsage = llmproxyUsageCollector.getCached();
+        if (cachedUsage) {
+          wsSend(ws, { ...cachedUsage, type: 'llmproxy_usage' });
+        } else {
+          refreshLlmproxyUsage().then((usage) => wsSend(ws, usage));
+        }
       } else {
         // 失败原因细分：token 提供但无效 → session_expired；密码错 → invalid_password；兜底 auth_failed
         let reason;
@@ -3975,6 +4036,9 @@ wss.on('connection', (ws, req) => {
         break;
       case 'get_codex_config':
         wsSend(ws, { type: 'codex_config', config: getCodexConfigMasked() });
+        break;
+      case 'get_llmproxy_usage':
+        refreshLlmproxyUsage(msg.force === true).then((usage) => wsSend(ws, usage));
         break;
       case 'save_codex_config':
         handleSaveCodexConfig(ws, msg.config);

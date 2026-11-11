@@ -67,6 +67,10 @@ const {
   createSessionBodySearch,
   extractMessageText,
 } = require(path.join(REPO_DIR, 'lib', 'session-body-search.js'));
+const {
+  buildUsageRanges,
+  createUsageCollector,
+} = require(path.join(REPO_DIR, 'lib', 'llmproxy-usage.js'));
 
 function mkdirp(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -279,6 +283,71 @@ function testSessionBodySearch() {
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
+}
+
+async function testLlmproxyUsage() {
+  const ranges = buildUsageRanges(new Date('2026-11-10T08:50:00Z'), 'Asia/Shanghai', '2000-01-01');
+  assert(ranges.today.start === '2026-11-09 16:00:00', `llmproxy today start must be UTC (got ${ranges.today.start})`);
+  assert(ranges.today.end === '2026-11-10 16:00:00', `llmproxy today end must be UTC (got ${ranges.today.end})`);
+  assert(ranges.month.start === '2026-10-31 16:00:00', `llmproxy month start must be UTC (got ${ranges.month.start})`);
+  assert(ranges.month.end === '2026-11-30 16:00:00', `llmproxy month end must be UTC (got ${ranges.month.end})`);
+  const newYearRanges = buildUsageRanges(new Date('2026-12-31T17:30:00Z'), 'Asia/Shanghai', '2000-01-01');
+  assert(newYearRanges.month.start === '2026-12-31 16:00:00' && newYearRanges.month.end === '2027-01-31 16:00:00', 'llmproxy month range must cross the new year');
+  const afterNewYearRanges = buildUsageRanges(new Date('2027-01-01T01:30:00Z'), 'Asia/Shanghai', '2000-01-01');
+  assert(afterNewYearRanges.today.start === '2026-12-31 16:00:00' && afterNewYearRanges.today.end === '2027-01-01 16:00:00', 'llmproxy day range must cross the new year');
+
+  const requests = [];
+  const rows = [
+    { startTime: '2026-11-09T15:59:59.000Z', spend: 1, total_tokens: 1000000, prompt_tokens: 600000, completion_tokens: 400000, metadata: { usage_object: { cache_read_input_tokens: 100000 } } },
+    { startTime: '2026-11-09T16:00:00.000Z', spend: 2, total_tokens: 2000000, prompt_tokens: 1200000, completion_tokens: 800000, metadata: { usage_object: { cache_read_input_tokens: 200000 } } },
+    { startTime: '2026-11-10T15:59:59.000Z', spend: 3, total_tokens: 3000000, prompt_tokens: 1800000, completion_tokens: 1200000, metadata: { usage_object: { cache_read_input_tokens: 300000 } } },
+    { startTime: '2026-11-10T16:00:00.000Z', spend: 4, total_tokens: 4000000, prompt_tokens: 2400000, completion_tokens: 1600000, metadata: { usage_object: { cache_read_input_tokens: 400000 } } },
+  ];
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    requests.push(parsed);
+    const page = Number(parsed.searchParams.get('page'));
+    return {
+      ok: true,
+      json: async () => ({ data: page === 1 ? rows.slice(0, 2) : rows.slice(2), total_pages: 2, total_is_capped: false }),
+    };
+  };
+  const collector = createUsageCollector({
+    fetchImpl,
+    cacheTtlMs: 0,
+    nowProvider: () => new Date('2026-11-10T08:50:00Z'),
+  });
+  const payload = await collector.refresh({
+    enabled: true, baseUrl: 'https://llmproxy.example', authToken: 'test-token', endUser: 'huxiaojie',
+    monthlyQuotaUsd: 2000, timezone: 'Asia/Shanghai', historyStart: '2000-01-01',
+  });
+  assert(requests.length === 2, `llmproxy usage must fetch every page (got ${requests.length})`);
+  assert(requests.every((url) => url.searchParams.get('end_user') === 'huxiaojie'), 'llmproxy usage must always filter by the configured end_user');
+  assert(requests[0].searchParams.get('page_size') === '1000', 'llmproxy usage must request the maximum page size');
+  assert(payload.today.spend === 5 && payload.today.totalTokens === 5000000, 'llmproxy today metrics must include both pages and exclude the next day');
+  assert(payload.monthToDate.spend === 10 && payload.monthToDate.totalTokens === 10000000, 'llmproxy month metrics must exclude the previous month');
+  assert(payload.history.spend === 10 && payload.history.totalTokens === 10000000, 'llmproxy history metrics must include every page');
+  assert(payload.monthToDate.cacheReadTokens === 1000000, 'llmproxy cache-read tokens must be aggregated');
+  assert(payload.remainingUsd === 1990 && payload.usedPercent === 0.5, 'llmproxy quota calculations are incorrect');
+  assert(payload.endUser === 'huxiaojie' && payload.authToken === undefined, 'llmproxy response must expose end_user without exposing the API key');
+
+  let retryFetches = 0;
+  const retryCollector = createUsageCollector({
+    fetchImpl: async () => {
+      retryFetches += 1;
+      if (retryFetches === 1) throw new Error('temporary failure');
+      return { ok: true, json: async () => ({ data: [], total_pages: 1, total_is_capped: false }) };
+    },
+    cacheTtlMs: 0,
+  });
+  const retryConfig = {
+    enabled: true, baseUrl: 'https://llmproxy.example', authToken: 'test-token', endUser: 'huxiaojie',
+    monthlyQuotaUsd: 2000, timezone: 'Asia/Shanghai', historyStart: '2000-01-01',
+  };
+  await retryCollector.refresh(retryConfig).catch(() => {});
+  const retryPayload = await retryCollector.refresh(retryConfig);
+  assert(retryFetches === 2 && retryPayload.monthToDate.spend === 0, 'llmproxy usage must allow retry after a failed refresh');
+  console.log('llmproxy usage checks passed.');
 }
 
 function testSessionHistorySync() {
@@ -745,6 +814,7 @@ async function main() {
   testCodexHistoryMigration();
   testSessionOverviewMatcher();
   testSessionBodySearch();
+  await testLlmproxyUsage();
   testSessionHistorySync();
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
@@ -755,6 +825,9 @@ async function main() {
   mkdirp(sessionsDir);
   mkdirp(logsDir);
   mkdirp(homeDir);
+
+  // 主回归禁止认证后访问真实 llmproxy；协议级用例使用隔离的本地 mock endpoint。
+  fs.writeFileSync(path.join(configDir, 'llmproxy-usage.json'), JSON.stringify({ enabled: false }, null, 2));
 
   fs.writeFileSync(path.join(configDir, 'notify.json'), JSON.stringify({
     provider: 'off',

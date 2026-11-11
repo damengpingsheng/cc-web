@@ -14,6 +14,7 @@
 | `model.json` | Claude 模型模板 + 当前活动模板 |
 | `codex.json` | Codex profiles（API key、模型、自定义 CODEX_HOME） |
 | `dev.json` | GitHub token/repos + SSH hosts + Cloudflare API token/zones（供 `/github`、`/ssh`、`/cf` 使用） |
+| `llmproxy-usage.json` | llmproxy 个人用量统计：`baseUrl`、`endUser`、`monthlyQuotaUsd`、`timezone`、`historyStart`。API key 优先从 `OPENAI_API_KEY` 读取，其次复用 Codex custom profile 或本机 `~/.codex/auth.json`；不会下发前端 |
 
 `dev.json` schema（cloudflare 块，token 下发前端时经 `maskSecret` 掩码，保存时 `****` 值保留旧 token；zones 整体替换、`name` 必填、`id` 自动生成 `z_` + 8 位 hex）：
 

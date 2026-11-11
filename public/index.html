@@ -15,7 +15,7 @@
       document.documentElement.dataset.theme = theme;
     })();
   </script>
-  <link rel="stylesheet" href="style.css?v=1.5.1-my.73">
+  <link rel="stylesheet" href="style.css?v=1.5.1-my.74">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
 </head>
 <body>
@@ -68,6 +68,36 @@
       <header class="chat-header">
         <button id="menu-btn" class="menu-btn" title="菜单">☰</button>
         <span id="chat-title" class="chat-title">新会话</span>
+        <section id="llmproxy-usage" class="llmproxy-usage" hidden tabindex="0" aria-label="llmproxy 本月额度与用量" title="llmproxy本月额度" aria-describedby="llmproxy-usage-details">
+          <div class="llmproxy-usage-meter">
+            <span id="llmproxy-usage-fill" class="llmproxy-usage-fill" aria-hidden="true"></span>
+            <span class="llmproxy-usage-label">llmproxy</span>
+            <span id="llmproxy-usage-percent" class="llmproxy-usage-percent"></span>
+          </div>
+          <div id="llmproxy-usage-details" class="llmproxy-usage-details">
+            <div class="llmproxy-usage-summary">
+              <span class="llmproxy-usage-summary-label">llmproxy本月额度</span>
+              <strong id="llmproxy-usage-amount" class="llmproxy-usage-amount"></strong>
+              <span id="llmproxy-usage-remaining" class="llmproxy-usage-remaining"></span>
+            </div>
+            <div class="llmproxy-usage-group">
+              <span class="llmproxy-usage-group-title">今日</span>
+              <span id="llmproxy-usage-today"></span>
+            </div>
+            <div class="llmproxy-usage-group">
+              <span class="llmproxy-usage-group-title">本月</span>
+              <span id="llmproxy-usage-month"></span>
+            </div>
+            <div class="llmproxy-usage-group">
+              <span class="llmproxy-usage-group-title">历史累计</span>
+              <span id="llmproxy-usage-history"></span>
+            </div>
+            <div class="llmproxy-usage-footer">
+              <span id="llmproxy-usage-updated"></span>
+              <button id="llmproxy-usage-refresh" class="llmproxy-usage-refresh" type="button">刷新</button>
+            </div>
+          </div>
+        </section>
         <button id="chat-agent-btn" class="chat-agent-btn" type="button" aria-haspopup="menu" aria-expanded="false">Claude</button>
         <button id="chat-gateway" class="chat-gateway" type="button" aria-haspopup="menu" aria-expanded="false" hidden></button>
         <div id="chat-gateway-menu" class="chat-agent-menu chat-gateway-menu" hidden>
@@ -250,6 +280,6 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.11/purify.min.js"></script>
-  <script src="app.js?v=1.5.1-my.73"></script>
+  <script src="app.js?v=1.5.1-my.74"></script>
 </body>
 </html>

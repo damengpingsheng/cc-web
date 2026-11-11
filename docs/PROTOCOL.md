@@ -28,6 +28,7 @@
 | `change_password` | 改密 |
 | `get_model_config` / `save_model_config` | Claude 模型模板 |
 | `get_codex_config` / `save_codex_config` | Codex profile |
+| `get_llmproxy_usage { force? }` | 查询当前登录用户配置的 llmproxy 个人用量；默认命中 3 分钟缓存，`force=true` 强制刷新 |
 | `fetch_models` | 拉取可用模型列表 |
 | `check_update` | 检查版本更新 |
 | `read_claude_local_config` / `read_codex_local_config` | 读本地 CLI 配置 |
@@ -70,6 +71,7 @@
 | `notify_config` / `notify_test_result` | 通知配置回执 |
 | `password_changed` | 改密通知。成功时返回新 `token`，前端必须用新 token 替换旧 token；改密副作用：**踢掉所有其他已认证 WS 连接**（详见 [CONFIG.md](./CONFIG.md#鉴权与安全)） |
 | `model_config` / `codex_config` / `dev_config` | 配置回执 |
+| `llmproxy_usage` | llmproxy 个人用量。成功时含 `endUser`、`monthlyQuotaUsd`、`today`、`monthToDate`、`history`、`remainingUsd`、`usedPercent`、`updatedAt`；每个范围含 `spend`、`totalTokens`、`promptTokens`、`completionTokens`、`cacheReadTokens`。失败时 `ok=false` 并含 `message` |
 | `claude_local_config` / `codex_local_config` | 本地配置回执 |
 | `fetch_models_result` | 模型列表回执 |
 | `update_info` | 版本更新信息 |
