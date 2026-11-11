@@ -2562,11 +2562,14 @@ async function testAutoSessionTitle() {
         'LAGSW-9877',
       ];
       const hasBothTransactions = prompt.includes('事务一：配置 A') && prompt.includes('事务二：配置 B');
+      const isIncidentalJiraCase = prompt.includes('排查agent异常命名目录');
       const title = apiRequests <= badTitles.length
         ? badTitles[apiRequests - 1]
         : hasBothTransactions
           ? '事务一配置A与事务二配置B'
-          : 'LAGSW-9877 Jira字段更新与评论规避';
+          : isIncidentalJiraCase
+            ? 'agent异常命名目录排查与路径安全规则防护'
+            : 'LAGSW-9877 Jira字段更新与评论规避';
       const content = JSON.stringify([{ id: candidates[0]?.id, title }]);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ choices: [{ message: { content } }] }));
@@ -2658,8 +2661,19 @@ async function testAutoSessionTitle() {
       assert(titlePrompt.includes('事务一：配置 A') && titlePrompt.includes('事务二：配置 B'), 'Auto-title prompt must retain first and later transaction intent beyond the recent six turns');
       assert(titlePrompt.includes('"phases"') && titlePrompt.includes('后段事务不能覆盖或替代前段事务'), 'Auto-title prompt must describe the complete phased conversation');
       assert(fullConversationTitle.includes('事务一配置A') && fullConversationTitle.includes('事务二配置B'), `Auto title must preserve both conversation phases (got ${fullConversationTitle})`);
-      assert(fullConversationTitle.includes('LAGSW-9877') && fullConversationTitle.includes('8555出图偏绿'), `Auto title fallback must preserve the Jira topic and full conversation summary (got ${fullConversationTitle})`);
+      assert(!fullConversationTitle.includes('LAGSW-9877'), `Auto title must not force a Jira ID when it is not a main transaction (got ${fullConversationTitle})`);
       assert(apiRequests === 13, `Auto title should call API once per completed turn (got ${apiRequests})`);
+
+      const jiraRequestsBeforeIncidental = jiraRequests;
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+      const incidentalSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.sessionId !== session.sessionId);
+      ws.send(JSON.stringify({ type: 'message', text: '排查agent异常命名目录 trigger codex incidental jira example', sessionId: incidentalSession.sessionId, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === incidentalSession.sessionId);
+      await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === incidentalSession.sessionId && msg.source === 'auto');
+      await sleep(150);
+      const incidentalSaved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${incidentalSession.sessionId}.json`), 'utf8'));
+      assert(incidentalSaved.title === 'agent异常命名目录排查与路径安全规则防护', `Incidental assistant Jira examples must not change the title (got ${incidentalSaved.title})`);
+      assert(jiraRequests === jiraRequestsBeforeIncidental, `Assistant-only Jira examples must not query Jira (got ${jiraRequests - jiraRequestsBeforeIncidental} requests)`);
 
       ws.send(JSON.stringify({ type: 'rename_session', sessionId: session.sessionId, title: '保留手工命名' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'session_renamed' && msg.sessionId === session.sessionId && msg.source === 'manual');
@@ -2689,7 +2703,7 @@ async function testAutoSessionTitle() {
       await sleep(150);
       const disabledSaved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${disabledSession.sessionId}.json`), 'utf8'));
       assert(disabledSaved.title === '关闭开关后不应自动整理', `Disabled auto-title must keep prompt title (got ${disabledSaved.title})`);
-      assert(apiRequests === 13, `Disabled auto-title must not call API (got ${apiRequests})`);
+      assert(apiRequests === 14, `Disabled auto-title must not call API (got ${apiRequests})`);
       ws.close();
     });
   } finally {

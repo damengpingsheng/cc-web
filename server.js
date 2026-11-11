@@ -2030,7 +2030,7 @@ function buildSessionTitleContext(messages) {
   const phases = buildSessionTitlePhases(messages);
   const jiraIds = new Set();
   for (const message of messages) {
-    const text = getSessionTitleUserText(message) || getSessionTitleAssistantText(message);
+    const text = getSessionTitleUserText(message);
     for (const key of collectJiraIdsFromText(text)) jiraIds.add(key);
   }
   return {
@@ -2070,7 +2070,7 @@ function getJiraApiToken() {
 
 function extractJiraIds(candidate) {
   const keys = new Set(candidate?.jiraIds || []);
-  for (const context of getSessionTitleCandidateContextTexts(candidate)) {
+  for (const context of candidate?.users || []) {
     for (const key of collectJiraIdsFromText(context)) keys.add(key);
   }
   return [...keys].slice(0, 5);
@@ -2120,7 +2120,7 @@ function buildJiraTitleFallback(candidate, suggestedTitle = '') {
     if (!summary) continue;
     const issueTitle = `${issue.key} ${summary}`;
     const suggestion = normalizeSessionTitleText(suggestedTitle)
-      .replace(new RegExp(`\\b${issue.key}\\b`, 'gi'), '')
+      .replace(/\b[A-Z][A-Z0-9]{1,9}-\d+\b/gi, '')
       .replace(/^[\s，,。.:：;；/\\|()（）\[\]【】_-]+|[\s，,。.:：;；/\\|()（）\[\]【】_-]+$/g, '')
       .trim();
     const title = truncateSessionTitleContext(suggestion ? `${issueTitle}；${suggestion}` : issueTitle, suggestion ? 96 : 48);
@@ -2130,10 +2130,12 @@ function buildJiraTitleFallback(candidate, suggestedTitle = '') {
 }
 
 function titleIncludesJiraSummary(title, candidate) {
-  if (!candidate?.jiraIssues?.length) return true;
   const value = normalizeSessionTitleText(title).toLowerCase();
-  return candidate.jiraIssues.some((issue) => {
-    if (!value.includes(String(issue.key || '').toLowerCase())) return false;
+  const titleJiraIds = collectJiraIdsFromText(title);
+  if (titleJiraIds.length === 0) return true;
+  return titleJiraIds.every((key) => {
+    const issue = (candidate?.jiraIssues || []).find((entry) => entry.key === key);
+    if (!issue) return false;
     const summary = normalizeSessionTitleText(issue.summary)
       .replace(/^(?:【[^】]*】\s*)+/, '')
       .replace(/[\s，,。.:：;；/\\|()（）\[\]【】_-]+/g, '')
@@ -2186,8 +2188,8 @@ function buildSessionTitleSuggestionPrompt(candidates) {
 
 规则：
 1. phases 按时间顺序覆盖完整会话。逐个阶段识别主要事务，标题必须同时保留前段和后续的不同主要事务；不能只总结最后一轮或最后几轮，后段事务不能覆盖或替代前段事务。
-2. 使用简体中文，优先使用 12-48 个中文字符的短名词或动作短语；事务较多时可适度延长并缩略各事务，保留能区分工作的功能名、Jira/Gerrit ID、pipe、寄存器或芯片名。
-3. 对话涉及 Jira ID 时，标题要同时包含该 Jira ID 和 jiraIssues 中对应工单标题的核心内容；工单标题太长可缩略，但不能只输出一个 Jira ID，也不能只写后续操作而丢掉工单主题。
+2. 使用简体中文，优先使用 12-48 个中文字符的短名词或动作短语；事务较多时可适度延长并缩略各事务，保留能区分工作的功能名、Gerrit ID、pipe、寄存器或芯片名。
+3. jiraIssues 只提供用户请求中出现的工单。只有 Jira 工单本身构成主要事务时才在标题中写 Jira ID；命令、日志、代码示例、验证样例或助手回复中顺带出现的 ID 不应写入。若标题写了 Jira ID，必须同时包含 jiraIssues 中对应工单标题的核心内容；工单标题太长可缩略，但不能只输出一个 Jira ID，也不能只写后续操作而丢掉工单主题。
 4. 去掉“帮我、我想、是否可以、可行吗、为什么、请”等提问外壳和问号。
 5. 后续实现或诊断改变了范围时，只补充最终范围，不能删除前段已经完成或调查过的主要事务；只有证据支持时才写“完成/修复”，否则用“分析、核查、排查、评审”等中性动词。
 6. 不使用日文假名；UUID 和内部会话 ID 只用于定位上下文，不能写进标题，也不能生成“记录某个会话”这类指令残片。

@@ -140,7 +140,7 @@
 - `trigger`: `'background'`（仅后台完成触发）或 `'always'`
 - `apiSource`: `'claude'` / `'codex'` / `'custom'`
 - `autoTitle`: 每轮最终回复完成后自动整理会话标题。只更新首问派生或此前自动生成的标题；`titleSource: 'manual'` 的用户命名不会被覆盖，可复用上述摘要 API。
-- Jira 标题增强：会话中出现 Jira ID 时，服务端读取工单标题并加入自动标题上下文；模型漏掉工单主题时，回退为“Jira ID + 缩略工单标题”。认证优先使用 `JIRA_API_TOKEN`，否则读取 `~/.jira-cli/token`；地址可用 `JIRA_BASE_URL` 覆盖。
+- Jira 标题增强：只从用户请求提取 Jira ID 并读取工单标题作为自动标题上下文；命令、日志、代码示例、验证样例或助手回复中顺带出现的 ID 不触发工单查询。只有工单本身构成主要事务时才要求写入标题；标题包含 Jira ID 但漏掉工单主题时，回退为“Jira ID + 缩略工单标题”。认证优先使用 `JIRA_API_TOKEN`，否则读取 `~/.jira-cli/token`；地址可用 `JIRA_BASE_URL` 覆盖。
 
 标题来源保存在会话 JSON 的 `titleSource`：`'prompt'`（首问派生）/ `'auto'`（自动生成）/ `'manual'`（用户命名）。旧会话没有该字段时，仅当标题仍是首问前缀才视为可自动整理。
 

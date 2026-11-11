@@ -177,6 +177,8 @@ function readStdin() {
     ? 'Codex compact finished.'
     : isInitPrompt
       ? 'Codex init finished.'
+      : input.includes('trigger codex incidental jira example')
+        ? '排查命令示例：jira_LAGSW-1234；验证样例：AX615-9890。'
       : input.includes('没有生成最终回答')
         ? 'Codex recovered final summary.'
         : `Codex mock handled (${imageCount} image): ${input}`;
