@@ -7667,10 +7667,13 @@
       if (e.key === 'Tab') { e.preventDefault(); selectCmdMenuItem(); return; }
       if (e.key === 'Escape') { hideCmdMenu(); return; }
     }
-    // 历史回溯：输入框为空时 ↑ 调出上一条发过的内容；已在回溯态则继续翻。
-    // 一旦用户改动内容就退出回溯（见下面的 input 监听），↑/↓ 随即恢复成光标移动。
+    // 历史回溯：输入框为空时 ↑ 调出上一条发过的内容；已在回溯态且光标仍在末尾时继续翻。
+    // 光标离开末尾、出现选区或用户改动内容后，↑/↓ 交还输入框的原始光标移动行为。
+    const caretAtEnd = msgInput.selectionStart === msgInput.selectionEnd
+      && msgInput.selectionStart === msgInput.value.length;
     if ((e.key === 'ArrowUp' || e.key === 'ArrowDown')
-        && (promptHistoryIndex >= 0 || (e.key === 'ArrowUp' && !msgInput.value))
+        && ((promptHistoryIndex >= 0 && caretAtEnd)
+          || (e.key === 'ArrowUp' && !msgInput.value))
         && recallPrompt(e.key === 'ArrowUp' ? -1 : 1)) {
       e.preventDefault();
       return;
