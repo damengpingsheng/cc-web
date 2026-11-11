@@ -1403,7 +1403,7 @@
         if (index < 0) return;
         const [removed] = currentQueue.splice(index, 1);
         for (const attachment of removed?.attachments || []) {
-          deleteUploadedAttachment(attachment?.id);
+          if (!attachment?.reuse) deleteUploadedAttachment(attachment?.id);
         }
         cleanupMessageQueue(key);
         renderMessageQueue();
@@ -1451,26 +1451,36 @@
     renderMessageQueue();
   }
 
-  function enqueueComposerMessage(text) {
+  function enqueueMessage(text, attachments = [], mode = currentMode, agent = currentAgent) {
     const key = getActiveMessageQueueKey();
     const queue = messageQueues.get(key) || [];
     if (queue.length >= MESSAGE_QUEUE_CAP) {
       appendError(`最多排队 ${MESSAGE_QUEUE_CAP} 条消息，请等待当前队列处理。`);
-      return;
+      return false;
     }
     queue.push({
       id: `queue-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
       text,
-      attachments: pendingAttachments.map((attachment) => ({ ...attachment })),
-      mode: currentMode,
-      agent: currentAgent,
+      attachments: attachments.map((attachment) => ({ ...attachment })),
+      mode,
+      agent,
     });
     messageQueues.set(key, queue);
+    renderMessageQueue();
+    return true;
+  }
+
+  function enqueueComposerMessage(text) {
+    if (!enqueueMessage(
+      text,
+      pendingAttachments,
+      currentMode,
+      currentAgent,
+    )) return;
     msgInput.value = '';
     clearComposerDraft();
     pendingAttachments = [];
     renderPendingAttachments();
-    renderMessageQueue();
     autoResize();
     msgInput.focus();
   }
@@ -3871,14 +3881,16 @@
   // 纯装饰，语义由按钮的 title / aria-label 承担。
   const MSG_ICON_COPY = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
   const MSG_ICON_EDIT = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>';
+  const MSG_ICON_RESEND = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"></path><path d="M21 3v6h-6"></path></svg>';
   const MSG_ICON_FOLD = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 14 5-5 5 5"></path><path d="m7 19 5-5 5 5"></path></svg>';
   const MSG_ICON_CHECK = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>';
 
-  // 气泡外侧的悬停操作条（复制，user 消息额外有编辑）。复制取原始文本
+  // 气泡外侧的悬停操作条（复制，user 消息额外有编辑、重发）。复制取原始文本
   // （assistant 是 markdown 源文本，user 是输入原文），而不是渲染后的 innerText ——
   // 否则代码块围栏、列表符号会在复制时丢失。原始文本挂在元素上，流式刷新时同步更新。
-  function attachMsgActions(div, role, content, beforeEl) {
+  function attachMsgActions(div, role, content, attachments, beforeEl) {
     div._ccRawText = typeof content === 'string' ? content : '';
+    div._ccAttachments = Array.isArray(attachments) ? attachments.map((attachment) => ({ ...attachment })) : [];
 
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
@@ -3920,6 +3932,17 @@
         msgInput.setSelectionRange(end, end);
       });
       actions.appendChild(editBtn);
+
+      const resendBtn = document.createElement('button');
+      resendBtn.type = 'button';
+      resendBtn.className = 'msg-action-btn';
+      resendBtn.innerHTML = MSG_ICON_RESEND;
+      resendBtn.title = '重发';
+      resendBtn.setAttribute('aria-label', '把这条提问追加到会话末尾重新发送');
+      resendBtn.addEventListener('click', () => {
+        resendUserMessage(div._ccRawText || '', div._ccAttachments || []);
+      });
+      actions.appendChild(resendBtn);
     }
 
     if (role === 'assistant') {
@@ -4075,7 +4098,7 @@
     div.appendChild(bubble);
     const time = buildMsgTimeElement(timestamp);
     if (time) div.appendChild(time);
-    if (role === 'user' || role === 'assistant') attachMsgActions(div, role, content, time);
+    if (role === 'user' || role === 'assistant') attachMsgActions(div, role, content, attachments, time);
     return div;
   }
 
@@ -7109,6 +7132,65 @@
   }
 
   // --- Send Message ---
+  // 历史提问的重发只追加一轮，不截断、不修改已有对话。历史附件仍在有效期内时复用，
+  // 过期附件跳过并提示；输入框草稿和待发送附件保持不变。
+  function resendUserMessage(text, attachments) {
+    const rawText = typeof text === 'string' ? text : '';
+    const normalizedText = rawText.trim();
+    const sourceAttachments = Array.isArray(attachments) ? attachments : [];
+    const reusableAttachments = sourceAttachments
+      .filter((attachment) => attachment?.id && attachment.storageState !== 'expired')
+      .map((attachment) => ({ ...attachment, reuse: true }));
+    const skippedAttachmentCount = sourceAttachments.length - reusableAttachments.length;
+
+    if (!normalizedText && reusableAttachments.length === 0) {
+      appendError(skippedAttachmentCount > 0
+        ? '原消息中的图片已过期，没有可重发的内容。'
+        : '这条消息没有可重发的内容。');
+      return;
+    }
+    if (isBlockingSessionLoad()) return;
+    if (!isWsConnected()) {
+      showConnBanner();
+      return;
+    }
+    if (!currentSessionId) {
+      appendError('当前会话尚未创建，请稍后再试。');
+      return;
+    }
+
+    pushPromptHistory(normalizedText);
+    if (isGenerating || currentSessionRunning) {
+      if (!enqueueMessage(rawText, reusableAttachments, currentMode, currentAgent)) return;
+      if (skippedAttachmentCount > 0) {
+        appendSystemMessage(`原消息中的 ${skippedAttachmentCount} 张图片已过期，本次仅重发可用内容。`);
+      }
+      return;
+    }
+
+    if (skippedAttachmentCount > 0) {
+      appendSystemMessage(`原消息中的 ${skippedAttachmentCount} 张图片已过期，本次仅重发可用内容。`);
+    }
+    const welcome = messagesDiv.querySelector('.welcome-msg');
+    if (welcome) welcome.remove();
+    virtAppendEls([createMsgElement('user', rawText, reusableAttachments, Date.now())]);
+    scrollToBottom(true);
+    pendingClaudeRecoveryUi = {
+      sessionId: currentSessionId,
+      text: rawText,
+      attachments: reusableAttachments.map((attachment) => ({ ...attachment })),
+    };
+    send({
+      type: 'message',
+      text: rawText,
+      attachments: reusableAttachments,
+      sessionId: currentSessionId,
+      mode: currentMode,
+      agent: currentAgent,
+    });
+    startGenerating();
+  }
+
   // 不变量：空文本+无附件、会话加载阻塞时立即返回；生成中改为加入待发送队列；
   // 未连接时立即返回并显示断线状态条（不清空输入框、不渲染气泡、不进入生成态，
   // 避免 WS 断线窗口内发送被静默丢弃、重连快照又冲掉本地气泡）。
