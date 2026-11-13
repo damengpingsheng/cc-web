@@ -599,6 +599,36 @@ function testGatewayEnv() {
   console.log('Gateway environment checks passed.');
 }
 
+function testCodexLocalProxyHeaders() {
+  const runtime = createAgentRuntime({
+    processEnv: {
+      HOME: '/tmp',
+      CODEX_LITELLM_END_USER_ID: 'huxiaojie',
+      CODEX_CLIENT_HOSTNAME: 'test-host',
+    },
+    resolveCodexGatewayEnv: () => ({}),
+    CLAUDE_PATH: '', CODEX_PATH: '', MODEL_MAP: {},
+    loadModelConfig: () => ({}), applyCustomTemplateToSettings: () => {},
+    loadCodexConfig: () => ({ gateway: 'localproxy' }),
+    prepareCodexCustomRuntime: () => ({ mode: 'local' }),
+    wsSend: () => {}, truncateObj: (x) => x, sanitizeToolInput: (_, x) => x,
+    isInjectedClaudeUserEntry: () => false, loadSession: () => null, saveSession: () => {},
+    setRuntimeSessionId: () => {}, clearRuntimeSessionId: () => {}, getRuntimeSessionId: () => null,
+  });
+  const spec = runtime.buildCodexSpawnSpec({
+    model: 'gpt-6-astra', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'localproxy',
+  });
+  const providerOverride = spec.args.find((arg) => arg.startsWith('model_providers.localproxy={'));
+  assert(providerOverride, 'Codex localproxy provider must be passed as one TOML table');
+  assert(providerOverride.includes('env_http_headers={"X-LiteLLM-End-User-Id"="CODEX_LITELLM_END_USER_ID",'),
+    'Codex localproxy provider must send the LiteLLM end-user header from the injected environment');
+  assert(providerOverride.includes('"X-Client-Hostname"="CODEX_CLIENT_HOSTNAME"}'),
+    'Codex localproxy provider must send the client hostname from the injected environment');
+  assert(spec.env.CODEX_LITELLM_END_USER_ID === 'huxiaojie', 'Codex child process must receive the end-user environment');
+  assert(spec.env.CODEX_CLIENT_HOSTNAME === 'test-host', 'Codex child process must receive the client-hostname environment');
+  console.log('Codex localproxy header checks passed.');
+}
+
 function testApirouterUsageFormatting() {
   const source = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
   const start = source.indexOf('  function formatApirouterAmount');
@@ -1079,6 +1109,7 @@ async function main() {
   await testLlmproxyUsage();
   await testApirouterUsage();
   testGatewayEnv();
+  testCodexLocalProxyHeaders();
   testApirouterUsageFormatting();
   testSessionHistorySync();
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
