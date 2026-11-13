@@ -98,6 +98,36 @@
             </div>
           </div>
         </section>
+        <section id="apirouter-usage" class="llmproxy-usage apirouter-usage" hidden tabindex="0" aria-label="APIRouter 用量" title="APIRouter 模型 key 用量" aria-describedby="apirouter-usage-details">
+          <div class="llmproxy-usage-meter">
+            <span id="apirouter-usage-fill" class="llmproxy-usage-fill" aria-hidden="true"></span>
+            <span class="llmproxy-usage-label">APIRouter</span>
+            <span id="apirouter-usage-percent" class="llmproxy-usage-percent"></span>
+          </div>
+          <div id="apirouter-usage-details" class="llmproxy-usage-details">
+            <div class="llmproxy-usage-summary">
+              <span class="llmproxy-usage-summary-label">APIRouter 当前订阅</span>
+              <strong id="apirouter-usage-amount" class="llmproxy-usage-amount"></strong>
+              <span id="apirouter-usage-remaining" class="llmproxy-usage-remaining"></span>
+            </div>
+            <div class="llmproxy-usage-group">
+              <span class="llmproxy-usage-group-title">订阅计划</span>
+              <span id="apirouter-usage-plan"></span>
+            </div>
+            <div class="llmproxy-usage-group">
+              <span class="llmproxy-usage-group-title">钱包余额</span>
+              <span id="apirouter-usage-wallet"></span>
+            </div>
+            <div class="llmproxy-usage-group">
+              <span class="llmproxy-usage-group-title">当前 key 累计</span>
+              <span id="apirouter-usage-key"></span>
+            </div>
+            <div class="llmproxy-usage-footer">
+              <span id="apirouter-usage-updated"></span>
+              <button id="apirouter-usage-refresh" class="llmproxy-usage-refresh" type="button">刷新</button>
+            </div>
+          </div>
+        </section>
         <button id="chat-agent-btn" class="chat-agent-btn" type="button" aria-haspopup="menu" aria-expanded="false">Claude</button>
         <button id="chat-gateway" class="chat-gateway" type="button" aria-haspopup="menu" aria-expanded="false" hidden></button>
         <div id="chat-gateway-menu" class="chat-agent-menu chat-gateway-menu" hidden>

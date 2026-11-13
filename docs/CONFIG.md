@@ -14,7 +14,8 @@
 | `model.json` | Claude 模型模板 + 当前活动模板 |
 | `codex.json` | Codex profiles（API key、模型、自定义 CODEX_HOME） |
 | `dev.json` | GitHub token/repos + SSH hosts + Cloudflare API token/zones（供 `/github`、`/ssh`、`/cf` 使用） |
-| `llmproxy-usage.json` | llmproxy 个人用量统计：`baseUrl`、`endUser`、`monthlyQuotaUsd`、`timezone`、`historyStart`。API key 优先从 `OPENAI_API_KEY` 读取，其次复用 Codex custom profile 或本机 `~/.codex/auth.json`；不会下发前端 |
+| `llmproxy-usage.json` | llmproxy 个人用量统计：`endUser`、`monthlyQuotaUsd`、`timezone`、`historyStart`；`baseUrl` 仅作未设置 `LLMPROXY_BASE_URL` 时的兼容回退。凭据只读取 `LLMPROXY_API_KEY`；不会下发前端 |
+| `apirouter-usage.json` | APIRouter 模型 key 用量统计：`enabled`、`timezone`；`baseUrl` 仅作未设置 `APIROUTER_BASE_URL` 时的兼容回退。仅调用模型 key 可访问的 `/api/usage/token/` 与 `/api/log/token`，不依赖控制台 access token；不会下发前端 |
 
 `dev.json` schema（cloudflare 块，token 下发前端时经 `maskSecret` 掩码，保存时 `****` 值保留旧 token；zones 整体替换、`name` 必填、`id` 自动生成 `z_` + 8 位 hex）：
 
@@ -44,6 +45,10 @@
 | `AI_SESSION_TRACE_ROOT` | `~/.ai-session-trace` | Claude transcript 过期后，用于查找 hook 保存的 `transcript.jsonl` / `transcript.sha256` 快照；只有摘要与 session ID 均校验通过才允许恢复 |
 | `CC_WEB_IP_WHITELIST` | — | 暴力破解豁免 IP 列表 |
 | `CC_WEB_TRUSTED_PROXIES` | — | 可信反向代理 CIDR/IP 列表（仅这些来源的 X-Forwarded-For 才被信任），默认空 = 最严格 |
+| `APIROUTER_BASE_URL` | — | APIRouter 网关地址；Codex 请求保留 `/v1`，用量接口自动剥掉。优先于 `apirouter-usage.json` 的 `baseUrl` |
+| `APIROUTER_API_KEY` | — | APIRouter 模型 key，仅用于 APIRouter 用量查询；不会回退到 `OPENAI_API_KEY` 或 llmproxy key |
+| `LLMPROXY_BASE_URL` | — | llmproxy 网关地址；Codex 请求保留 `/v1`，用量接口自动剥掉。优先于 `llmproxy-usage.json` 的 `baseUrl` |
+| `LLMPROXY_API_KEY` | — | llmproxy key，仅用于 llmproxy 用量查询；不会回退到 `OPENAI_API_KEY` 或 APIRouter key |
 | `PUSHPLUS_TOKEN` | — | 遗留：首次运行迁移到 `config/notify.json` |
 | `CC_WEB_PASSWORD` | — | 遗留：首次运行迁移到 `config/auth.json` |
 

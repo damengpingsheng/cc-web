@@ -71,6 +71,13 @@ const {
   buildUsageRanges,
   createUsageCollector,
 } = require(path.join(REPO_DIR, 'lib', 'llmproxy-usage.js'));
+const {
+  createApirouterUsageCollector,
+} = require(path.join(REPO_DIR, 'lib', 'apirouter-usage.js'));
+const {
+  parseEnvFile,
+  createGatewayEnvResolver,
+} = require(path.join(REPO_DIR, 'lib', 'gateway-env.js'));
 
 function mkdirp(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -348,6 +355,187 @@ async function testLlmproxyUsage() {
   const retryPayload = await retryCollector.refresh(retryConfig);
   assert(retryFetches === 2 && retryPayload.monthToDate.spend === 0, 'llmproxy usage must allow retry after a failed refresh');
   console.log('llmproxy usage checks passed.');
+}
+
+async function testApirouterUsage() {
+  const requests = [];
+  const logRows = [
+    {
+      created_at: 1794474400,
+      other: JSON.stringify({
+        subscription_plan_title: '旧订阅',
+        subscription_total: 500000,
+        subscription_used: 100000,
+        subscription_remain: 400000,
+        billing_source: 'subscription',
+      }),
+    },
+    {
+      created_at: 1794474545,
+      other: JSON.stringify({
+        subscription_plan_title: 'Axera员工标准版',
+        subscription_total: 73855244,
+        subscription_used: 16180365,
+        subscription_remain: 57674879,
+        billing_source: 'subscription',
+      }),
+    },
+  ];
+  const fetchImpl = async (url, options = {}) => {
+    const parsed = new URL(url);
+    requests.push({ pathname: parsed.pathname, authorization: options.headers?.Authorization });
+    if (parsed.pathname === '/api/status') {
+      return {
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: { quota_display_type: 'CNY', quota_per_unit: 500000, usd_exchange_rate: 6.77 },
+        }),
+      };
+    }
+    if (parsed.pathname === '/api/usage/token/') {
+      return {
+        ok: true,
+        json: async () => ({
+          code: true,
+          data: {
+            object: 'token_usage',
+            name: 'auto_group',
+            unlimited_quota: true,
+            total_available: -32642193,
+            total_granted: 0,
+            total_used: 32642193,
+            expires_at: 0,
+            user_quota: { total_available: 7435, total_used: 425909028 },
+          },
+        }),
+      };
+    }
+    if (parsed.pathname === '/api/log/token') {
+      return { ok: true, json: async () => ({ success: true, data: logRows }) };
+    }
+    throw new Error(`unexpected APIRouter URL: ${url}`);
+  };
+  const collector = createApirouterUsageCollector({
+    fetchImpl,
+    cacheTtlMs: 0,
+    nowProvider: () => new Date('2026-11-12T09:32:00Z'),
+  });
+  const payload = await collector.refresh({
+    enabled: true,
+    baseUrl: 'https://apirouter.example',
+    authToken: 'test-token',
+    timezone: 'Asia/Shanghai',
+  });
+  const close = (left, right) => Math.abs(Number(left) - Number(right)) < 0.00001;
+
+  assert(requests.length === 3, `APIRouter usage must fetch status, token and log endpoints (got ${requests.length})`);
+  assert(requests.find((item) => item.pathname === '/api/status')?.authorization === undefined, 'APIRouter status must remain unauthenticated');
+  assert(requests.filter((item) => item.pathname !== '/api/status').every((item) => item.authorization === 'Bearer test-token'), 'APIRouter usage endpoints must use the model key');
+  assert(payload.ok === true && payload.currency === 'CNY' && payload.currencySymbol === '¥', 'APIRouter usage must expose the display currency');
+  assert(payload.key.name === 'auto_group' && payload.key.unlimitedQuota === true && payload.key.available === null, 'Unlimited APIRouter keys must not expose a negative available quota');
+  assert(close(payload.key.used, (32642193 / 500000) * 6.77), 'APIRouter key usage must be converted to the display currency');
+  assert(close(payload.wallet.available, (7435 / 500000) * 6.77), 'APIRouter wallet quota must be converted to the display currency');
+  assert(payload.subscription.title === 'Axera员工标准版', 'APIRouter usage must select the latest subscription log');
+  assert(close(payload.subscription.total, 1000) && close(payload.subscription.remaining, (57674879 / 500000) * 6.77), 'APIRouter subscription quotas must be converted correctly');
+  assert(close(payload.subscription.used, (16180365 / 500000) * 6.77), 'APIRouter subscription usage must be converted correctly');
+  assert(payload.updatedAt === '2026-11-12T09:32:00.000Z', 'APIRouter usage timestamp must use the collector clock');
+  assert(!JSON.stringify(payload).includes('test-token'), 'APIRouter usage payload must never expose the model key');
+
+  const collectorWithoutLogs = createApirouterUsageCollector({
+    fetchImpl: async (url, options = {}) => {
+      const parsed = new URL(url);
+      if (parsed.pathname === '/api/log/token') throw new Error('log endpoint unavailable');
+      return fetchImpl(url, options);
+    },
+    cacheTtlMs: 0,
+  });
+  const withoutLogs = await collectorWithoutLogs.refresh({
+    enabled: true,
+    baseUrl: 'https://apirouter.example',
+    authToken: 'test-token',
+  });
+  assert(withoutLogs.ok === true && withoutLogs.subscription === null, 'APIRouter token usage must remain available when optional logs fail');
+
+  let failureFetches = 0;
+  const failingCollector = createApirouterUsageCollector({
+    fetchImpl: async () => {
+      failureFetches += 1;
+      return { ok: false, status: 429, json: async () => ({}) };
+    },
+    cacheTtlMs: 0,
+    failureCacheTtlMs: 60 * 1000,
+  });
+  const failingConfig = {
+    enabled: true,
+    baseUrl: 'https://apirouter.example',
+    authToken: 'test-token',
+  };
+  await failingCollector.refresh(failingConfig).catch(() => {});
+  const fetchesAfterFirstRefresh = failureFetches;
+  await failingCollector.refresh(failingConfig).catch(() => {});
+  assert(fetchesAfterFirstRefresh > 0 && failureFetches === fetchesAfterFirstRefresh, 'APIRouter failures must use the short failure cache instead of retrying for every client');
+  console.log('APIRouter usage checks passed.');
+}
+
+function testGatewayEnv() {
+  const parsed = parseEnvFile([
+    'export APIROUTER_BASE_URL="https://apirouter.example/v1"',
+    'export APIROUTER_API_KEY="apirouter-key"',
+    'export LLMPROXY_BASE_URL="https://llmproxy.example/v1"',
+    'export LLMPROXY_API_KEY="llmproxy-key"',
+    'export OPENAI_BASE_URL="$LLMPROXY_BASE_URL"',
+    'export OPENAI_API_KEY="${LLMPROXY_API_KEY}"',
+  ].join('\n'));
+  assert(parsed.OPENAI_BASE_URL === 'https://llmproxy.example/v1', 'gateway env must expand $VAR references');
+  assert(parsed.OPENAI_API_KEY === 'llmproxy-key', 'gateway env must expand braced ${VAR} references');
+
+  const envFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-gateway-env-')), 'codex.env');
+  fs.writeFileSync(envFile, [
+    'export APIROUTER_BASE_URL="https://apirouter.example/v1"',
+    'export APIROUTER_API_KEY="apirouter-key"',
+    'export LLMPROXY_BASE_URL="https://llmproxy.example/v1"',
+    'export LLMPROXY_API_KEY="llmproxy-key"',
+    'export OPENAI_BASE_URL="https://openai.example/v1"',
+    'export OPENAI_API_KEY="openai-key"',
+  ].join('\n'));
+  const resolver = createGatewayEnvResolver({ env: {}, envPath: envFile });
+  assert(JSON.stringify(resolver.resolveGateway('apirouter')) === JSON.stringify({
+    baseUrl: 'https://apirouter.example/v1',
+    apiKey: 'apirouter-key',
+  }), 'APIRouter runtime must use only APIROUTER_* variables');
+  assert(JSON.stringify(resolver.resolveGateway('llmproxy')) === JSON.stringify({
+    baseUrl: 'https://llmproxy.example/v1',
+    apiKey: 'llmproxy-key',
+  }), 'llmproxy runtime must use only LLMPROXY_* variables');
+  const apiUsage = resolver.loadUsageConfig({ baseUrl: 'https://legacy-api.example' }, 'APIROUTER', {});
+  const llmUsage = resolver.loadUsageConfig({ baseUrl: 'https://legacy-llm.example' }, 'LLMPROXY', {});
+  assert(apiUsage.baseUrl === 'https://apirouter.example' && apiUsage.authToken === 'apirouter-key', 'APIRouter usage must strip /v1 and use its own key');
+  assert(llmUsage.baseUrl === 'https://llmproxy.example' && llmUsage.authToken === 'llmproxy-key', 'llmproxy usage must strip /v1 and use its own key');
+
+  const processResolver = createGatewayEnvResolver({
+    env: {
+      HOME: process.env.HOME,
+      APIROUTER_BASE_URL: 'https://process-api.example/v1',
+      APIROUTER_API_KEY: 'process-api-key',
+    },
+    envPath: envFile,
+  });
+  assert(processResolver.resolveGateway('apirouter').apiKey === 'process-api-key', 'process environment must override ~/.agents/codex.env');
+  console.log('Gateway environment checks passed.');
+}
+
+function testApirouterUsageFormatting() {
+  const source = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  const start = source.indexOf('  function formatApirouterAmount');
+  const end = source.indexOf('  function renderApirouterUsage', start);
+  assert(start >= 0 && end > start, 'APIRouter amount formatter must be extractable from public/app.js');
+  const formatAmount = new Function(`${source.slice(start, end)}; return formatApirouterAmount;`)();
+  assert(formatAmount(null, { currencySymbol: '¥' }) === '--', 'Missing APIRouter amounts must not render as zero');
+  assert(formatAmount(undefined, { currencySymbol: '¥' }) === '--', 'Undefined APIRouter amounts must render as unavailable');
+  assert(formatAmount(12.5, { currencySymbol: '¥' }) === '¥12.50', 'APIRouter currency amounts must use the configured symbol');
+  assert(formatAmount(1250, { currency: 'TOKENS' }) === '1,250 tokens', 'APIRouter token quotas must render as token counts');
+  console.log('APIRouter usage formatting checks passed.');
 }
 
 function testSessionHistorySync() {
@@ -815,6 +1003,9 @@ async function main() {
   testSessionOverviewMatcher();
   testSessionBodySearch();
   await testLlmproxyUsage();
+  await testApirouterUsage();
+  testGatewayEnv();
+  testApirouterUsageFormatting();
   testSessionHistorySync();
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
   const configDir = path.join(tempRoot, 'config');
@@ -828,6 +1019,7 @@ async function main() {
 
   // 主回归禁止认证后访问真实 llmproxy；协议级用例使用隔离的本地 mock endpoint。
   fs.writeFileSync(path.join(configDir, 'llmproxy-usage.json'), JSON.stringify({ enabled: false }, null, 2));
+  fs.writeFileSync(path.join(configDir, 'apirouter-usage.json'), JSON.stringify({ enabled: false }, null, 2));
 
   fs.writeFileSync(path.join(configDir, 'notify.json'), JSON.stringify({
     provider: 'off',

@@ -6,7 +6,7 @@
 
 ### 客户端 → 服务端
 
-`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 40 个 case = **41 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
+`server.js` 客户端消息入口：`auth` 单独分支 + switch 共 42 个 case = **43 个 type**（按符号名 `ws.on('message')` 与 switch 定位最稳）。
 
 | 类型 | 用途 |
 |---|---|
@@ -29,6 +29,7 @@
 | `get_model_config` / `save_model_config` | Claude 模型模板 |
 | `get_codex_config` / `save_codex_config` | Codex profile |
 | `get_llmproxy_usage { force? }` | 查询当前登录用户配置的 llmproxy 个人用量；默认命中 3 分钟缓存，`force=true` 强制刷新 |
+| `get_apirouter_usage { force? }` | 使用模型 `sk-` key 查询 APIRouter 的 key 累计用量、钱包额度和最近一次订阅计费；默认命中 3 分钟缓存，`force=true` 强制刷新 |
 | `fetch_models` | 拉取可用模型列表 |
 | `check_update` | 检查版本更新 |
 | `read_claude_local_config` / `read_codex_local_config` | 读本地 CLI 配置 |
@@ -44,7 +45,7 @@
 
 ### 服务端 → 客户端
 
-`public/app.js` 中 `handleServerMessage` 函数，共 **40 个 case**：
+`public/app.js` 中 `handleServerMessage` 函数，共 **42 个 case**：
 
 | 类型 | 用途 |
 |---|---|
@@ -72,6 +73,7 @@
 | `password_changed` | 改密通知。成功时返回新 `token`，前端必须用新 token 替换旧 token；改密副作用：**踢掉所有其他已认证 WS 连接**（详见 [CONFIG.md](./CONFIG.md#鉴权与安全)） |
 | `model_config` / `codex_config` / `dev_config` | 配置回执 |
 | `llmproxy_usage` | llmproxy 个人用量。成功时含 `endUser`、`monthlyQuotaUsd`、`today`、`monthToDate`、`history`、`remainingUsd`、`usedPercent`、`updatedAt`；每个范围含 `spend`、`totalTokens`、`promptTokens`、`completionTokens`、`cacheReadTokens`。失败时 `ok=false` 并含 `message` |
+| `apirouter_usage` | APIRouter 模型 key 用量。成功时含 `key`（名称、无限额度标志、可用/授予/累计用量、到期时间）、可选 `wallet`（用户额度可用/累计）、可选 `subscription`（最新一条带订阅计费日志的计划名、总额/已用/剩余、使用比例、观测时间），以及 `currency`、`currencySymbol`、`timezone`、`updatedAt`。日志接口失败时仍返回 key/wallet；失败时 `ok=false` 并含 `message`。不包含 API key 或 access token |
 | `claude_local_config` / `codex_local_config` | 本地配置回执 |
 | `fetch_models_result` | 模型列表回执 |
 | `update_info` | 版本更新信息 |

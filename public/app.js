@@ -285,6 +285,17 @@
   const llmproxyUsageHistory = $('#llmproxy-usage-history');
   const llmproxyUsageUpdated = $('#llmproxy-usage-updated');
   const llmproxyUsageRefresh = $('#llmproxy-usage-refresh');
+  const apirouterUsage = $('#apirouter-usage');
+  const apirouterUsageMeter = $('#apirouter-usage .llmproxy-usage-meter');
+  const apirouterUsageAmount = $('#apirouter-usage-amount');
+  const apirouterUsageRemaining = $('#apirouter-usage-remaining');
+  const apirouterUsagePercent = $('#apirouter-usage-percent');
+  const apirouterUsageFill = $('#apirouter-usage-fill');
+  const apirouterUsagePlan = $('#apirouter-usage-plan');
+  const apirouterUsageWallet = $('#apirouter-usage-wallet');
+  const apirouterUsageKey = $('#apirouter-usage-key');
+  const apirouterUsageUpdated = $('#apirouter-usage-updated');
+  const apirouterUsageRefresh = $('#apirouter-usage-refresh');
   const chatModelState = $('#chat-model-state');
   const costDisplay = $('#cost-display');
   const messageQueueEl = $('#message-queue');
@@ -2691,6 +2702,89 @@
     llmproxyUsageUpdated.textContent = `${formatUsageUpdated(msg.updatedAt)} · ${msg.endUser || ''}`;
   }
 
+  function formatApirouterAmount(value, msg) {
+    if (value === null || value === undefined || value === '') return '--';
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return '--';
+    if (msg?.currency === 'TOKENS') {
+      return `${amount.toLocaleString('en-US', { maximumFractionDigits: 0 })} tokens`;
+    }
+    const symbol = msg?.currencySymbol || '';
+    return `${symbol}${amount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+
+  function renderApirouterUsage(msg) {
+    if (!apirouterUsage) return;
+    apirouterUsage.hidden = false;
+    apirouterUsage.classList.remove('warning', 'over-budget');
+    if (!msg || msg.ok !== true) {
+      apirouterUsagePercent.textContent = '--';
+      apirouterUsageAmount.textContent = msg?.message || '用量暂不可用';
+      apirouterUsageRemaining.textContent = '';
+      apirouterUsageFill.style.width = '0%';
+      apirouterUsagePlan.textContent = '暂不可用';
+      apirouterUsageWallet.textContent = '暂不可用';
+      apirouterUsageKey.textContent = '暂不可用';
+      apirouterUsageUpdated.textContent = formatUsageUpdated(msg?.updatedAt);
+      return;
+    }
+
+    const plan = msg.subscription;
+    const used = plan?.used == null ? null : Number(plan.used);
+    const total = plan?.total == null ? null : Number(plan.total);
+    const remaining = plan?.remaining == null ? null : Number(plan.remaining);
+    const hasPlan = Number.isFinite(used) && Number.isFinite(total) && total > 0;
+    const percent = hasPlan
+      ? Math.min(100, Math.max(0, Number(plan?.usedPercent) || (used / total) * 100))
+      : 0;
+    if (hasPlan) {
+      apirouterUsagePercent.textContent = `${percent.toFixed(1)}%`;
+      apirouterUsageAmount.textContent = `${formatApirouterAmount(used, msg)} / ${formatApirouterAmount(total, msg)}`;
+      apirouterUsageRemaining.textContent = Number.isFinite(remaining)
+        ? `${remaining >= 0 ? '剩余' : '超额'} ${formatApirouterAmount(Math.abs(remaining), msg)}`
+        : '';
+      apirouterUsageFill.style.width = `${percent}%`;
+      if (percent >= 100) apirouterUsage.classList.add('over-budget');
+      else if (percent >= 90) apirouterUsage.classList.add('warning');
+    } else {
+      apirouterUsagePercent.textContent = msg.key?.unlimitedQuota ? '∞' : '--';
+      apirouterUsageAmount.textContent = msg.key?.unlimitedQuota ? '无限额度 key' : '订阅信息暂不可用';
+      apirouterUsageRemaining.textContent = '';
+      apirouterUsageFill.style.width = '0%';
+    }
+
+    apirouterUsage.setAttribute(
+      'aria-label',
+      hasPlan
+        ? `APIRouter 当前订阅，已使用 ${percent.toFixed(1)}%，${formatApirouterAmount(used, msg)} / ${formatApirouterAmount(total, msg)}`
+        : `APIRouter 当前 key${msg.key?.unlimitedQuota ? '，无限额度' : ''}`,
+    );
+
+    if (plan) {
+      const observed = plan.observedAt ? new Date(plan.observedAt) : null;
+      const observedText = observed && Number.isFinite(observed.getTime())
+        ? ` · 最近计费 ${observed.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`
+        : '';
+      apirouterUsagePlan.textContent = `${plan.title || '当前订阅'}${observedText}`;
+    } else {
+      apirouterUsagePlan.textContent = '暂无带订阅计费的最近记录';
+    }
+
+    apirouterUsageWallet.textContent = msg.wallet
+      ? `可用 ${formatApirouterAmount(msg.wallet.available, msg)} · 已用 ${formatApirouterAmount(msg.wallet.used, msg)}`
+      : '当前 key 未返回用户额度';
+
+    let keyText = msg.key?.name || '未命名 key';
+    keyText += msg.key?.unlimitedQuota ? ' · 无限额度' : ` · 可用 ${formatApirouterAmount(msg.key?.available, msg)}`;
+    keyText += ` · 累计 ${formatApirouterAmount(msg.key?.used, msg)}`;
+    if (msg.key?.expiresAt) {
+      const expires = new Date(msg.key.expiresAt);
+      if (Number.isFinite(expires.getTime())) keyText += ` · 到期 ${expires.toLocaleDateString('zh-CN')}`;
+    }
+    apirouterUsageKey.textContent = keyText;
+    apirouterUsageUpdated.textContent = `${formatUsageUpdated(msg.updatedAt)} · 模型 key`;
+  }
+
 	  function _splitCodexThinkingModel(model) {
 	    const raw = String(model || '').trim();
 	    if (!raw) return { base: '', level: '' };
@@ -3558,6 +3652,11 @@
       case 'llmproxy_usage':
         renderLlmproxyUsage(msg);
         if (llmproxyUsageRefresh) llmproxyUsageRefresh.disabled = false;
+        break;
+
+      case 'apirouter_usage':
+        renderApirouterUsage(msg);
+        if (apirouterUsageRefresh) apirouterUsageRefresh.disabled = false;
         break;
 
       case 'claude_local_config':
@@ -7434,13 +7533,26 @@
     });
   }
 
+  if (apirouterUsageRefresh) {
+    apirouterUsageRefresh.addEventListener('click', () => {
+      if (!isWsConnected()) return;
+      apirouterUsageRefresh.disabled = true;
+      send({ type: 'get_apirouter_usage', force: true });
+    });
+  }
+
   setInterval(() => {
-    if (isWsConnected()) send({ type: 'get_llmproxy_usage', force: true });
+    if (!isWsConnected()) return;
+    send({ type: 'get_llmproxy_usage', force: true });
+    send({ type: 'get_apirouter_usage', force: true });
   }, LLMPROXY_USAGE_REFRESH_INTERVAL);
 
   if (llmproxyUsageMeter) {
     // 胶囊只用于悬停展示；点击不抢焦点，避免出现文本插入光标和悬停层粘住。
     llmproxyUsageMeter.addEventListener('pointerdown', (event) => event.preventDefault());
+  }
+  if (apirouterUsageMeter) {
+    apirouterUsageMeter.addEventListener('pointerdown', (event) => event.preventDefault());
   }
 
   // Split new-chat button

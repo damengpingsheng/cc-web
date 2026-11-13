@@ -1197,6 +1197,8 @@ body.session-loading-active {
 .llmproxy-usage.warning .llmproxy-usage-percent { color: #9a6f14; }
 .llmproxy-usage.over-budget .llmproxy-usage-fill { background: rgba(192, 85, 58, 0.32); }
 .llmproxy-usage.over-budget .llmproxy-usage-percent { color: var(--danger); }
+.apirouter-usage .llmproxy-usage-fill { background: rgba(46, 138, 97, 0.22); }
+.apirouter-usage .llmproxy-usage-percent { color: #2e8a61; }
 .llmproxy-usage-details {
   position: absolute;
   top: calc(100% + 7px);
