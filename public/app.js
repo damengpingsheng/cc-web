@@ -283,6 +283,9 @@
   const llmproxyUsageToday = $('#llmproxy-usage-today');
   const llmproxyUsageMonth = $('#llmproxy-usage-month');
   const llmproxyUsageHistory = $('#llmproxy-usage-history');
+  const llmproxyUsageTodayModels = $('#llmproxy-usage-today-models');
+  const llmproxyUsageMonthModels = $('#llmproxy-usage-month-models');
+  const llmproxyUsageHistoryModels = $('#llmproxy-usage-history-models');
   const llmproxyUsageUpdated = $('#llmproxy-usage-updated');
   const llmproxyUsageRefresh = $('#llmproxy-usage-refresh');
   const apirouterUsage = $('#apirouter-usage');
@@ -2665,6 +2668,42 @@
       + `（输入 ${formatUsageMillions(metrics.promptTokens)} / 输出 ${formatUsageMillions(metrics.completionTokens)} / cache ${formatUsageMillions(metrics.cacheReadTokens)}）`;
   }
 
+  function setUsageModels(el, models) {
+    if (!el) return;
+    el.replaceChildren();
+    if (!Array.isArray(models)) {
+      const unavailable = document.createElement('span');
+      unavailable.className = 'llmproxy-usage-model-empty';
+      unavailable.textContent = '暂不可用';
+      el.appendChild(unavailable);
+      return;
+    }
+    if (models.length === 0) {
+      const empty = document.createElement('span');
+      empty.className = 'llmproxy-usage-model-empty';
+      empty.textContent = '暂无调用';
+      el.appendChild(empty);
+      return;
+    }
+    for (const model of models) {
+      const row = document.createElement('div');
+      row.className = 'llmproxy-usage-model-row';
+      const name = document.createElement('span');
+      const fullName = String(model?.model || 'unknown-model');
+      name.className = 'llmproxy-usage-model-name';
+      name.title = fullName;
+      name.textContent = fullName.replace(/^openai\//i, '');
+      const tokens = document.createElement('span');
+      tokens.className = 'llmproxy-usage-model-tokens';
+      tokens.textContent = `${Number(model?.calls) || 0} 次 · ${formatUsageMillions(model?.totalTokens)} tok`;
+      const spend = document.createElement('span');
+      spend.className = 'llmproxy-usage-model-spend';
+      spend.textContent = formatUsageUsd(model?.spend);
+      row.append(name, tokens, spend);
+      el.appendChild(row);
+    }
+  }
+
   function renderLlmproxyUsage(msg) {
     if (!llmproxyUsage) return;
     llmproxyUsage.hidden = false;
@@ -2677,6 +2716,9 @@
       setUsageDetails(llmproxyUsageToday, null);
       setUsageDetails(llmproxyUsageMonth, null);
       setUsageDetails(llmproxyUsageHistory, null);
+      setUsageModels(llmproxyUsageTodayModels, null);
+      setUsageModels(llmproxyUsageMonthModels, null);
+      setUsageModels(llmproxyUsageHistoryModels, null);
       llmproxyUsageUpdated.textContent = formatUsageUpdated(msg?.updatedAt);
       return;
     }
@@ -2699,6 +2741,9 @@
     setUsageDetails(llmproxyUsageToday, msg.today);
     setUsageDetails(llmproxyUsageMonth, msg.monthToDate);
     setUsageDetails(llmproxyUsageHistory, msg.history);
+    setUsageModels(llmproxyUsageTodayModels, msg.today?.models);
+    setUsageModels(llmproxyUsageMonthModels, msg.monthToDate?.models);
+    setUsageModels(llmproxyUsageHistoryModels, msg.history?.models);
     llmproxyUsageUpdated.textContent = `${formatUsageUpdated(msg.updatedAt)} · ${msg.endUser || ''}`;
   }
 

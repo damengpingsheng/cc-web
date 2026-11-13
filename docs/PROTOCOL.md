@@ -72,7 +72,7 @@
 | `notify_config` / `notify_test_result` | 通知配置回执 |
 | `password_changed` | 改密通知。成功时返回新 `token`，前端必须用新 token 替换旧 token；改密副作用：**踢掉所有其他已认证 WS 连接**（详见 [CONFIG.md](./CONFIG.md#鉴权与安全)） |
 | `model_config` / `codex_config` / `dev_config` | 配置回执 |
-| `llmproxy_usage` | llmproxy 个人用量。成功时含 `endUser`、`monthlyQuotaUsd`、`today`、`monthToDate`、`history`、`remainingUsd`、`usedPercent`、`updatedAt`；每个范围含 `spend`、`totalTokens`、`promptTokens`、`completionTokens`、`cacheReadTokens`。失败时 `ok=false` 并含 `message` |
+| `llmproxy_usage` | llmproxy 个人用量。成功时含 `endUser`、`monthlyQuotaUsd`、`today`、`monthToDate`、`history`、`remainingUsd`、`usedPercent`、`updatedAt`；每个范围含 `spend`、`totalTokens`、`promptTokens`、`completionTokens`、`cacheReadTokens`，以及按消费降序排列的 `models`（每项含 `model`、`calls`、`spend` 和各类 Token）。失败时 `ok=false` 并含 `message` |
 | `apirouter_usage` | APIRouter 模型 key 用量。成功时含 `key`（名称、无限额度标志、可用/授予/累计用量、到期时间）、可选 `wallet`（用户额度可用/累计）、可选 `subscription`（最新一条带订阅计费日志的计划名、总额/已用/剩余、使用比例、观测时间），以及 `currency`、`currencySymbol`、`timezone`、`updatedAt`。日志接口失败时仍返回 key/wallet；失败时 `ok=false` 并含 `message`。不包含 API key 或 access token |
 | `claude_local_config` / `codex_local_config` | 本地配置回执 |
 | `fetch_models_result` | 模型列表回执 |

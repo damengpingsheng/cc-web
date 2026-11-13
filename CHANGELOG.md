@@ -8,6 +8,24 @@
 
 ---
 
+## 分叉 v1.5.59
+
+### 新增
+
+llmproxy 个人额度胶囊的今日、本月和历史累计明细新增模型拆分，按实际模型聚合调用次数、消费和 Token；模型按消费金额降序排列，胶囊悬停层可滚动查看较长列表。
+
+### 验证
+
+- llmproxy 用量单测覆盖今日、本月和历史累计按模型聚合、调用次数、消费与 Token 统计及排序；隔离 WebSocket 用例验证 `get_llmproxy_usage` 实际下发三组模型明细。
+- `node --check` 覆盖 `lib/llmproxy-usage.js`、`public/app.js`、`scripts/regression.js`；执行 `git diff --check` 和 `npm run regression`。
+
+### 生效前提
+
+- 本次包含服务端与前端静态文件改动，需要重启 cc-web 服务进程并刷新页面。
+- 前端静态资源 `?v=` 已打到 `1.5.1-my.77`。
+
+---
+
 ## 分叉 v1.5.58
 
 ### 新增

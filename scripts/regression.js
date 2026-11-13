@@ -305,10 +305,10 @@ async function testLlmproxyUsage() {
 
   const requests = [];
   const rows = [
-    { startTime: '2026-11-09T15:59:59.000Z', spend: 1, total_tokens: 1000000, prompt_tokens: 600000, completion_tokens: 400000, metadata: { usage_object: { cache_read_input_tokens: 100000 } } },
-    { startTime: '2026-11-09T16:00:00.000Z', spend: 2, total_tokens: 2000000, prompt_tokens: 1200000, completion_tokens: 800000, metadata: { usage_object: { cache_read_input_tokens: 200000 } } },
-    { startTime: '2026-11-10T15:59:59.000Z', spend: 3, total_tokens: 3000000, prompt_tokens: 1800000, completion_tokens: 1200000, metadata: { usage_object: { cache_read_input_tokens: 300000 } } },
-    { startTime: '2026-11-10T16:00:00.000Z', spend: 4, total_tokens: 4000000, prompt_tokens: 2400000, completion_tokens: 1600000, metadata: { usage_object: { cache_read_input_tokens: 400000 } } },
+    { startTime: '2026-11-09T15:59:59.000Z', model: 'openai/grok-4.7', spend: 1, total_tokens: 1000000, prompt_tokens: 600000, completion_tokens: 400000, metadata: { usage_object: { cache_read_input_tokens: 100000 } } },
+    { startTime: '2026-11-09T16:00:00.000Z', model: 'openai/grok-4.7', spend: 2, total_tokens: 2000000, prompt_tokens: 1200000, completion_tokens: 800000, metadata: { usage_object: { cache_read_input_tokens: 200000 } } },
+    { startTime: '2026-11-10T15:59:59.000Z', model: 'openai/claude-sonnet-test', spend: 3, total_tokens: 3000000, prompt_tokens: 1800000, completion_tokens: 1200000, metadata: { usage_object: { cache_read_input_tokens: 300000 } } },
+    { startTime: '2026-11-10T16:00:00.000Z', model: 'openai/grok-4.7', spend: 4, total_tokens: 4000000, prompt_tokens: 2400000, completion_tokens: 1600000, metadata: { usage_object: { cache_read_input_tokens: 400000 } } },
   ];
   const fetchImpl = async (url) => {
     const parsed = new URL(url);
@@ -335,6 +335,12 @@ async function testLlmproxyUsage() {
   assert(payload.monthToDate.spend === 10 && payload.monthToDate.totalTokens === 10000000, 'llmproxy month metrics must exclude the previous month');
   assert(payload.history.spend === 10 && payload.history.totalTokens === 10000000, 'llmproxy history metrics must include every page');
   assert(payload.monthToDate.cacheReadTokens === 1000000, 'llmproxy cache-read tokens must be aggregated');
+  assert(payload.today.models.length === 2 && payload.today.models[0].model === 'openai/claude-sonnet-test', 'llmproxy today models must be aggregated and sorted by spend');
+  assert(payload.today.models.find((item) => item.model === 'openai/grok-4.7')?.calls === 1, 'llmproxy today model calls must be counted');
+  const monthGrok = payload.monthToDate.models.find((item) => item.model === 'openai/grok-4.7');
+  assert(monthGrok?.calls === 3 && monthGrok.spend === 7 && monthGrok.totalTokens === 7000000, 'llmproxy month model metrics must include every matching request');
+  const historyGrok = payload.history.models.find((item) => item.model === 'openai/grok-4.7');
+  assert(historyGrok?.calls === 3 && historyGrok.spend === 7 && historyGrok.totalTokens === 7000000, 'llmproxy history model metrics must include every matching request');
   assert(payload.remainingUsd === 1990 && payload.usedPercent === 0.5, 'llmproxy quota calculations are incorrect');
   assert(payload.endUser === 'huxiaojie' && payload.authToken === undefined, 'llmproxy response must expose end_user without exposing the API key');
 
@@ -354,6 +360,74 @@ async function testLlmproxyUsage() {
   await retryCollector.refresh(retryConfig).catch(() => {});
   const retryPayload = await retryCollector.refresh(retryConfig);
   assert(retryFetches === 2 && retryPayload.monthToDate.spend === 0, 'llmproxy usage must allow retry after a failed refresh');
+
+  const protocolRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-llmproxy-protocol-'));
+  const protocolConfigDir = path.join(protocolRoot, 'config');
+  const protocolSessionsDir = path.join(protocolRoot, 'sessions');
+  const protocolLogsDir = path.join(protocolRoot, 'logs');
+  const protocolHomeDir = path.join(protocolRoot, 'home');
+  for (const dir of [protocolConfigDir, protocolSessionsDir, protocolLogsDir, protocolHomeDir]) mkdirp(dir);
+  let protocolFetchCount = 0;
+  const protocolUsage = {
+    data: [{
+      startTime: new Date().toISOString(), model: 'openai/protocol-model', spend: 1.25,
+      total_tokens: 2000000, prompt_tokens: 1500000, completion_tokens: 500000,
+    }],
+    total_pages: 1,
+    total_is_capped: false,
+  };
+  const protocolMock = http.createServer((req, res) => {
+    if (req.url?.startsWith('/spend/logs/v2?')) protocolFetchCount += 1;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(protocolUsage));
+  });
+  await new Promise((resolve, reject) => {
+    protocolMock.once('error', reject);
+    protocolMock.listen(0, '127.0.0.1', resolve);
+  });
+  const protocolMockPort = protocolMock.address().port;
+  const protocolBaseUrl = `http://127.0.0.1:${protocolMockPort}`;
+  fs.writeFileSync(path.join(protocolConfigDir, 'llmproxy-usage.json'), JSON.stringify({
+    enabled: true, baseUrl: `${protocolBaseUrl}/v1`, endUser: 'huxiaojie',
+    monthlyQuotaUsd: 2000, timezone: 'Asia/Shanghai', historyStart: '2000-01-01',
+  }));
+  fs.writeFileSync(path.join(protocolConfigDir, 'apirouter-usage.json'), JSON.stringify({ enabled: false }));
+  const protocolPort = await getFreePort();
+  const protocolPassword = 'Llmproxy!234';
+  const protocolApiKey = 'protocol-test-token';
+  try {
+    await withServer({
+      PORT: String(protocolPort),
+      CC_WEB_PASSWORD: protocolPassword,
+      CC_WEB_CONFIG_DIR: protocolConfigDir,
+      CC_WEB_SESSIONS_DIR: protocolSessionsDir,
+      CC_WEB_LOGS_DIR: protocolLogsDir,
+      HOME: protocolHomeDir,
+      TZ: 'Asia/Shanghai',
+      LLMPROXY_BASE_URL: `${protocolBaseUrl}/v1`,
+      LLMPROXY_API_KEY: protocolApiKey,
+      CLAUDE_PATH: MOCK_CLAUDE,
+      CODEX_PATH: MOCK_CODEX,
+    }, async () => {
+      const { ws, messages } = await connectWs(protocolPort, protocolPassword);
+      ws.send(JSON.stringify({ type: 'get_llmproxy_usage', force: true }));
+      // 登录广播和刷新可能并发；单飞场景下手工刷新复用在途请求，等待它结束后再次强制刷新。
+      await nextMessage(messages, ws, (item) => item.type === 'llmproxy_usage');
+      ws.send(JSON.stringify({ type: 'get_llmproxy_usage', force: true }));
+      const msg = await nextMessage(messages, ws, (item) => item.type === 'llmproxy_usage'
+        && item.today?.models?.[0]?.model === 'openai/protocol-model');
+      assert(msg.ok === true, `llmproxy protocol payload failed: ${msg.message || 'unknown error'}`);
+      assert(protocolFetchCount >= 1, 'llmproxy protocol case must query the isolated gateway');
+      assert(msg.today?.models?.[0]?.model === 'openai/protocol-model', 'llmproxy protocol payload must include today model breakdown');
+      assert(msg.monthToDate?.models?.[0]?.calls === 1, 'llmproxy protocol payload must include month model breakdown');
+      assert(msg.history?.models?.[0]?.totalTokens === 2000000, 'llmproxy protocol payload must include history model breakdown');
+      assert(!JSON.stringify(msg).includes(protocolApiKey), 'llmproxy protocol payload must not expose the API key');
+      ws.close();
+    });
+  } finally {
+    await new Promise((resolve) => protocolMock.close(resolve));
+    fs.rmSync(protocolRoot, { recursive: true, force: true });
+  }
   console.log('llmproxy usage checks passed.');
 }
 

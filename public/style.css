@@ -1232,6 +1232,12 @@ body.session-loading-active {
 .llmproxy-usage-remaining { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .llmproxy-usage-group { display: grid; gap: 3px; min-width: 0; }
 .llmproxy-usage-group-title { color: var(--text-muted); font-size: 11px; font-weight: 700; }
+.llmproxy-usage-models { display: grid; gap: 3px; max-height: 150px; overflow-y: auto; padding-top: 4px; border-top: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent); }
+.llmproxy-usage-model-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 66px; gap: 8px; align-items: baseline; font-size: 11px; font-variant-numeric: tabular-nums; }
+.llmproxy-usage-model-name { overflow: hidden; color: var(--text-secondary); text-overflow: ellipsis; white-space: nowrap; }
+.llmproxy-usage-model-tokens { color: var(--text-muted); white-space: nowrap; }
+.llmproxy-usage-model-spend { color: var(--text-primary); text-align: right; white-space: nowrap; }
+.llmproxy-usage-model-empty { color: var(--text-muted); font-size: 11px; }
 .llmproxy-usage-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-muted); font-size: 11px; }
 .llmproxy-usage-refresh { appearance: none; border: 1px solid var(--border-color); border-radius: 999px; padding: 2px 9px; background: transparent; color: var(--text-secondary); font: inherit; cursor: pointer; }
 .llmproxy-usage-refresh:hover { color: var(--text-primary); background: var(--bg-tertiary); }
