@@ -131,15 +131,19 @@
             </div>
           </div>
         </section>
-        <button id="chat-agent-btn" class="chat-agent-btn" type="button" aria-haspopup="menu" aria-expanded="false">Claude</button>
-        <button id="chat-gateway" class="chat-gateway" type="button" aria-haspopup="menu" aria-expanded="false" hidden></button>
-        <div id="chat-gateway-menu" class="chat-agent-menu chat-gateway-menu" hidden>
-          <button type="button" class="chat-agent-option" data-gateway="apirouter">公司 apirouter</button>
-          <button type="button" class="chat-agent-option" data-gateway="localproxy">本地代理 (127.0.0.1:8787)</button>
+        <div class="chat-pill-anchor">
+          <button id="chat-agent-btn" class="chat-agent-btn" type="button" aria-haspopup="menu" aria-expanded="false">Claude</button>
+          <div id="chat-agent-menu" class="chat-agent-menu" hidden>
+            <button type="button" class="chat-agent-option active" data-agent="claude">Claude</button>
+            <button type="button" class="chat-agent-option" data-agent="codex">Codex</button>
+          </div>
         </div>
-        <div id="chat-agent-menu" class="chat-agent-menu" hidden>
-          <button type="button" class="chat-agent-option active" data-agent="claude">Claude</button>
-          <button type="button" class="chat-agent-option" data-agent="codex">Codex</button>
+        <div id="chat-gateway-anchor" class="chat-pill-anchor" hidden>
+          <button id="chat-gateway" class="chat-gateway" type="button" aria-haspopup="menu" aria-expanded="false" hidden></button>
+          <div id="chat-gateway-menu" class="chat-agent-menu chat-gateway-menu" hidden>
+            <button type="button" class="chat-agent-option" data-gateway="apirouter">公司 apirouter</button>
+            <button type="button" class="chat-agent-option" data-gateway="localproxy">本地代理 (127.0.0.1:8787)</button>
+          </div>
         </div>
         <span id="chat-runtime-state" class="chat-runtime-state" hidden>运行中</span>
         <span id="chat-cwd" class="chat-cwd" hidden></span>

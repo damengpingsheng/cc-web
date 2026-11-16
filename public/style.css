@@ -1051,6 +1051,10 @@ body.session-loading-active {
   transition: background 0.15s;
 }
 .chat-title:hover { background: var(--bg-tertiary); }
+.chat-pill-anchor {
+  position: relative;
+  flex-shrink: 0;
+}
 .chat-agent-btn {
   appearance: none;
   font-size: 11px;
@@ -1078,8 +1082,9 @@ body.session-loading-active {
 }
 .chat-agent-menu {
   position: absolute;
-  top: calc(100% - 6px);
-  right: 16px;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
   min-width: 148px;
   padding: 8px;
   border: 1px solid var(--border-color);
@@ -2820,8 +2825,8 @@ mark.search-hit.current {
     grid-template-columns: 1fr;
   }
   .chat-agent-menu {
-    right: 10px;
     min-width: 138px;
+    max-width: calc(100vw - 20px);
   }
   .chat-cwd {
     max-width: 120px;

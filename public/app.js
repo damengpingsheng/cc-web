@@ -272,6 +272,7 @@
   const chatRuntimeState = $('#chat-runtime-state');
   const chatCwd = $('#chat-cwd');
   const chatGateway = $('#chat-gateway');
+  const chatGatewayAnchor = $('#chat-gateway-anchor');
   const chatGatewayMenu = $('#chat-gateway-menu');
   const llmproxyUsage = $('#llmproxy-usage');
   const llmproxyUsageMeter = $('.llmproxy-usage-meter');
@@ -2263,6 +2264,7 @@
     // 欢迎页（没有会话）不显示，与 cwd 徽标同一口径
     if (currentAgent !== 'codex' || !currentSessionId) {
       chatGateway.hidden = true;
+      if (chatGatewayAnchor) chatGatewayAnchor.hidden = true;
       chatGateway.textContent = '';
       chatGateway.title = '';
       syncGatewayMenu('');
@@ -2278,6 +2280,7 @@
         + '\ncustom 模式不走公司 apirouter / 本地代理，要切网关先在设置里改回「本地配置」';
       chatGateway.disabled = true;
       chatGateway.hidden = false;
+      if (chatGatewayAnchor) chatGatewayAnchor.hidden = false;
       syncGatewayMenu('');
       return;
     }
@@ -2291,6 +2294,7 @@
       + '\n点击切换（下一轮生效）';
     chatGateway.disabled = false;
     chatGateway.hidden = false;
+    if (chatGatewayAnchor) chatGatewayAnchor.hidden = false;
     syncGatewayMenu(gateway);
   }
 
@@ -2310,6 +2314,19 @@
     if (chatGateway) chatGateway.setAttribute('aria-expanded', 'false');
   }
 
+  function positionChatMenu(trigger, menu) {
+    if (!trigger || !menu || menu.hidden || trigger.hidden) return;
+    menu.style.transform = '';
+    const triggerRect = trigger.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const gutter = 10;
+    const maxLeft = window.innerWidth - gutter - menuRect.width;
+    const centeredLeft = triggerRect.left + triggerRect.width / 2 - menuRect.width / 2;
+    const clampedDelta = Math.max(gutter, Math.min(centeredLeft, maxLeft)) - centeredLeft;
+    menu.style.right = 'auto';
+    menu.style.transform = clampedDelta ? `translateX(calc(-50% + ${clampedDelta}px))` : '';
+  }
+
   function toggleGatewayMenu() {
     if (!chatGatewayMenu || !chatGateway || chatGateway.disabled) return;
     const willOpen = chatGatewayMenu.hidden;
@@ -2317,6 +2334,7 @@
     if (willOpen) closeAgentMenu();
     chatGatewayMenu.hidden = !willOpen;
     chatGateway.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    if (willOpen) positionChatMenu(chatGateway, chatGatewayMenu);
   }
 
   // 输入框左侧的模型徽标。Claude 的思考强度是独立的 currentEffort；
@@ -2398,6 +2416,7 @@
     const willOpen = chatAgentMenu.hidden;
     chatAgentMenu.hidden = !willOpen;
     chatAgentBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    if (willOpen) positionChatMenu(chatAgentBtn, chatAgentMenu);
   }
 
   function resetChatView(agent) {
