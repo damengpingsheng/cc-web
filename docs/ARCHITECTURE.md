@@ -97,7 +97,7 @@ UI 统一支持两个 Agent，底层不对称。所有差异在 `lib/agent-runti
 
 | 维度 | Claude | Codex |
 |---|---|---|
-| resume 句柄 | `claudeSessionId` | `codexThreadId` + `codexHomeDir` + `codexRuntimeKey` |
+| resume 句柄 | `claudeSessionId` | `codexThreadId` + `codexHomeDir` + `codexRuntimeKey` + `codexProvider` |
 | resume 命令 | `claude --resume <id>` | `codex exec resume <runtimeId> -` |
 | runtime id 取法 | 直接 `claudeSessionId` | `getRuntimeSessionId` 取自 profile/线程 |
 
@@ -134,6 +134,10 @@ Claude 直接 `--model <name>`，不拆分。
 ### 自定义 Codex profile
 
 每个 Codex profile 创建隔离的 `CODEX_HOME` 目录，内含独立 `config.toml`（base_url / model / auth_method / API key）。环境变量级隔离，多 profile 不串扰。
+
+### 会话级四路由
+
+`lib/gateway-routing.js` 定义 `proxy-apirouter`、`proxy-llmproxy`、`direct-apirouter`、`direct-llmproxy`。`lib/agent-runtime.js` 把选择映射到 Codex provider 或 Claude `ANTHROPIC_BASE_URL`；`lib/codex-proxy-manager.js` 负责代理健康检查、自动启动、重启和退出清理。代理端口在运行时确定并传给 spawn 构建，不能只按固定 8787 拼接。
 
 ### 修改时的影响域
 

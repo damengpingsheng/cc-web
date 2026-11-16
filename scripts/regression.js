@@ -78,6 +78,14 @@ const {
   parseEnvFile,
   createGatewayEnvResolver,
 } = require(path.join(REPO_DIR, 'lib', 'gateway-env.js'));
+const {
+  normalizeGateway,
+  gatewayParts,
+} = require(path.join(REPO_DIR, 'lib', 'gateway-routing.js'));
+const {
+  createCodexProxyManager,
+  isCompatibleHealth,
+} = require(path.join(REPO_DIR, 'lib', 'codex-proxy-manager.js'));
 
 function mkdirp(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -596,37 +604,362 @@ function testGatewayEnv() {
     envPath: envFile,
   });
   assert(processResolver.resolveGateway('apirouter').apiKey === 'process-api-key', 'process environment must override ~/.agents/codex.env');
+  const claudeEnvFile = path.join(path.dirname(envFile), 'claude.env');
+  fs.writeFileSync(claudeEnvFile, [
+    'APIROUTER_ANTHROPIC_AUTH_TOKEN="apirouter-anthropic-token"',
+    'LLMPROXY_ANTHROPIC_AUTH_TOKEN="llmproxy-anthropic-token"',
+  ].join('\n'));
+  const scopedResolver = createGatewayEnvResolver({ env: {}, envPath: envFile, claudeEnvPath: claudeEnvFile });
+  assert(scopedResolver.resolveAnthropicGateway('apirouter').authToken === 'apirouter-anthropic-token', 'APIRouter Anthropic runtime must combine base URL and token from separate env files');
+  assert(scopedResolver.resolveAnthropicGateway('llmproxy').baseUrl === 'https://llmproxy.example', 'llmproxy must use LLMPROXY_BASE_URL without /v1 for Anthropic');
+  assert(scopedResolver.resolveAnthropicGateway('llmproxy').authToken === 'llmproxy-anthropic-token', 'llmproxy Anthropic runtime must keep its token isolated');
   console.log('Gateway environment checks passed.');
 }
 
-function testCodexLocalProxyHeaders() {
+function testGatewayRouting() {
+  const expected = [
+    ['proxy-apirouter', 'proxy', 'apirouter'],
+    ['proxy-llmproxy', 'proxy', 'llmproxy'],
+    ['direct-apirouter', 'direct', 'apirouter'],
+    ['direct-llmproxy', 'direct', 'llmproxy'],
+  ];
+  for (const [id, transport, upstream] of expected) {
+    assert(JSON.stringify(gatewayParts(id)) === JSON.stringify({ gateway: id, transport, upstream }), `Route ${id} must split correctly`);
+    assert(normalizeGateway(id) === id, `Route ${id} must survive normalization`);
+  }
+  assert(normalizeGateway('apirouter') === 'direct-apirouter', 'Legacy apirouter must map to direct-apirouter');
+  assert(normalizeGateway('localproxy') === 'proxy-apirouter', 'Legacy localproxy must map to proxy-apirouter');
+  console.log('Gateway routing checks passed.');
+}
+
+function testCodexGatewayHeaderCases() {
+  let runtimeThreadId = null;
   const runtime = createAgentRuntime({
     processEnv: {
       HOME: '/tmp',
       CODEX_LITELLM_END_USER_ID: 'huxiaojie',
       CODEX_CLIENT_HOSTNAME: 'test-host',
     },
-    resolveCodexGatewayEnv: () => ({}),
+    resolveCodexGatewayEnv: (upstream) => upstream === 'llmproxy'
+      ? { baseUrl: 'https://llmproxy.example/v1', apiKey: 'llmproxy-key' }
+      : { baseUrl: 'https://apirouter.example/v1', apiKey: 'apirouter-key' },
+    resolveAnthropicGateway: (upstream) => upstream === 'llmproxy'
+      ? { baseUrl: 'https://llmproxy.example', authToken: 'llmproxy-token' }
+      : { baseUrl: 'https://apirouter.example', authToken: 'apirouter-token' },
+    codexProxyBaseUrl: () => 'http://127.0.0.1:8799',
+    gatewayParts,
     CLAUDE_PATH: '', CODEX_PATH: '', MODEL_MAP: {},
     loadModelConfig: () => ({}), applyCustomTemplateToSettings: () => {},
-    loadCodexConfig: () => ({ gateway: 'localproxy' }),
+    loadCodexConfig: () => ({ gateway: 'proxy-apirouter' }),
     prepareCodexCustomRuntime: () => ({ mode: 'local' }),
     wsSend: () => {}, truncateObj: (x) => x, sanitizeToolInput: (_, x) => x,
     isInjectedClaudeUserEntry: () => false, loadSession: () => null, saveSession: () => {},
-    setRuntimeSessionId: () => {}, clearRuntimeSessionId: () => {}, getRuntimeSessionId: () => null,
+    setRuntimeSessionId: () => {}, clearRuntimeSessionId: () => {}, getRuntimeSessionId: () => runtimeThreadId,
   });
   const spec = runtime.buildCodexSpawnSpec({
-    model: 'gpt-6-astra', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'localproxy',
+    model: 'gpt-6-astra', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'proxy-llmproxy',
   });
-  const providerOverride = spec.args.find((arg) => arg.startsWith('model_providers.localproxy={'));
-  assert(providerOverride, 'Codex localproxy provider must be passed as one TOML table');
+  const providerOverride = spec.args.find((arg) => arg.startsWith('model_providers.ccweb_gateway={'));
+  assert(providerOverride, 'Codex gateway provider must be passed as one TOML table');
+  assert(providerOverride.includes('base_url="http://127.0.0.1:8799/llmproxy/v1"'), 'Codex proxy llmproxy route must use the managed proxy base URL');
   assert(providerOverride.includes('env_http_headers={"X-LiteLLM-End-User-Id"="CODEX_LITELLM_END_USER_ID",'),
     'Codex localproxy provider must send the LiteLLM end-user header from the injected environment');
   assert(providerOverride.includes('"X-Client-Hostname"="CODEX_CLIENT_HOSTNAME"}'),
     'Codex localproxy provider must send the client hostname from the injected environment');
+  assert(providerOverride.includes('capabilities={remote_compaction="unsupported"}'),
+    'Codex gateway provider must disable remote compaction: name="OpenAI" would otherwise trip the proxy on compaction_trigger');
   assert(spec.env.CODEX_LITELLM_END_USER_ID === 'huxiaojie', 'Codex child process must receive the end-user environment');
   assert(spec.env.CODEX_CLIENT_HOSTNAME === 'test-host', 'Codex child process must receive the client-hostname environment');
-  console.log('Codex localproxy header checks passed.');
+  assert(spec.env.OPENAI_API_KEY === 'llmproxy-key', 'Codex proxy route must still inject the selected upstream key');
+  assert(spec.codexProvider === 'ccweb_gateway', 'A new Codex thread must use the ccweb_gateway provider identity');
+
+  const direct = runtime.buildCodexSpawnSpec({
+    model: 'gpt-6-astra', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'direct-apirouter',
+  });
+  const directProvider = direct.args.find((arg) => arg.startsWith('model_providers.ccweb_gateway={'));
+  assert(directProvider.includes('base_url="https://apirouter.example/v1"'), 'Codex direct route must bypass the proxy');
+  assert(direct.env.OPENAI_API_KEY === 'apirouter-key', 'Codex direct route must use the apirouter key');
+  assert(!direct.args.join(' ').includes('127.0.0.1:8799'), 'Codex direct route must not reference the proxy');
+
+  runtimeThreadId = 'legacy-localproxy-thread';
+  const resumedProxy = runtime.buildCodexSpawnSpec({
+    model: 'gpt-6-astra', permissionMode: 'yolo', cwd: '/tmp',
+    codexThreadId: runtimeThreadId, codexProvider: 'localproxy', codexGateway: 'proxy-llmproxy',
+  });
+  assert(resumedProxy.args.includes('model_provider="localproxy"'),
+    'Resuming a historical Codex thread must preserve its provider identity');
+  const resumedProxyOverride = resumedProxy.args.find((arg) => arg.startsWith('model_providers.localproxy={'));
+  assert(resumedProxyOverride?.includes('base_url="http://127.0.0.1:8799/llmproxy/v1"'),
+    'A resumed thread must use the current route base URL under its historical provider');
+  assert(!resumedProxy.args.join(' ').includes('model_provider="ccweb_gateway"'),
+    'A resumed historical thread must not be switched to ccweb_gateway');
+
+  const resumedDirect = runtime.buildCodexSpawnSpec({
+    model: 'gpt-6-astra', permissionMode: 'yolo', cwd: '/tmp',
+    codexThreadId: runtimeThreadId, codexProvider: 'localproxy', codexGateway: 'direct-apirouter',
+  });
+  assert(resumedDirect.args.includes('model_provider="localproxy"'),
+    'Switching gateway options must not change a resumed thread provider identity');
+  const resumedDirectOverride = resumedDirect.args.find((arg) => arg.startsWith('model_providers.localproxy={'));
+  assert(resumedDirectOverride?.includes('base_url="https://apirouter.example/v1"'),
+    'A resumed thread direct route must update base_url without renaming the provider');
+
+  const claudeProxy = runtime.buildClaudeSpawnSpec({ model: 'claude-opus', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'proxy-apirouter' });
+  assert(claudeProxy.env.ANTHROPIC_BASE_URL === 'http://127.0.0.1:8799/apirouter', 'Claude proxy route must use the selected proxy path');
+  assert(claudeProxy.env.ANTHROPIC_AUTH_TOKEN === 'apirouter-token', 'Claude proxy route must use the selected upstream token');
+  const claudeDirect = runtime.buildClaudeSpawnSpec({ model: 'claude-opus', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'direct-llmproxy' });
+  assert(claudeDirect.env.ANTHROPIC_BASE_URL === 'https://llmproxy.example', 'Claude direct route must bypass the proxy');
+  assert(claudeDirect.env.ANTHROPIC_AUTH_TOKEN === 'llmproxy-token', 'Claude direct route must use the llmproxy token');
+  console.log('Gateway runtime checks passed.');
+}
+
+async function testCodexProxyManager() {
+  const compatibleHealth = {
+    status: 200,
+    body: {
+      ok: true,
+      version: 2,
+      routes: ['/apirouter/v1/responses', '/llmproxy/v1/responses', '/apirouter/v1/messages', '/llmproxy/v1/messages'],
+      upstreams: { apirouter: true, llmproxy: true },
+    },
+  };
+  assert(isCompatibleHealth(compatibleHealth), 'Version 2 dual-route health response must be compatible');
+  assert(!isCompatibleHealth({ status: 200, body: { ok: true, upstream: 'legacy' } }), 'Legacy proxy health must not be reused');
+
+  const external = createCodexProxyManager({
+    port: 8787,
+    proxyPath: __filename,
+    logsDir: os.tmpdir(),
+    healthImpl: async () => compatibleHealth,
+  });
+  assert(await external.ensureReady() === 'http://127.0.0.1:8787', 'Compatible external proxy must be reused');
+  assert(external.status().managed === false, 'Reused external proxy must not be marked as owned');
+
+  const fakeChild = new (require('events').EventEmitter)();
+  fakeChild.pid = 4242;
+  fakeChild.exitCode = null;
+  let spawnedArgs = null;
+  let healthChecks = 0;
+  const owned = createCodexProxyManager({
+    port: 8787,
+    proxyPath: path.join(REPO_DIR, 'lib', 'gateway-routing.js'),
+    logsDir: os.tmpdir(),
+    spawnImpl: (command, args) => { spawnedArgs = { command, args }; return fakeChild; },
+    portAvailableImpl: async (port) => port === 8788,
+    healthImpl: async (port) => (port < 8788 ? { status: 0 } : compatibleHealth),
+    resolveUpstreams: () => ({ apirouter: 'https://api.example/v1', llmproxy: 'https://llm.example/v1' }),
+    startupTimeoutMs: 500,
+  });
+  assert(await owned.ensureReady() === 'http://127.0.0.1:8788', 'Occupied incompatible port must select a nearby free port');
+  assert(spawnedArgs.args.includes('--apirouter-upstream') && spawnedArgs.args.includes('--llmproxy-upstream'), 'Managed proxy must receive both upstream arguments');
+  assert(owned.status().managed === true, 'Self-started proxy must be marked as owned');
+  owned.stop();
+  assert(owned.status().managed === true, 'Stopping must not start another proxy');
+
+  let attempts = 0;
+  const retryPort = await getFreePort();
+  const retryable = createCodexProxyManager({
+    port: retryPort,
+    proxyPath: path.join(REPO_DIR, 'lib', 'gateway-routing.js'),
+    logsDir: os.tmpdir(),
+    spawnImpl: () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('transient spawn failure');
+      const retryChild = new (require('events').EventEmitter)();
+      retryChild.pid = 4243;
+      retryChild.exitCode = null;
+      return retryChild;
+    },
+    portAvailableImpl: async () => true,
+    healthImpl: async (port) => ((port === retryPort && attempts < 2) ? { status: 0 } : compatibleHealth),
+    resolveUpstreams: () => ({ apirouter: 'https://api.example/v1', llmproxy: 'https://llm.example/v1' }),
+    startupTimeoutMs: 500,
+  });
+  let firstStartError = null;
+  try { await retryable.ensureReady(); } catch (error) { firstStartError = error; }
+  assert(firstStartError && /transient spawn failure/.test(firstStartError.message),
+    'The first managed proxy startup failure must be reported to its caller');
+  assert(await retryable.ensureReady() === `http://127.0.0.1:${retryPort}`,
+    'A failed initial proxy startup must be retryable without restarting CC-Web');
+  assert(attempts === 2, 'Retry must invoke the proxy spawn path again');
+  retryable.stop();
+  console.log('Codex proxy manager checks passed.');
+}
+
+async function testPerSessionGatewayRoutes() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-gateway-routes-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  mkdirp(path.join(homeDir, '.agents'));
+  fs.writeFileSync(path.join(homeDir, '.agents', 'codex.env'), [
+    'APIROUTER_BASE_URL="https://apirouter.example/v1"',
+    'APIROUTER_API_KEY="apirouter-key"',
+    'LLMPROXY_BASE_URL="https://llmproxy.example/v1"',
+    'LLMPROXY_API_KEY="llmproxy-key"',
+  ].join('\n'));
+
+  const proxyServer = http.createServer((req, res) => {
+    if (req.url !== '/health') {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      version: 2,
+      routes: ['/apirouter/v1/responses', '/llmproxy/v1/responses', '/apirouter/v1/messages', '/llmproxy/v1/messages'],
+      upstreams: { apirouter: true, llmproxy: true },
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    proxyServer.once('error', reject);
+    proxyServer.listen(0, '127.0.0.1', resolve);
+  });
+  const proxyPort = proxyServer.address().port;
+  const port = await getFreePort();
+  const password = 'GatewayRoutes!234';
+  const gateways = ['proxy-apirouter', 'proxy-llmproxy', 'direct-apirouter', 'direct-llmproxy'];
+
+  try {
+    await withServer({
+      PORT: String(port),
+      CC_WEB_PASSWORD: password,
+      CC_WEB_CONFIG_DIR: configDir,
+      CC_WEB_SESSIONS_DIR: sessionsDir,
+      CC_WEB_LOGS_DIR: logsDir,
+      HOME: homeDir,
+      CLAUDE_PATH: MOCK_CLAUDE,
+      CODEX_PATH: MOCK_CODEX,
+      CODEX_PROXY_PORT: String(proxyPort),
+      CC_WEB_CODEX_PROXY_DISABLED: '0',
+      APIROUTER_BASE_URL: 'https://apirouter.example/v1',
+      APIROUTER_API_KEY: 'apirouter-key',
+      LLMPROXY_BASE_URL: 'https://llmproxy.example/v1',
+      LLMPROXY_API_KEY: 'llmproxy-key',
+    }, async () => {
+      const pages = [];
+      for (const gateway of gateways) {
+        const page = await connectWs(port, password);
+        await nextMessage(page.messages, page.ws, (msg) => msg.type === 'session_list');
+        page.ws.send(JSON.stringify({
+          type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: gateway,
+        }));
+        const info = await nextMessage(page.messages, page.ws,
+          (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.codexGateway === gateway);
+        pages.push({ ...page, gateway, sessionId: info.sessionId });
+      }
+
+      for (const page of pages) {
+        page.ws.send(JSON.stringify({
+          type: 'message', text: `route ${page.gateway}`, sessionId: page.sessionId, mode: 'yolo', agent: 'codex',
+        }));
+      }
+      await Promise.all(pages.map((page) => nextMessage(
+        page.messages,
+        page.ws,
+        (msg) => msg.type === 'done' && msg.sessionId === page.sessionId,
+      )));
+
+      const spawnEvents = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+        .filter((item) => item?.event === 'process_spawn' && item.agent === 'codex');
+      const expectedUrls = {
+        'proxy-apirouter': `http://127.0.0.1:${proxyPort}/apirouter/v1`,
+        'proxy-llmproxy': `http://127.0.0.1:${proxyPort}/llmproxy/v1`,
+        'direct-apirouter': 'https://apirouter.example/v1',
+        'direct-llmproxy': 'https://llmproxy.example/v1',
+      };
+      for (const page of pages) {
+        const spawn = spawnEvents.find((item) => item.sessionId === page.sessionId.slice(0, 8));
+        assert(spawn, `Missing Codex spawn for ${page.gateway}`);
+        assert(spawn.args.includes('model_provider="ccweb_gateway"'),
+          `${page.gateway} new thread must use the ccweb_gateway provider identity`);
+        assert(spawn.args.includes(`base_url="${expectedUrls[page.gateway]}"`),
+          `${page.gateway} must spawn with its own provider URL (got ${spawn.args})`);
+      }
+
+      const legacyThreadId = 'legacy-localproxy-resume-thread';
+      const legacySessionId = 'legacy-localproxy-session';
+      const legacyRolloutDir = path.join(homeDir, '.codex', 'sessions', '2026', '03', '12');
+      mkdirp(legacyRolloutDir);
+      fs.writeFileSync(path.join(legacyRolloutDir, `rollout-2026-03-12T00-00-00-${legacyThreadId}.jsonl`), `${JSON.stringify({
+        timestamp: '2026-03-12T00:00:00.000Z',
+        type: 'session_meta',
+        payload: {
+          id: legacyThreadId, cwd: workDir, cli_version: '0.160.1', source: 'exec', model_provider: 'localproxy',
+        },
+      })}\n`);
+      fs.writeFileSync(path.join(sessionsDir, `${legacySessionId}.json`), JSON.stringify({
+        id: legacySessionId,
+        title: 'legacy localproxy session',
+        created: '2026-03-12T00:00:00.000Z',
+        updated: '2026-03-12T00:00:00.000Z',
+        agent: 'codex',
+        claudeSessionId: null,
+        codexThreadId: legacyThreadId,
+        codexGateway: 'proxy-llmproxy',
+        model: 'gpt-6-astra',
+        permissionMode: 'yolo',
+        messages: [],
+        cwd: workDir,
+      }, null, 2));
+      pages[0].ws.send(JSON.stringify({
+        type: 'message', text: 'legacy localproxy resume', sessionId: legacySessionId, mode: 'yolo', agent: 'codex',
+      }));
+      await nextMessage(pages[0].messages, pages[0].ws,
+        (msg) => msg.type === 'done' && msg.sessionId === legacySessionId);
+      const legacySession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${legacySessionId}.json`), 'utf8'));
+      assert(legacySession.codexProvider === 'localproxy',
+        'Resuming an old session must persist the provider recovered from its rollout');
+      const allSpawnEvents = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+        .filter((item) => item?.event === 'process_spawn' && item.agent === 'codex');
+      const legacySpawn = allSpawnEvents.find((item) => item.sessionId === legacySessionId.slice(0, 8));
+      assert(legacySpawn, 'Missing legacy Codex resume spawn');
+      assert(legacySpawn.args.includes('model_provider="localproxy"'),
+        'Legacy resume must retain the thread provider instead of using ccweb_gateway');
+      assert(legacySpawn.args.includes('model_providers.localproxy={'),
+        'Legacy resume must define the provider table under the historical name');
+      assert(legacySpawn.args.includes(`base_url="http://127.0.0.1:${proxyPort}/llmproxy/v1"`),
+        'Legacy resume must still honor the currently selected gateway route');
+
+      pages[0].ws.send(JSON.stringify({
+        type: 'set_session_gateway', sessionId: legacySessionId, gateway: 'proxy-apirouter',
+      }));
+      await nextMessage(pages[0].messages, pages[0].ws,
+        (msg) => msg.type === 'session_gateway' && msg.sessionId === legacySessionId);
+      pages[0].ws.send(JSON.stringify({
+        type: 'message', text: 'legacy route switch', sessionId: legacySessionId, mode: 'yolo', agent: 'codex',
+      }));
+      await nextMessage(pages[0].messages, pages[0].ws,
+        (msg) => msg.type === 'done' && msg.sessionId === legacySessionId);
+      const switchedSpawn = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+        .filter((item) => item?.event === 'process_spawn' && item.agent === 'codex')
+        .filter((item) => item.sessionId === legacySessionId.slice(0, 8))
+        .pop();
+      assert(switchedSpawn?.args.includes('model_provider="localproxy"'),
+        'Switching the route must not change the legacy thread provider identity');
+      assert(switchedSpawn?.args.includes(`base_url="http://127.0.0.1:${proxyPort}/apirouter/v1"`),
+        'Switching the route must update the legacy provider base_url');
+      for (const page of pages) page.ws.close();
+    });
+  } finally {
+    await new Promise((resolve) => proxyServer.close(resolve));
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+  console.log('Per-session gateway route checks passed.');
 }
 
 function testApirouterUsageFormatting() {
@@ -697,6 +1030,9 @@ async function waitForFile(filePath, timeoutMs = 10000) {
 }
 
 async function withServer(env, fn) {
+  if (!Object.prototype.hasOwnProperty.call(env, 'CC_WEB_CODEX_PROXY_DISABLED')) {
+    env = { ...env, CC_WEB_CODEX_PROXY_DISABLED: '1' };
+  }
   const child = spawn('/usr/bin/node', [SERVER_PATH], {
     cwd: REPO_DIR,
     // 与跑测者的 shell 环境解耦，都放在 ...env 之前，单个用例仍可覆盖：
@@ -818,7 +1154,9 @@ function createFakeCodexHistory(homeDir) {
     JSON.stringify({
       timestamp: '2026-03-12T00:00:00.000Z',
       type: 'session_meta',
-      payload: { id: threadId, cwd: '/tmp/project-b', cli_version: '0.114.0', source: 'exec' },
+      payload: {
+        id: threadId, cwd: '/tmp/project-b', cli_version: '0.114.0', source: 'exec', model_provider: 'localproxy',
+      },
     }),
     JSON.stringify({
       timestamp: '2026-03-12T00:00:00.100Z',
@@ -912,7 +1250,7 @@ function createFakeCodexHistory(homeDir) {
       estimated_bytes INTEGER NOT NULL DEFAULT 0
     );
     INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, cli_version)
-    VALUES ('${threadId}', '${rolloutPath.replace(/'/g, "''")}', 1, 2, 'exec', 'OpenAI', '/tmp/project-b', 'Codex import prompt', '{}', 'never', '0.114.0');
+    VALUES ('${threadId}', '${rolloutPath.replace(/'/g, "''")}', 1, 2, 'exec', 'localproxy', '/tmp/project-b', 'Codex import prompt', '{}', 'never', '0.114.0');
     INSERT INTO logs (ts, ts_nanos, level, target, thread_id) VALUES (1, 0, 'INFO', 'test', '${threadId}');
   `);
 
@@ -1109,7 +1447,10 @@ async function main() {
   await testLlmproxyUsage();
   await testApirouterUsage();
   testGatewayEnv();
-  testCodexLocalProxyHeaders();
+  testGatewayRouting();
+  testCodexGatewayHeaderCases();
+  await testCodexProxyManager();
+  await testPerSessionGatewayRoutes();
   testApirouterUsageFormatting();
   testSessionHistorySync();
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-regression-'));
@@ -1167,6 +1508,7 @@ async function main() {
     HOME: homeDir,
     CLAUDE_PATH: MOCK_CLAUDE,
     CODEX_PATH: MOCK_CODEX,
+    CC_WEB_CODEX_PROXY_DISABLED: '1',
     // 心跳间隔压到 400ms：主链路全程覆盖多轮 ping/pong，验证心跳不干扰正常消息流
     CC_WEB_WS_PING_INTERVAL_MS: '400',
   }, async () => {
@@ -1242,6 +1584,9 @@ async function main() {
 
     ws.send(JSON.stringify({ type: 'message', text: 'second codex prompt', sessionId: firstMessageSession.sessionId, mode: 'plan', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+    const storedAfterFirstResume = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
+    assert(storedAfterFirstResume.codexProvider === 'openai_compat',
+      'A custom-profile Codex thread must cache the provider identity used by thread.started');
 
     const processLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
     const spawnLine = processLog

@@ -21,6 +21,7 @@
 | `audit_session_titles` | 扫描由首条用户消息派生的会话标题，并按可用模型配置生成内容型标题建议 |
 | `apply_session_titles { changes }` | 备份后批量更新标题。每项含 `id` / `oldTitle` / `newTitle`；任一会话正在运行或标题已变化时整批拒绝 |
 | `set_mode` | 切换 permissionMode |
+| `set_session_gateway { sessionId, gateway }` | 切换会话级四路由；`gateway` 为 `proxy-apirouter` / `proxy-llmproxy` / `direct-apirouter` / `direct-llmproxy`，下一轮生效 |
 | `list_sessions` | 拉取会话列表 |
 | `search_session_bodies { requestId, query, regex }` | 按需扫描会话 JSON 中 user / assistant 的正文。`regex=false` 为 Unicode 不区分大小写子串，`regex=true` 为 Unicode 不区分大小写正则；返回会话 id、命中数和首个命中片段。工具调用、工具输出、system、压缩摘要和本地命令不参与匹配 |
 | `detach_view` | 关闭查看模式 |
@@ -64,6 +65,7 @@
 | `session_titles_applied` | 标题批量更新回执。成功时含 `count` 与备份目录 `backupDir`；失败时不写入 |
 | `session_body_search_result` | 正文搜索结果。原样返回 `requestId`、`query`、`regex`，并含 `ok`、`error` 与 `results`；每项结果含 `sessionId`、`matchCount`、`matchCountCapped`、`snippet`、`snippetStart`、`snippetEnd` |
 | `mode_changed` / `model_changed` | 模式/模型切换通知 |
+| `session_gateway` | 会话级网关回执 `{ sessionId, codexGateway }`，前端同步徽标和本地快照 |
 | `text_delta` | 文本流增量（**经 DOMPurify sanitize 后注入 DOM**，详见 [ARCHITECTURE.md](./ARCHITECTURE.md)） |
 | `tool_start` / `tool_end` | 工具调用起止 |
 | `cost` / `usage` | 成本/用量更新 |

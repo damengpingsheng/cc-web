@@ -40,17 +40,29 @@
 | `CC_WEB_SESSIONS_DIR` | `./sessions` | 会话目录覆盖 |
 | `CC_WEB_PUBLIC_DIR` | `./public` | 静态目录覆盖 |
 | `CC_WEB_LOGS_DIR` | `./logs` | 日志目录覆盖 |
+| `CODEX_PROXY_PORT` | `8787` | CC-Web 代理的首选端口；端口被旧版代理占用时，自托管实例自动使用附近空闲端口 |
+| `CC_WEB_CODEX_PROXY_PATH` | `~/Tools/codex-api-proxy/codex_api_proxy.py` | 自托管代理脚本路径 |
+| `CC_WEB_PYTHON_PATH` | `python3` | 启动代理使用的 Python 解释器 |
+| `CC_WEB_CODEX_PROXY_DISABLED` | — | 设为 `1` 时禁用自动代理托管（隔离测试或改用外部兼容实例） |
 | `CC_WEB_WS_PING_INTERVAL_MS` | `25000` | WebSocket 心跳间隔（毫秒）。每轮 ping 全部客户端，连续两轮无 pong terminate 死连接 |
 | `CC_WEB_AUTOCOMPACT_PCT` | `80` | Claude 预防性水位压缩阈值（%，收敛到 10-99）。resume 前读 transcript jsonl 水位，达到 窗口（`[1m]` 模型 1M / 其他 200K）× 该比例 时先自动 `/compact` 再重放原消息。详见 [RUNTIME.md "自动 compact 重试"](./RUNTIME.md#自动-compact-重试) |
 | `AI_SESSION_TRACE_ROOT` | `~/.ai-session-trace` | Claude transcript 过期后，用于查找 hook 保存的 `transcript.jsonl` / `transcript.sha256` 快照；只有摘要与 session ID 均校验通过才允许恢复 |
 | `CC_WEB_IP_WHITELIST` | — | 暴力破解豁免 IP 列表 |
 | `CC_WEB_TRUSTED_PROXIES` | — | 可信反向代理 CIDR/IP 列表（仅这些来源的 X-Forwarded-For 才被信任），默认空 = 最严格 |
 | `APIROUTER_BASE_URL` | — | APIRouter 网关地址；Codex 请求保留 `/v1`，用量接口自动剥掉。优先于 `apirouter-usage.json` 的 `baseUrl` |
-| `APIROUTER_API_KEY` | — | APIRouter 模型 key，仅用于 APIRouter 用量查询；不会回退到 `OPENAI_API_KEY` 或 llmproxy key |
+| `APIROUTER_API_KEY` | — | APIRouter 模型 key，用于 APIRouter 请求与用量查询；不会回退到 `OPENAI_API_KEY` 或 llmproxy key |
 | `LLMPROXY_BASE_URL` | — | llmproxy 网关地址；Codex 请求保留 `/v1`，用量接口自动剥掉。优先于 `llmproxy-usage.json` 的 `baseUrl` |
-| `LLMPROXY_API_KEY` | — | llmproxy key，仅用于 llmproxy 用量查询；不会回退到 `OPENAI_API_KEY` 或 APIRouter key |
+| `LLMPROXY_API_KEY` | — | llmproxy key，用于 llmproxy 请求与用量查询；不会回退到 `OPENAI_API_KEY` 或 APIRouter key |
 | `PUSHPLUS_TOKEN` | — | 遗留：首次运行迁移到 `config/notify.json` |
 | `CC_WEB_PASSWORD` | — | 遗留：首次运行迁移到 `config/auth.json` |
+
+上述变量既可在进程环境设置，也可写入 `~/.agents/codex.env` 或 `~/.agents/claude.env`。Claude 的 APIRouter 凭据不会借用通用 `ANTHROPIC_*`；llmproxy 才允许用通用 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 作为兼容回退。
+
+## CC-Web 代理托管
+
+网关选项有四个：`proxy-apirouter`、`proxy-llmproxy`、`direct-apirouter`、`direct-llmproxy`。代理选项首次使用时由 CC-Web 启动 `codex_api_proxy.py`，日志写 `logs/codex-api-proxy.log`。代理退出后按 1/2/5/10/30 秒退避重启；CC-Web 退出时只停止自己启动的进程。
+
+启动时先检查 `127.0.0.1:<CODEX_PROXY_PORT>/health`。只有 `version >= 2` 且具备两条 Responses/Messages 路由的实例会复用；旧实例不兼容时，CC-Web 自己在后续空闲端口启动新实例，不修改外部进程。直连选项不以代理健康状态作为前置条件。
 
 ## 环境假设
 

@@ -39,6 +39,11 @@ const { createSessionBodySearch } = require('./lib/session-body-search');
 const { createUsageCollector } = require('./lib/llmproxy-usage');
 const { createApirouterUsageCollector } = require('./lib/apirouter-usage');
 const { createGatewayEnvResolver } = require('./lib/gateway-env');
+const { createCodexProxyManager } = require('./lib/codex-proxy-manager');
+const {
+  normalizeGateway,
+  gatewayParts,
+} = require('./lib/gateway-routing');
 const {
   mergeCodexHistoryByUserTurn,
   needsCodexToolLayoutMigration,
@@ -57,6 +62,9 @@ const PORT = parseInt(process.env.PORT) || 8002;
 const HOST = process.env.HOST || '127.0.0.1';
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
 const CODEX_PATH = process.env.CODEX_PATH || 'codex';
+const CODEX_PROXY_PORT = Number.parseInt(process.env.CODEX_PROXY_PORT || process.env.CC_WEB_CODEX_PROXY_PORT || '8787', 10);
+const CODEX_PROXY_PATH = process.env.CC_WEB_CODEX_PROXY_PATH
+  || path.join(process.env.HOME || process.env.USERPROFILE || '', 'Tools', 'codex-api-proxy', 'codex_api_proxy.py');
 const CONFIG_DIR = process.env.CC_WEB_CONFIG_DIR || path.join(__dirname, 'config');
 const SESSIONS_DIR = process.env.CC_WEB_SESSIONS_DIR || path.join(__dirname, 'sessions');
 const PUBLIC_DIR = process.env.CC_WEB_PUBLIC_DIR || path.join(__dirname, 'public');
@@ -806,7 +814,7 @@ const DEFAULT_CODEX_CONFIG = {
   mode: 'local',
   activeProfile: '',
   profiles: [],
-  gateway: 'apirouter',  // local 模式下 codex 请求走向：apirouter（公司默认）| localproxy（本机 Responses→Chat 适配代理）
+  gateway: 'direct-apirouter',
   enableSearch: false,
   supportsSearch: false,
   localSnapshot: {},  // saved snapshot of local ~/.codex config (archive-only, no restore)
@@ -953,7 +961,7 @@ function loadCodexConfig() {
       return {
         mode: raw.mode === 'custom' ? 'custom' : 'local',
         activeProfile: raw.activeProfile || '',
-        gateway: raw.gateway === 'localproxy' ? 'localproxy' : 'apirouter',
+        gateway: normalizeGateway(raw.gateway),
         profiles: Array.isArray(raw.profiles) ? raw.profiles.map((profile) => ({
           name: String(profile?.name || '').trim(),
           apiKey: String(profile?.apiKey || ''),
@@ -975,7 +983,7 @@ function saveCodexConfig(config) {
   atomicWriteJson(CODEX_CONFIG_PATH, JSON.stringify({
     mode: config.mode === 'custom' ? 'custom' : 'local',
     activeProfile: config.activeProfile || '',
-    gateway: config.gateway === 'localproxy' ? 'localproxy' : 'apirouter',
+    gateway: normalizeGateway(config.gateway),
     profiles: Array.isArray(config.profiles) ? config.profiles.map((profile) => ({
       name: String(profile?.name || '').trim(),
       apiKey: String(profile?.apiKey || ''),
@@ -992,7 +1000,7 @@ function getCodexConfigMasked() {
   return {
     mode: config.mode === 'custom' ? 'custom' : 'local',
     activeProfile: config.activeProfile || '',
-    gateway: config.gateway === 'localproxy' ? 'localproxy' : 'apirouter',
+    gateway: normalizeGateway(config.gateway),
     profiles: (config.profiles || []).map((profile) => ({
       name: profile.name,
       apiKey: maskSecret(profile.apiKey),
@@ -1199,6 +1207,31 @@ function copyCodexThreadRollouts(threadId, targetHomeDir) {
   }
 }
 
+function resolveCodexThreadProvider(threadId, extraSessionsDirs = []) {
+  if (!threadId) return '';
+  const sourceDirs = [CODEX_SESSIONS_DIR, path.join(CODEX_RUNTIME_HOME, 'sessions'), ...extraSessionsDirs];
+  for (const sourceDir of sourceDirs) {
+    for (const filePath of walkJsonlFiles(sourceDir)) {
+      const fileName = path.basename(filePath);
+      if (!fileName.includes(threadId) && !filePath.includes(threadId)) continue;
+      const owner = readCodexRolloutOwner(filePath);
+      if (owner?.threadId === threadId && owner.modelProvider) return owner.modelProvider;
+    }
+  }
+  return '';
+}
+
+function prepareCodexThreadProvider(session, extraSessionsDirs = []) {
+  if (!session) return '';
+  if (session.codexProvider) return session.codexProvider;
+  const provider = resolveCodexThreadProvider(session.codexThreadId, [
+    session.codexHomeDir ? path.join(session.codexHomeDir, 'sessions') : '',
+    ...extraSessionsDirs,
+  ]);
+  if (provider) session.codexProvider = provider;
+  return provider;
+}
+
 function ensureCodexSessionHome(session) {
   if (!session?.id) return CODEX_RUNTIME_HOME;
   if (!session.codexHomeDir) session.codexHomeDir = codexSessionHomeDir(session.id);
@@ -1339,6 +1372,18 @@ function resolveGatewayCreds() {
 }
 
 const gatewayEnv = createGatewayEnvResolver({ env: process.env });
+const codexProxyManager = createCodexProxyManager({
+  port: CODEX_PROXY_PORT,
+  proxyPath: CODEX_PROXY_PATH,
+  logsDir: LOGS_DIR,
+  disabled: process.env.CC_WEB_CODEX_PROXY_DISABLED === '1',
+  resolveUpstreams: () => ({
+    apirouter: gatewayEnv.resolveGateway('apirouter').baseUrl,
+    llmproxy: gatewayEnv.resolveGateway('llmproxy').baseUrl,
+  }),
+  log: (level, event, data) => plog(level, event, data),
+});
+let activeCodexProxyBaseUrl = '';
 
 function loadLlmproxyUsageConfig() {
   try {
@@ -1368,6 +1413,14 @@ const apirouterUsageCollector = createApirouterUsageCollector({
 
 function resolveCodexGatewayEnv(gateway) {
   return gatewayEnv.resolveGateway(gateway);
+}
+
+function resolveAnthropicGateway(gateway) {
+  return gatewayEnv.resolveAnthropicGateway(gateway);
+}
+
+function codexProxyBaseUrl() {
+  return activeCodexProxyBaseUrl || `http://127.0.0.1:${CODEX_PROXY_PORT}`;
 }
 
 async function refreshLlmproxyUsage(force = false) {
@@ -1683,7 +1736,7 @@ function normalizeAgent(agent) {
  * **新增字段必须在此设默认值**，否则旧 session 加载时会是 undefined。
  *
  * 当前在此设默认值的字段：agent / claudeSessionId / codexThreadId /
- * codexHomeDir / codexRuntimeKey / totalCost / totalUsage / taskMode /
+ * codexHomeDir / codexRuntimeKey / codexProvider / totalCost / totalUsage / taskMode /
  * sshHostId / remoteCwd / messages。
  *
  * 注意：permissionMode / hasUnread / updated **不**在此设默认值：
@@ -1699,10 +1752,13 @@ function normalizeAgent(agent) {
 function normalizeSession(session) {
   if (!session || typeof session !== 'object') return session;
   session.agent = normalizeAgent(session.agent);
+  // 空值表示旧会话没有会话级选择，运行时继续跟随全局 gateway。
+  session.codexGateway = session.codexGateway ? normalizeGateway(session.codexGateway) : '';
   if (!Object.prototype.hasOwnProperty.call(session, 'claudeSessionId')) session.claudeSessionId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexThreadId')) session.codexThreadId = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'codexHomeDir')) session.codexHomeDir = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'codexRuntimeKey')) session.codexRuntimeKey = '';
+  if (!Object.prototype.hasOwnProperty.call(session, 'codexProvider')) session.codexProvider = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'totalCost')) session.totalCost = 0;
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
     session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
@@ -4371,7 +4427,7 @@ function handleSaveCodexConfig(ws, newConfig) {
   const merged = {
     mode: newConfig.mode === 'custom' ? 'custom' : 'local',
     activeProfile: String(newConfig.activeProfile || '').trim(),
-    gateway: newConfig.gateway === 'localproxy' ? 'localproxy' : 'apirouter',
+    gateway: normalizeGateway(newConfig.gateway),
     profiles: mergedProfiles,
     enableSearch: false,
     supportsSearch: false,
@@ -5003,7 +5059,7 @@ function handleNewSession(ws, msg) {
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
   // 会话级 Codex 网关（新建会话弹窗选择）；空值/旧会话回落到全局配置的 gateway
-  const codexGateway = msg?.codexGateway === 'localproxy' ? 'localproxy' : 'apirouter';
+  const codexGateway = normalizeGateway(msg?.codexGateway || loadCodexConfig().gateway);
   const taskMode = msg?.taskMode === 'remote' ? 'remote' : 'local';
   const sshHostId = String(msg?.sshHostId || '').trim();
   const remoteCwd = String(msg?.remoteCwd || '').trim();
@@ -5045,7 +5101,7 @@ function handleNewSession(ws, msg) {
     claudeSessionId: null,
     codexThreadId: null,
     model: agent === 'codex' ? resolveDefaultCodexModel() : MODEL_MAP.opus,
-    codexGateway: agent === 'codex' ? codexGateway : '',
+    codexGateway,
     permissionMode: requestedMode,
     totalCost: 0,
     totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -5350,8 +5406,7 @@ function handleDeleteSession(ws, sessionId) {
 function handleSetSessionGateway(ws, sessionId, gateway) {
   const session = sessionId ? loadSession(sessionId) : null;
   if (!session) return wsSend(ws, { type: 'error', message: '会话不存在，无法切换网关' });
-  if (getSessionAgent(session) !== 'codex') return wsSend(ws, { type: 'error', message: '只有 Codex 会话支持切换网关' });
-  session.codexGateway = gateway === 'localproxy' ? 'localproxy' : 'apirouter';
+  session.codexGateway = normalizeGateway(gateway);
   saveSession(session);
   wsSend(ws, { type: 'session_gateway', sessionId: session.id, codexGateway: session.codexGateway });
 }
@@ -5446,7 +5501,7 @@ function handleAbort(ws) {
  * @param {object} msg - { text, sessionId, mode, attachments, agent }
  * @param {object} [options={}] - { hideInHistory }
  */
-function handleMessage(ws, msg, options = {}) {
+async function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
   const { hideInHistory = false, recoveryReplay = false, codexEmptyFinalRetry = false } = options;
   const textValue = typeof text === 'string' ? text : '';
@@ -5492,7 +5547,9 @@ function handleMessage(ws, msg, options = {}) {
 	      agent,
 	      claudeSessionId: null,
 	      codexThreadId: null,
+	      codexProvider: '',
 	      model: agent === 'codex' ? resolveDefaultCodexModel() : null,
+	      codexGateway: normalizeGateway(msg.codexGateway || loadCodexConfig().gateway),
 	      permissionMode: mode || 'yolo',
 	      totalCost: 0,
 	      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
@@ -5501,6 +5558,7 @@ function handleMessage(ws, msg, options = {}) {
 	    };
 	  }
   normalizeSession(session);
+  if (!isClaudeSession(session) && prepareCodexThreadProvider(session)) saveSession(session);
 
   if (normalizedText.startsWith('/') && !/^\/goal(?:\s|$)/i.test(normalizedText) && resolvedAttachments.length > 0) {
     return wsSend(ws, { type: 'error', message: '命令消息暂不支持同时附带图片。请先发送图片说明，再单独使用 /model 或 /mode。' });
@@ -5621,6 +5679,25 @@ function handleMessage(ws, msg, options = {}) {
       ? `Create and persist a durable goal for this thread: ${codexGoalMatch[1].trim()}\n\nWork autonomously toward this goal now. Keep the goal updated with meaningful progress, and only mark it complete when the stated condition is satisfied.`
       : 'Clear the durable goal for this thread. Confirm that it has been removed.')
     : textValue;
+  const route = gatewayParts(session.codexGateway);
+  if (route.transport === 'proxy') {
+    try {
+      activeCodexProxyBaseUrl = await codexProxyManager.ensureReady();
+      if (!activeCodexProxyBaseUrl) {
+        throw new Error('代理托管已禁用');
+      }
+    } catch (error) {
+      plog('ERROR', 'codex_proxy_unavailable', {
+        sessionId: session.id.slice(0, 8),
+        gateway: session.codexGateway,
+        error: error.message,
+      });
+      return wsSend(ws, {
+        type: 'error',
+        message: `codex_api_proxy 未就绪，代理请求未发送：${error.message}`,
+      });
+    }
+  }
   const spawnSpec = isClaudeSession(session)
     ? buildClaudeSpawnSpec(session, { attachments: resolvedAttachments })
     : buildCodexSpawnSpec(session, { attachments: resolvedAttachments });
@@ -5786,6 +5863,7 @@ function handleMessage(ws, msg, options = {}) {
     errorSent: false,
     codexHomeDir: spawnSpec.codexHomeDir || '',
     codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
+    codexProvider: spawnSpec.codexProvider || '',
     tailer: null,
   };
   activeProcesses.set(currentSessionId, entry);
@@ -5839,6 +5917,9 @@ const {
 } = createAgentRuntime({
   processEnv: process.env,
   resolveCodexGatewayEnv,
+  resolveAnthropicGateway,
+  codexProxyBaseUrl,
+  gatewayParts,
   CLAUDE_PATH,
   CODEX_PATH,
   MODEL_MAP,
@@ -6521,6 +6602,7 @@ function handleImportCodexSession(ws, msg) {
     agent: 'codex',
     claudeSessionId: null,
     codexThreadId: threadId,
+    codexProvider: parsed.meta.modelProvider || existingSession?.codexProvider || '',
     importedFrom: 'codex',
     importedRolloutPath: parsed.filePath,
     model: existingSession?.model || null,
@@ -6607,6 +6689,7 @@ function shutdown(reason, exitCode = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
   plog('INFO', 'server_shutdown_start', { reason, activeProcesses: activeProcesses.size });
+  codexProxyManager.stop();
 
   try {
     for (const client of wss.clients) {

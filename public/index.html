@@ -141,8 +141,10 @@
         <div id="chat-gateway-anchor" class="chat-pill-anchor" hidden>
           <button id="chat-gateway" class="chat-gateway" type="button" aria-haspopup="menu" aria-expanded="false" hidden></button>
           <div id="chat-gateway-menu" class="chat-agent-menu chat-gateway-menu" hidden>
-            <button type="button" class="chat-agent-option" data-gateway="apirouter">公司 apirouter</button>
-            <button type="button" class="chat-agent-option" data-gateway="localproxy">本地代理 (127.0.0.1:8787)</button>
+            <button type="button" class="chat-agent-option" data-gateway="proxy-apirouter">代理走 apirouter</button>
+            <button type="button" class="chat-agent-option" data-gateway="proxy-llmproxy">代理走 llmproxy</button>
+            <button type="button" class="chat-agent-option" data-gateway="direct-apirouter">直连 apirouter</button>
+            <button type="button" class="chat-agent-option" data-gateway="direct-llmproxy">直连 llmproxy</button>
           </div>
         </div>
         <span id="chat-runtime-state" class="chat-runtime-state" hidden>运行中</span>

@@ -26,7 +26,7 @@ Claude Code 会按 `cleanupPeriodDays` 清理 `~/.claude/projects/<project>/<ses
 
 `server.js` 中 `normalizeSession()` 在加载时统一字段默认值。**新增字段必须在 `normalizeSession` 设默认值**，保证前向兼容。
 
-当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `totalCost` / `totalUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `titleSource` / `messages`。
+当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `codexProvider` / `totalCost` / `totalUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `titleSource` / `messages`。
 
 **不在该函数设默认值**（由创建/业务路径显式赋值）：
 - `permissionMode` — 由 `handleNewSession` / `handleMessage` 创建时赋值，默认 `'yolo'`
@@ -54,6 +54,8 @@ Claude Code 会按 `cleanupPeriodDays` 清理 `~/.claude/projects/<project>/<ses
 | `codexThreadId` | Codex resume 线程 id |
 | `codexHomeDir` | Codex 隔离 profile 目录（CODEX_HOME） |
 | `codexRuntimeKey` | Codex runtime 认证 key |
+| `codexProvider` | Codex thread 在 `session_meta` 中记录的 provider 名；resume 时复用，路由切换只更新对应 provider 的 `base_url` |
+| `codexGateway` | 会话级四路由：代理/直连 × APIRouter/llmproxy；旧值 `apirouter` / `localproxy` 自动迁移 |
 | `permissionMode` | cc-web 内部值：`'default'` / `'plan'` / `'yolo'`（= `dangerously_skip_permissions`）。默认 `'yolo'`。Claude/Codex 各自 CLI 参数映射见 [ARCHITECTURE.md](./ARCHITECTURE.md#权限模式映射) |
 | `model` | 当前会话使用的模型（Codex 创建时设默认，Claude 从模板解析） |
 | `cwd` | 工作目录 |
@@ -82,6 +84,12 @@ Claude Code 会按 `cleanupPeriodDays` 清理 `~/.claude/projects/<project>/<ses
 解析结果按文件 `mtime + size` 缓存在内存中，未变化的会话不会重复解析；文件更新后自动重新读取，删除会话后清理对应缓存。缓存上限 512 个会话文件，不建立持久化全文索引。
 
 ## Detached 进程生命周期
+
+### 会话级网关与代理托管
+
+Codex 和 Claude 的 local 模式都在每轮 spawn 前读取 `session.codexGateway`。Codex 使用私有 provider `ccweb_gateway`：代理模式把 provider base URL 指向 `http://127.0.0.1:<port>/<upstream>/v1`，直连模式直接指向所选上游。Claude 对应设置 `ANTHROPIC_BASE_URL` 为代理路径或所选上游，并注入该上游自己的 token；custom 模板仍以模板 endpoint 为准。
+
+每条请求的代理路径已经带上 upstream，因此多个页面会话即使同时选择不同选项，也不会共享“当前上游”状态。首次代理请求会等待 `lib/codex-proxy-manager.js` 完成复用或启动；代理不可用时该轮明确报错且不 spawn CLI。外层进程只按代理/直连检查需要的上游，直连不需要代理就绪。
 
 ### 三态流转
 

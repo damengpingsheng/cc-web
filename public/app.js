@@ -217,6 +217,26 @@
   let currentCwd = null;
   // 当前会话的会话级 Codex 网关原始值（空表示未单独指定，展示口径见 updateGatewayBadge）
   let currentCodexGateway = '';
+  let currentClaudeMode = 'local';
+  const GATEWAY_OPTIONS = [
+    ['proxy-apirouter', '代理走 apirouter'],
+    ['proxy-llmproxy', '代理走 llmproxy'],
+    ['direct-apirouter', '直连 apirouter'],
+    ['direct-llmproxy', '直连 llmproxy'],
+  ];
+  const GATEWAY_LABELS = Object.fromEntries(GATEWAY_OPTIONS);
+  const GATEWAY_ALIASES = { apirouter: 'direct-apirouter', localproxy: 'proxy-apirouter' };
+  function normalizeGateway(value) {
+    const raw = String(value || '').trim();
+    const gatewayId = Object.prototype.hasOwnProperty.call(GATEWAY_LABELS, raw)
+      ? raw : (GATEWAY_ALIASES[raw] || 'direct-apirouter');
+    return gatewayId;
+  }
+  function gatewayOptionsHtml(selected) {
+    const active = normalizeGateway(selected);
+    return GATEWAY_OPTIONS.map(([value, label]) =>
+      `<option value="${value}"${value === active ? ' selected' : ''}>${label}</option>`).join('');
+  }
   let currentSessionRunning = false;
   // 最近一条已乐观渲染、但可能被 Claude transcript 预检拦下的消息。选择恢复时
   // 保留气泡；取消发送时恢复输入框和附件，避免 UI 看起来已经发送。
@@ -2254,15 +2274,11 @@
     chatCwd.hidden = !currentCwd || (currentSessionRunning && shouldOverlayRuntimeBadge());
   }
 
-  // 会话头部的网关徽标：只对 Codex 会话显示（Claude 走全局 ANTHROPIC_BASE_URL，没有这一项）。
-  // 取值口径与 agent-runtime 的 spawn 逻辑一致：会话级 codexGateway 优先，缺省回落全局配置的 gateway；
-  // custom 模式既不选 apirouter 也不选 localproxy，直接打在 profile 的 apiBase 上，单独标一行。
-  // 徽标本身是会话内切网关的入口：点开菜单选另一个网关，写进本会话的 session.codexGateway，
-  // 下一轮 spawn 即生效（provider 的 -c 覆盖在 exec 层，resume 轮同样吃得到，见 commit 6f32562）。
+  // Codex 和 Claude 都按会话选择 transport/upstream；custom 模板仍使用自己的 endpoint。
   function updateGatewayBadge() {
     if (!chatGateway) return;
     // 欢迎页（没有会话）不显示，与 cwd 徽标同一口径
-    if (currentAgent !== 'codex' || !currentSessionId) {
+    if (!currentSessionId) {
       chatGateway.hidden = true;
       if (chatGatewayAnchor) chatGatewayAnchor.hidden = true;
       chatGateway.textContent = '';
@@ -2271,13 +2287,22 @@
       return;
     }
     const config = codexConfigCache || {};
-    if (config.mode === 'custom') {
+    if (currentAgent === 'codex' && config.mode === 'custom') {
       const profile = (Array.isArray(config.profiles) ? config.profiles : [])
         .find((item) => item && item.name === config.activeProfile) || null;
       chatGateway.textContent = '自定义 Profile';
       chatGateway.title = `当前网关: 自定义 Profile${profile?.name ? `（${profile.name}）` : ''}`
         + `\nAPI Base: ${profile?.apiBase || '未设置'}`
-        + '\ncustom 模式不走公司 apirouter / 本地代理，要切网关先在设置里改回「本地配置」';
+        + '\ncustom 模式不走四路由，要切网关先在设置里改回「本地配置」';
+      chatGateway.disabled = true;
+      chatGateway.hidden = false;
+      if (chatGatewayAnchor) chatGatewayAnchor.hidden = false;
+      syncGatewayMenu('');
+      return;
+    }
+    if (currentAgent === 'claude' && currentClaudeMode === 'custom') {
+      chatGateway.textContent = '自定义模板';
+      chatGateway.title = '当前使用 Claude 自定义模板 endpoint，不经过四路由；切回「本地配置」后可选择代理或直连。';
       chatGateway.disabled = true;
       chatGateway.hidden = false;
       if (chatGatewayAnchor) chatGatewayAnchor.hidden = false;
@@ -2285,13 +2310,12 @@
       return;
     }
     // 会话级值为空 = 建会话时没有单独选过（旧会话/导入会话），跟着全局配置走
-    const sessionLevel = (currentCodexGateway === 'localproxy' || currentCodexGateway === 'apirouter')
-      ? currentCodexGateway : '';
-    const gateway = sessionLevel || (config.gateway === 'localproxy' ? 'localproxy' : 'apirouter');
-    chatGateway.textContent = gateway === 'localproxy' ? '本地代理' : '公司 apirouter';
-    chatGateway.title = `当前网关: ${gateway === 'localproxy' ? '本地代理 (127.0.0.1:8787)' : '公司 apirouter'}`
+    const sessionLevel = currentCodexGateway ? normalizeGateway(currentCodexGateway) : '';
+    const gateway = sessionLevel || normalizeGateway(config.gateway);
+    chatGateway.textContent = GATEWAY_LABELS[gateway];
+    chatGateway.title = `当前路由: ${GATEWAY_LABELS[gateway]}`
       + `\n来源: ${sessionLevel ? '本会话创建时选择' : '全局配置（本会话未单独指定）'}`
-      + '\n点击切换（下一轮生效）';
+      + '\n代理模式由 CC-Web 自动启动和守护；点击切换（下一轮生效）';
     chatGateway.disabled = false;
     chatGateway.hidden = false;
     if (chatGatewayAnchor) chatGatewayAnchor.hidden = false;
@@ -3704,6 +3728,8 @@
         break;
 
       case 'model_config':
+        currentClaudeMode = msg.config?.mode === 'custom' ? 'custom' : 'local';
+        updateGatewayBadge();
         if (typeof _onModelConfig === 'function') _onModelConfig(msg.config);
         break;
 
@@ -8687,13 +8713,12 @@
           <div class="settings-field">
             <label>网关</label>
             <select class="settings-select" id="codex-gateway-select" style="width:100%">
-              <option value="apirouter"${codexGateway === 'apirouter' ? ' selected' : ''}>公司 apirouter（默认）</option>
-              <option value="localproxy"${codexGateway === 'localproxy' ? ' selected' : ''}>本地代理 (127.0.0.1:8787)</option>
+              ${gatewayOptionsHtml(codexGateway)}
             </select>
           </div>
           <div class="settings-inline-note">
             直接复用本机 <code>codex</code> 的登录态与 <code>~/.codex/config.toml</code>。
-            ${codexGateway === 'localproxy' ? '选本地代理时需先启动 <code>~/Tools/codex-api-proxy/codex_api_proxy.py</code>（监听 127.0.0.1:8787）。' : ''}
+            代理选项由 CC-Web 自动启动并守护 <code>codex_api_proxy.py</code>（127.0.0.1:8787）；直连选项不经过代理。
           </div>
         `;
         panel.querySelector('#codex-profile-select').addEventListener('change', (e) => {
@@ -8710,7 +8735,7 @@
         panel.querySelector('#codex-info-btn').addEventListener('click', showClaudeLocalInfoModal);
         panel.querySelector('#codex-read-local-btn').addEventListener('click', () => send({ type: 'read_codex_local_config' }));
         panel.querySelector('#codex-gateway-select').addEventListener('change', (e) => {
-          codexGateway = e.target.value === 'localproxy' ? 'localproxy' : 'apirouter';
+          codexGateway = normalizeGateway(e.target.value);
           renderCodexConfigArea();
         });
         return;
@@ -8916,7 +8941,7 @@
     _onCodexConfig = (config) => {
       currentCodexConfig = config || {};
       codexEditingProfiles = (currentCodexConfig.profiles || []).map((profile) => normalizeCodexProfile(profile));
-      codexGateway = currentCodexConfig.gateway === 'localproxy' ? 'localproxy' : 'apirouter';
+      codexGateway = normalizeGateway(currentCodexConfig.gateway);
       if (currentCodexConfig.mode === 'local') {
         codexActiveProfile = '';
       } else {
@@ -9291,11 +9316,16 @@
           ${targetAgent === 'codex' ? `
           <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
             <span style="opacity:0.75;white-space:nowrap;font-size:0.92em">网关</span>
-            <select class="settings-select" id="ns-gateway-select" style="flex:1" title="选择 Codex 请求走向；本地代理需先启动 ~/Tools/codex-api-proxy/codex_api_proxy.py（监听 127.0.0.1:8787）">
-              <option value="apirouter"${codexConfigCache?.gateway === 'localproxy' ? '' : ' selected'}>公司 apirouter（默认）</option>
-              <option value="localproxy"${codexConfigCache?.gateway === 'localproxy' ? ' selected' : ''}>本地代理 (127.0.0.1:8787)</option>
+            <select class="settings-select" id="ns-gateway-select" style="flex:1" title="选择本会话的代理/直连及上游；代理由 CC-Web 自动启动和守护">
+              ${gatewayOptionsHtml(codexConfigCache?.gateway)}
             </select>
-          </div>` : ''}
+          </div>` : `
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+            <span style="opacity:0.75;white-space:nowrap;font-size:0.92em">网关</span>
+            <select class="settings-select" id="ns-gateway-select" style="flex:1" title="选择本会话的代理/直连及上游；代理由 CC-Web 自动启动和守护">
+              ${gatewayOptionsHtml(codexConfigCache?.gateway)}
+            </select>
+          </div>`}
           <div style="display:flex;gap:8px;margin-bottom:12px">
             <button class="btn-test ns-task-tab active" id="ns-tab-local" style="flex:1;padding:6px 12px">本地任务</button>
             <button class="btn-test ns-task-tab" id="ns-tab-remote" style="flex:1;padding:6px 12px">远程任务</button>
@@ -9502,7 +9532,7 @@
         pendingComposerDraftMigration = { agent: targetAgent };
         close();
         saveRecentCwd(cwd);
-        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local', codexGateway: overlay.querySelector('#ns-gateway-select')?.value || 'apirouter' });
+        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local', codexGateway: normalizeGateway(overlay.querySelector('#ns-gateway-select')?.value || codexConfigCache?.gateway) });
       } else {
         // Remote task
         if (!selectedHostId) {
@@ -9512,7 +9542,7 @@
         const remoteCwd = remoteView.querySelector('#ns-remote-cwd')?.value?.trim() || '';
         pendingComposerDraftMigration = { agent: targetAgent };
         close();
-        send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd, codexGateway: overlay.querySelector('#ns-gateway-select')?.value || 'apirouter' });
+        send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd, codexGateway: normalizeGateway(overlay.querySelector('#ns-gateway-select')?.value || codexConfigCache?.gateway) });
       }
     });
   }
