@@ -1661,6 +1661,17 @@ async function main() {
   mkdirp(logsDir);
   mkdirp(homeDir);
 
+  const claudeSettingsPath = path.join(homeDir, '.claude', 'settings.json');
+  mkdirp(path.dirname(claudeSettingsPath));
+  fs.writeFileSync(claudeSettingsPath, JSON.stringify({
+    env: {
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-6',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
+      CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
+    },
+  }, null, 2));
+
   // 主回归禁止认证后访问真实 llmproxy；协议级用例使用隔离的本地 mock endpoint。
   fs.writeFileSync(path.join(configDir, 'llmproxy-usage.json'), JSON.stringify({ enabled: false }, null, 2));
   fs.writeFileSync(path.join(configDir, 'apirouter-usage.json'), JSON.stringify({ enabled: false }, null, 2));
@@ -1713,6 +1724,49 @@ async function main() {
     const { ws, messages, token } = await connectWs(port, password);
 
     await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+
+    // settings changes after startup must refresh the picker and /model aliases.
+    ws.send(JSON.stringify({ type: 'list_models' }));
+    const oldModelOptions = await nextMessage(messages, ws, (msg) => msg.type === 'model_options');
+    assert(oldModelOptions.aliasModels?.sonnet === 'claude-sonnet-4-6', 'Initial model list should use startup settings');
+    fs.writeFileSync(claudeSettingsPath, JSON.stringify({
+      env: {
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5-5',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5-5',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-flash',
+        CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
+      },
+    }, null, 2));
+    ws.send(JSON.stringify({ type: 'list_models' }));
+    const refreshedModelOptions = await nextMessage(messages, ws, (msg) => msg.type === 'model_options');
+    assert(refreshedModelOptions.aliasModels?.sonnet === 'claude-sonnet-5-5',
+      'Model list should refresh sonnet after settings changes without restart');
+    assert(refreshedModelOptions.aliasModels?.haiku === 'deepseek-flash',
+      'Model list should refresh haiku after settings changes without restart');
+
+    const modelRefreshCwd = path.join(tempRoot, 'claude-model-refresh');
+    mkdirp(modelRefreshCwd);
+    ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: modelRefreshCwd, mode: 'yolo' }));
+    const modelRefreshSession = await nextMessage(messages, ws,
+      (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.cwd === modelRefreshCwd);
+    ws.send(JSON.stringify({
+      type: 'message', text: '/model sonnet', sessionId: modelRefreshSession.sessionId, mode: 'yolo', agent: 'claude',
+    }));
+    await nextMessage(messages, ws,
+      (msg) => msg.type === 'model_changed' && msg.model === 'sonnet');
+    const sonnetSession = JSON.parse(fs.readFileSync(
+      path.join(sessionsDir, `${modelRefreshSession.sessionId}.json`), 'utf8'));
+    assert(sonnetSession.model === 'claude-sonnet-5-5',
+      'Claude /model sonnet should use refreshed settings without restart');
+    ws.send(JSON.stringify({
+      type: 'message', text: '/model haiku', sessionId: modelRefreshSession.sessionId, mode: 'yolo', agent: 'claude',
+    }));
+    await nextMessage(messages, ws,
+      (msg) => msg.type === 'model_changed' && msg.model === 'haiku');
+    const haikuSession = JSON.parse(fs.readFileSync(
+      path.join(sessionsDir, `${modelRefreshSession.sessionId}.json`), 'utf8'));
+    assert(haikuSession.model === 'deepseek-flash',
+      'Claude /model haiku should use refreshed settings without restart');
 
     ws.send(JSON.stringify({
       type: 'save_codex_config',

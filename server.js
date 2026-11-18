@@ -4477,6 +4477,9 @@ function handleSaveCodexConfig(ws, newConfig) {
 // 没登记时回落到网关全量，网关也不可用时回落到 MODEL_MAP 的别名，保证选择器始终有内容。
 // codexModels 是 Codex agent 专用的候选，与 claude 的列表互不影响。
 async function handleListModels(ws) {
+  // ~/.claude/settings.json can change while the process is running. Refresh
+  // slots on every request so /model never shows the startup snapshot.
+  applyModelConfig();
   const picker = loadClaudePickerModels();
   const gateway = picker.length > 0 ? null : await fetchGatewayModels();
   const codexModels = await loadCodexModelOptions();
@@ -4722,6 +4725,8 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
     }
 
     case '/model': {
+      // Resolve aliases from the current settings/model config, not startup state.
+      if (agent !== 'codex') applyModelConfig();
       const modelInput = parts[1];
       if (agent === 'codex') {
         if (!modelInput) {
