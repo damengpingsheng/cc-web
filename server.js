@@ -31,7 +31,11 @@ const { StringDecoder } = require('string_decoder');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
-const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('./lib/context-usage');
+const {
+  estimateClaudeContextUsage,
+  estimateCodexContextUsage,
+  shouldPreemptiveCompact,
+} = require('./lib/context-usage');
 const { createAuthStore } = require('./lib/auth');
 const { createCodexRolloutStore, CODEX_EMPTY_FINAL_RETRY_MARKER } = require('./lib/codex-rollouts');
 const { createClientIpResolver } = require('./lib/client-ip');
@@ -3581,34 +3585,57 @@ function handleProcessComplete(sessionId, exitCode, signal) {
 
   let shouldReturnForFollowup = false;
   let shouldAutoCompact = false;
+  let compactAutoRetryRequested = false;
+
+  // Compact/replay is a logical continuation of the failed turn, not a UI-only
+  // action. Decide it before checking WebSocket state so a detached task can
+  // recover without an open browser.
+  if (pendingSlash?.kind === 'compact') {
+    const retry = pendingCompactRetries.get(sessionId);
+    compactAutoRetryRequested = !!(retry?.text && retry?.reason === 'auto');
+    if (compactAutoRetryRequested) {
+      if (contextLimitExceeded) {
+        pendingCompactRetries.delete(sessionId);
+      } else {
+        shouldReturnForFollowup = true;
+      }
+    }
+  }
+  if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
+    pendingCompactRetries.set(sessionId, {
+      text: pendingRetry?.text || '',
+      mode: pendingRetry?.mode || session.permissionMode || 'yolo',
+      reason: 'auto',
+    });
+    shouldAutoCompact = true;
+  }
 
   activeProcesses.delete(sessionId);
   cleanRunDir(sessionId);
   pendingSlashCommands.delete(sessionId);
+  const willContinue = !!((retryCodexWithoutResume && wsConnected)
+    || (shouldRetryCodexEmptyFinal && wsConnected)
+    || shouldReturnForFollowup || shouldAutoCompact);
 
   // Notify client
   if (wsConnected) {
     if (pendingSlash?.kind === 'compact') {
-      const retry = pendingCompactRetries.get(sessionId);
-      const autoRetryRequested = !!(retry?.text && retry?.reason === 'auto');
-      if (autoRetryRequested) {
+      if (compactAutoRetryRequested) {
         if (contextLimitExceeded) {
-          pendingCompactRetries.delete(sessionId);
           wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
         } else {
           wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
           wsSend(entry.ws, { type: 'system_message', message: compactAutoResumeMessage(entry.agent || 'claude') });
-          shouldReturnForFollowup = true;
         }
+      } else if (contextLimitExceeded) {
+        wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
       } else {
         wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
       }
     }
 
     if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
-      pendingCompactRetries.set(sessionId, { text: pendingRetry?.text || '', mode: pendingRetry?.mode || session.permissionMode || 'yolo', reason: 'auto' });
       wsSend(entry.ws, { type: 'system_message', message: compactAutoStartMessage(entry.agent || 'claude') });
-      shouldAutoCompact = true;
     }
 
     if (shouldRetryCodexEmptyFinal) {
@@ -3623,7 +3650,6 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       wsSend(entry.ws, { type: 'error', message: completionError });
     }
 
-    const willContinue = !!(retryCodexWithoutResume || shouldReturnForFollowup || shouldAutoCompact || shouldRetryCodexEmptyFinal);
     wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null, willContinue });
     sendSessionList(entry.ws);
     // 同步给其他客户端，避免只有发起的那个标签页知道任务完成
@@ -3645,12 +3671,19 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       });
     })();
   } else {
-    // Process completed while browser was disconnected — notify all connected clients
-    const sess = broadcastBackgroundDone(sessionId, entry);
-    // Push notification (background task)
-    buildNotifyContent(entry, sess, completionError, contextLimitExceeded).then(({ title: ntitle, content }) => {
-      sendNotification(ntitle, content);
-    });
+    if (willContinue) {
+      plog('INFO', 'detached_auto_continue', {
+        sessionId: sessionId.slice(0, 8),
+        action: shouldAutoCompact ? 'compact' : (shouldReturnForFollowup ? 'compact-replay' : 'retry'),
+      });
+    } else {
+      // Process completed while browser was disconnected — notify all connected clients
+      const sess = broadcastBackgroundDone(sessionId, entry);
+      // Push notification (background task)
+      buildNotifyContent(entry, sess, completionError, contextLimitExceeded).then(({ title: ntitle, content }) => {
+        sendNotification(ntitle, content);
+      });
+    }
   }
 
   if (retryCodexWithoutResume && entry.ws && entry.ws.readyState === 1 && session) {
@@ -3683,20 +3716,21 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     pendingCompactRetries.delete(sessionId);
   }
 
-  if (shouldReturnForFollowup && entry.ws && entry.ws.readyState === 1 && session) {
+  const continuationWs = wsConnected ? entry.ws : null;
+  if (shouldReturnForFollowup && session) {
     if (pendingSlash?.kind === 'compact') {
       const retry = pendingCompactRetries.get(sessionId);
       if (retry?.text) {
         pendingCompactRetries.delete(sessionId);
-        handleMessage(entry.ws, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
+        handleMessage(continuationWs, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
       }
       return;
     }
   }
 
-  if (shouldAutoCompact && entry.ws && entry.ws.readyState === 1 && session) {
+  if (shouldAutoCompact && session) {
     pendingSlashCommands.set(sessionId, { kind: 'compact' });
-    handleMessage(entry.ws, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
+    handleMessage(continuationWs, { text: '/compact', sessionId, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
     return;
   }
 
@@ -5585,14 +5619,14 @@ async function handleMessage(ws, msg, options = {}) {
     return requestClaudeRecovery(ws, session, textValue, attachments, session.permissionMode || 'yolo', { hideInHistory });
   }
 
-  // === P2 预防性水位压缩（仅 Claude resume 场景）===
-  // 发送前读 transcript jsonl 水位，接近上限（默认 80%）则先 /compact 再重放原消息，
+  // === P2 预防性水位压缩（Claude transcript / Codex rollout）===
+  // 发送前读原生上下文水位，接近上限（默认 80%）则先 /compact 再重放原消息，
   // 复用 P0 自动 compact 注入链路（pendingCompactRetries + pendingSlashCommands + 重放）。
   // 约束：定位/估算/判定任何一步不确定（无 jsonl、无 usage、解析失败、带附件无法重放、
   // 处于自动压缩重试循环等）一律不触发，直接走原流程——正常路径零改变。
   if (
-    isClaudeSession(session)
-    && session.claudeSessionId
+    ((isClaudeSession(session) && session.claudeSessionId)
+      || (!isClaudeSession(session) && session.codexThreadId))
     && normalizedText
     && normalizedText !== '/compact'
     && !hideInHistory
@@ -5601,18 +5635,29 @@ async function handleMessage(ws, msg, options = {}) {
     && pendingCompactRetries.get(session.id)?.reason !== 'auto'
   ) {
     try {
-      const jsonlPath = locateClaudeSessionJsonl(session.claudeSessionId);
-      const usageTokens = jsonlPath ? estimateClaudeContextUsage(jsonlPath) : null;
-      if (usageTokens !== null && shouldPreemptiveCompact(usageTokens, session.model, AUTOCOMPACT_PCT)) {
+      let usageTokens = null;
+      let windowTokens = null;
+      if (isClaudeSession(session)) {
+        const jsonlPath = locateClaudeSessionJsonl(session.claudeSessionId);
+        usageTokens = jsonlPath ? estimateClaudeContextUsage(jsonlPath) : null;
+      } else {
+        const jsonlPath = locateCodexThreadJsonl(session);
+        const usage = jsonlPath ? estimateCodexContextUsage(jsonlPath) : null;
+        usageTokens = usage?.usageTokens ?? null;
+        windowTokens = usage?.windowTokens ?? null;
+      }
+      if (usageTokens !== null
+          && shouldPreemptiveCompact(usageTokens, session.model, AUTOCOMPACT_PCT, windowTokens)) {
         preemptCompactGuard.add(session.id);
         session.updated = new Date().toISOString();
         saveSession(session);
         plog('INFO', 'preemptive_compact', {
           sessionId: session.id.slice(0, 8),
           usageTokens,
-          windowTokens: /1m/i.test(String(session.model || '')) ? 1_000_000 : 200_000,
+          windowTokens: windowTokens || (/1m/i.test(String(session.model || '')) ? 1_000_000 : 200_000),
           pct: AUTOCOMPACT_PCT,
           model: session.model || 'default',
+          agent: getSessionAgent(session),
         });
         wsSend(ws, { type: 'system_message', kind: 'compact', message: '◎ 检测到上下文接近上限，先执行压缩再发送您的消息' });
         // 与 handleProcessComplete 的 auto 分支完全一致的注入方式：
@@ -6021,6 +6066,37 @@ function locateClaudeSessionJsonl(claudeSessionId) {
       if (fs.existsSync(filePath)) return filePath;
     }
   } catch {}
+  return null;
+}
+
+// Codex rollout 可能位于默认 ~/.codex、托管 runtime home 或会话隔离 home。
+// 文件名通常包含 thread id，但最终仍以首条 session_meta 的 owner 为准，
+// 避免把 subagent 的 rollout 当成当前线程。
+function locateCodexThreadJsonl(session) {
+  const threadId = String(session?.codexThreadId || '').trim();
+  if (!threadId) return null;
+  const candidates = [];
+  const addCandidate = (filePath) => {
+    if (!filePath || candidates.includes(filePath)) return;
+    try {
+      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) candidates.push(filePath);
+    } catch {}
+  };
+  addCandidate(session?.importedRolloutPath);
+  const dirs = [
+    CODEX_SESSIONS_DIR,
+    path.join(CODEX_RUNTIME_HOME, 'sessions'),
+    session?.codexHomeDir ? path.join(session.codexHomeDir, 'sessions') : '',
+  ];
+  for (const dir of new Set(dirs.filter(Boolean))) {
+    for (const filePath of walkJsonlFiles(dir)) {
+      if (path.basename(filePath).includes(threadId)) addCandidate(filePath);
+    }
+  }
+  for (const filePath of candidates) {
+    const owner = readCodexRolloutOwner(filePath);
+    if (owner?.threadId === threadId) return filePath;
+  }
   return null;
 }
 

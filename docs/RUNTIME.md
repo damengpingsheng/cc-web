@@ -173,6 +173,7 @@ Codex 正常退出时若本轮已执行非 reasoning 工具、最后一个输出
 - `pendingCompactRetries: Map<sessionId, ...>` — 跟踪重试状态
 - `pendingSlashCommands: Map<sessionId, ...>` — 排队的 slash 命令
 - `reason: 'auto'`（自动触发）vs `'normal'`（用户主动）
+- 自动 compact 和压缩后的原 prompt 重放不依赖 WebSocket 在线。浏览器断开时，`handleProcessComplete` 仍会启动 detached `/compact`，成功后继续重放原 prompt；中间过程只写日志，最终结果再通过 `background_done` 或推送通知交付。
 
 核心位置：`server.js` 中 `handleProcessComplete` 函数（按函数名定位最稳）。
 
@@ -193,14 +194,14 @@ CLI 执行压缩时 cc-web 把 compact 边界事件转成 `system_message`（`ki
 
 #### 预防性水位压缩（P2，事前预防）
 
-与事后兜底（上面 P0）叠加成双保险，互不依赖。仅 Claude resume 场景（`session.claudeSessionId` 存在）生效：
+与事后兜底（上面 P0）叠加成双保险，互不依赖。Claude resume 和 Codex resume 都生效：
 
-1. `handleMessage` 在构造 spawn 之前，用 `locateClaudeSessionJsonl`（复用原生导入的定位方式）找 `~/.claude/projects/<dir>/<sessionId>.jsonl`
-2. `lib/context-usage.js` 的 `estimateClaudeContextUsage` 从文件**末尾向前**找最后一条带 usage 的 assistant 记录，取 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`（≈ 下一次请求的上下文规模）
-3. `shouldPreemptiveCompact(usage, model, CC_WEB_AUTOCOMPACT_PCT)`：窗口 = 模型标签含 `[1m]` → 1,000,000，否则 200,000；水位 ≥ 窗口 × 阈值%（默认 80%）即触发
-4. 触发时发 `◎ 检测到上下文接近上限，先执行压缩再发送您的消息`，然后**复用 P0 注入链路**：写 `pendingCompactRetries`（`reason:'auto'`，text=原消息）+ `pendingSlashCommands`（`kind:'compact'`）+ 以 `/compact` 为输入走 `handleMessage` spawn；compact 完成后原消息由现有 `handleProcessComplete` 重放链路发送
+1. `handleMessage` 在构造 spawn 之前定位原生上下文文件。Claude 用 `locateClaudeSessionJsonl` 找 `~/.claude/projects/<dir>/<sessionId>.jsonl`；Codex 用 `locateCodexThreadJsonl` 从默认、托管和会话隔离 home 中按 `codexThreadId` 及 rollout `session_meta` 归属查找。
+2. Claude 的 `estimateClaudeContextUsage` 从 transcript 末尾向前找最后一条带 usage 的 assistant 记录，取 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。Codex 的 `estimateCodexContextUsage` 从 rollout 末尾向前找最后一条非零 `token_count`，取 `last_token_usage.total_tokens`（缺失时用 input + output）和 `model_context_window`。
+3. `shouldPreemptiveCompact(usage, model, CC_WEB_AUTOCOMPACT_PCT, windowTokens?)`：Claude 按模型标签推断 1M / 200k 窗口；Codex 优先使用 rollout 报告的实际窗口（例如 237,500）。水位 ≥ 窗口 × 阈值%（默认 80%）即触发。
+4. 触发时发 `◎ 检测到上下文接近上限，先执行压缩再发送您的消息`，然后**复用 P0 注入链路**：写 `pendingCompactRetries`（`reason:'auto'`，text=原消息）+ `pendingSlashCommands`（`kind:'compact'`）+ 以 `/compact` 为输入走 `handleMessage` spawn；compact 完成后原消息由现有 `handleProcessComplete` 重放链路发送。
 
-**零改变约束**：定位不到 jsonl / 无 usage / 解析异常 / 带附件（无法重放）/ 文本为空——一律静默走原流程。防循环护栏 `preemptCompactGuard`：预防压缩后直到观察到一次正常（非 slash 注入）运行完成、或用户手动 `/compact`、或删除会话之前，不再对同一会话重复预防压缩。
+**零改变约束**：定位不到原生文件 / 无 usage / 解析异常 / 带附件（无法重放）/ 文本为空——一律静默走原流程。防循环护栏 `preemptCompactGuard`：预防压缩后直到观察到一次正常（非 slash 注入）运行完成、或用户手动 `/compact`、或删除会话之前，不再对同一会话重复预防压缩。
 
 ### `/goal` 多轮自治
 

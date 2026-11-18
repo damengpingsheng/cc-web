@@ -1227,6 +1227,15 @@ async function waitForFile(filePath, timeoutMs = 10000) {
   throw new Error(`Timed out waiting for file: ${filePath}`);
 }
 
+async function waitForCondition(predicate, message, timeoutMs = 15000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (predicate()) return;
+    await sleep(100);
+  }
+  throw new Error(message);
+}
+
 async function withServer(env, fn) {
   if (!Object.prototype.hasOwnProperty.call(env, 'CC_WEB_CODEX_PROXY_DISABLED')) {
     env = { ...env, CC_WEB_CODEX_PROXY_DISABLED: '1' };
@@ -1527,9 +1536,14 @@ async function testAuthStoreTokenMigration() {
 //   - estimateClaudeContextUsage 从文件末尾向前找最后一条含 usage 的 assistant 行，
 //     返回 input + cache_read + cache_creation 三项之和（更早的 usage 行、坏行不参与）
 //   - 无 usage / 文件不存在 → null（调用方必须跳过预防逻辑）
-//   - shouldPreemptiveCompact：[1m] 与普通窗口 × 高低水位四组合
+//   - estimateCodexContextUsage 从 rollout 末尾取非零 last_token_usage 和窗口
+//   - shouldPreemptiveCompact：[1m]、普通窗口、显式 Codex 窗口与高低水位组合
 async function testContextUsage() {
-  const { estimateClaudeContextUsage, shouldPreemptiveCompact } = require('../lib/context-usage');
+  const {
+    estimateClaudeContextUsage,
+    estimateCodexContextUsage,
+    shouldPreemptiveCompact,
+  } = require('../lib/context-usage');
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-usage-'));
 
   const usageLine = (usage) => JSON.stringify({
@@ -1554,12 +1568,40 @@ async function testContextUsage() {
   assert(estimateClaudeContextUsage(noUsagePath) === null, 'jsonl without usage must return null');
   assert(estimateClaudeContextUsage(path.join(tempDir, 'missing.jsonl')) === null, 'missing file must return null');
 
+  const codexUsage = (input, output, total, window) => JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info: {
+        last_token_usage: {
+          input_tokens: input,
+          output_tokens: output,
+          total_tokens: total,
+        },
+        model_context_window: window,
+      },
+    },
+  });
+  const codexPath = path.join(tempDir, 'codex-rollout.jsonl');
+  fs.writeFileSync(codexPath, [
+    codexUsage(100000, 5000, 105000, 237500),
+    codexUsage(0, 0, 0, 237500),
+    codexUsage(190000, 1000, 191000, 237500),
+    '',
+  ].join('\n'));
+  const codexEstimate = estimateCodexContextUsage(codexPath);
+  assert(codexEstimate?.usageTokens === 191000 && codexEstimate?.windowTokens === 237500,
+    'Codex estimate should use the last non-zero rollout token_count');
+  assert(estimateCodexContextUsage(noUsagePath) === null, 'Codex rollout without token_count must return null');
+
   // 4 combos: window size from model label × water level (threshold 80%)
   assert(shouldPreemptiveCompact(200000, 'claude-opus-4-6[1m]', 80) === false, '1M window: 200k is below 80% threshold');
   assert(shouldPreemptiveCompact(800000, 'claude-opus-4-6[1m]', 80) === true, '1M window: 800k reaches 80% threshold');
   assert(shouldPreemptiveCompact(160000, 'claude-sonnet-4-6', 80) === true, '200k window: 160k reaches 80% threshold');
   assert(shouldPreemptiveCompact(159999, 'claude-sonnet-4-6', 80) === false, '200k window: 159,999 is below 80% threshold');
   assert(shouldPreemptiveCompact(null, 'claude-opus-4-6[1m]', 80) === false, 'null usage must never preempt');
+  assert(shouldPreemptiveCompact(190000, '', 80, 237500) === true, 'Codex explicit window: 190k reaches 80% threshold');
+  assert(shouldPreemptiveCompact(189999, '', 80, 237500) === false, 'Codex explicit window: 189,999 is below 80% threshold');
 
   fs.rmSync(tempDir, { recursive: true, force: true });
   console.log('Context usage estimation checks passed.');
@@ -1704,6 +1746,48 @@ async function main() {
     usage: { input_tokens: 150000, cache_read_input_tokens: 40000, cache_creation_input_tokens: 10000, output_tokens: 500 },
   });
   const codexFixture = createFakeCodexHistory(homeDir);
+  const codexUsageFixtureCwd = path.join(tempRoot, 'project-codex-usage');
+  mkdirp(codexUsageFixtureCwd);
+  const codexUsageThreadId = 'codex-usage-import-thread';
+  const codexUsageRolloutPath = path.join(
+    homeDir, '.codex', 'sessions', '2026', '03', '12',
+    `rollout-2026-03-12T00-00-00-${codexUsageThreadId}.jsonl`,
+  );
+  fs.writeFileSync(codexUsageRolloutPath, [
+    JSON.stringify({
+      timestamp: '2026-03-12T00:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: codexUsageThreadId, cwd: codexUsageFixtureCwd, cli_version: '0.114.0',
+        source: 'exec', model_provider: 'localproxy',
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-03-12T00:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'Codex usage import prompt' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-03-12T00:00:02.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'assistant',
+        content: [{ type: 'output_text', text: 'Codex usage import answer' }],
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-03-12T00:00:03.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: { input_tokens: 190000, output_tokens: 1000, total_tokens: 191000 },
+          model_context_window: 237500,
+        },
+      },
+    }),
+    '',
+  ].join('\n'));
 
   const port = await getFreePort();
   const password = 'Regression!234';
@@ -1994,6 +2078,45 @@ async function main() {
 	      assert(/trigger codex context limit/.test(autoCompactRetry.text || ''), 'Codex auto /compact should replay the failed prompt after compact');
 	    }
 
+    const detachedPage = await connectWs(port, password);
+    await nextMessage(detachedPage.messages, detachedPage.ws, (msg) => msg.type === 'session_list');
+    const detachedCwd = path.join(tempRoot, 'codex-detached-compact');
+    mkdirp(detachedCwd);
+    detachedPage.ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: detachedCwd, mode: 'yolo' }));
+    const detachedSession = await nextMessage(detachedPage.messages, detachedPage.ws, (msg) => (
+      msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === detachedCwd
+    ));
+    detachedPage.ws.send(JSON.stringify({
+      type: 'message', text: 'warm detached compact', sessionId: detachedSession.sessionId, mode: 'yolo', agent: 'codex',
+    }));
+    await nextMessage(detachedPage.messages, detachedPage.ws, (msg) => (
+      msg.type === 'done' && msg.sessionId === detachedSession.sessionId
+    ));
+    detachedPage.ws.send(JSON.stringify({
+      type: 'message', text: 'trigger codex detached context limit',
+      sessionId: detachedSession.sessionId, mode: 'yolo', agent: 'codex',
+    }));
+    await sleep(50);
+    detachedPage.ws.close();
+    const detachedSessionPath = path.join(sessionsDir, `${detachedSession.sessionId}.json`);
+    await waitForCondition(() => {
+      try {
+        const saved = JSON.parse(fs.readFileSync(detachedSessionPath, 'utf8'));
+        return (saved.messages || []).some((message) => message.role === 'assistant'
+          && /trigger codex detached context limit/.test(message.content || ''));
+      } catch {
+        return false;
+      }
+    }, 'Detached Codex context-limit recovery did not finish compact+replay');
+    const detachedLog = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8');
+    const detachedSessionEvents = detachedLog.trim().split('\n')
+      .filter((line) => line.includes(detachedSession.sessionId.slice(0, 8)));
+    const detachedSpawns = detachedSessionEvents.filter((line) => line.includes('"event":"process_spawn"'));
+    assert(detachedSpawns.length >= 4,
+      `Detached context-limit recovery should spawn warmup+failure+compact+replay (got ${detachedSpawns.length})`);
+    assert(detachedSessionEvents.some((line) => line.includes('"event":"detached_auto_continue"')),
+      'Detached context-limit recovery must continue without an open WebSocket');
+
     const claudeAttachment = await uploadAttachment(port, token, {
       filename: 'claude-test.png',
       mime: 'image/png',
@@ -2270,6 +2393,43 @@ async function main() {
     const importedCodex = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'Codex import prompt');
     assert(importedCodex.messages?.[0]?.content === 'Codex import prompt', 'Codex import kept wrapper instructions');
     assert(importedCodex.totalUsage?.inputTokens === 20, 'Codex import usage parse failed');
+
+    const codexPreemptPage = await connectWs(port, password);
+    await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => msg.type === 'session_list');
+    codexPreemptPage.ws.send(JSON.stringify({
+      type: 'import_codex_session', threadId: codexUsageThreadId, rolloutPath: codexUsageRolloutPath,
+    }));
+    const codexUsageSession = await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
+      msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'Codex usage import prompt'
+    ));
+    codexPreemptPage.ws.send(JSON.stringify({
+      type: 'message', text: 'preempt codex usage replay prompt',
+      sessionId: codexUsageSession.sessionId, mode: 'yolo', agent: 'codex',
+    }));
+    const codexPreemptNotice = await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
+      msg.type === 'system_message' && /◎ 检测到上下文接近上限，先执行压缩再发送您的消息/.test(msg.message || '')
+    ));
+    assert(codexPreemptNotice.kind === 'compact', 'Codex preemptive compact should surface as kind=compact');
+    await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => msg.type === 'text_delta' && /Codex compact finished/.test(msg.text || ''));
+    await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
+      msg.type === 'system_message' && /已执行 Codex \/compact/.test(msg.message || '')
+    ));
+    await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
+      msg.type === 'system_message' && /按 Codex 压缩计划继续执行/.test(msg.message || '')
+    ));
+    const codexPreemptReplay = await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
+      msg.type === 'text_delta' && /preempt codex usage replay prompt/.test(msg.text || '')
+    ));
+    assert(/preempt codex usage replay prompt/.test(codexPreemptReplay.text || ''),
+      'Codex preemptive compact should replay the original prompt');
+    await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => msg.type === 'done' && msg.sessionId === codexUsageSession.sessionId);
+    codexPreemptPage.ws.close();
+    const codexPreemptSpawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+      .trim()
+      .split('\n')
+      .filter((line) => line.includes('"event":"process_spawn"') && line.includes(codexUsageSession.sessionId.slice(0, 8)));
+    assert(codexPreemptSpawns.length === 2,
+      `Codex preemptive compact should spawn compact+replay = 2 processes (got ${codexPreemptSpawns.length})`);
 
     fs.appendFileSync(codexFixture.rolloutPath, [
       JSON.stringify({
