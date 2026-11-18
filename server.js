@@ -5698,18 +5698,25 @@ async function handleMessage(ws, msg, options = {}) {
       });
     }
   }
+  const dir = runDir(currentSessionId);
+  fs.mkdirSync(dir, { recursive: true });
   const spawnSpec = isClaudeSession(session)
-    ? buildClaudeSpawnSpec(session, { attachments: resolvedAttachments })
+    ? buildClaudeSpawnSpec(session, {
+      attachments: resolvedAttachments,
+      settingsPath: path.join(dir, 'claude-settings.json'),
+    })
     : buildCodexSpawnSpec(session, { attachments: resolvedAttachments });
   if (spawnSpec?.error) {
+    cleanRunDir(currentSessionId);
     return wsSend(ws, { type: 'error', message: spawnSpec.error });
+  }
+  if (spawnSpec.settingsEnv) {
+    fs.writeFileSync(spawnSpec.settingsPath, JSON.stringify({ env: spawnSpec.settingsEnv }), { mode: 0o600 });
+    try { fs.chmodSync(spawnSpec.settingsPath, 0o600); } catch {}
   }
   saveSession(session);
 
   // === Detached process with file-based I/O ===
-  const dir = runDir(currentSessionId);
-  fs.mkdirSync(dir, { recursive: true });
-
   const inputPath = path.join(dir, 'input.txt');
   const outputPath = path.join(dir, 'output.jsonl');
   const errorPath = path.join(dir, 'error.log');

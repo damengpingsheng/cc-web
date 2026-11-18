@@ -662,6 +662,8 @@ function testCodexGatewayHeaderCases() {
   const providerOverride = spec.args.find((arg) => arg.startsWith('model_providers.ccweb_gateway={'));
   assert(providerOverride, 'Codex gateway provider must be passed as one TOML table');
   assert(providerOverride.includes('base_url="http://127.0.0.1:8799/llmproxy/v1"'), 'Codex proxy llmproxy route must use the managed proxy base URL');
+  assert(providerOverride.includes('env_key="LLMPROXY_API_KEY"'),
+    'Codex proxy llmproxy route must read the route-specific key, not the shared OPENAI_API_KEY');
   assert(providerOverride.includes('env_http_headers={"X-LiteLLM-End-User-Id"="CODEX_LITELLM_END_USER_ID",'),
     'Codex localproxy provider must send the LiteLLM end-user header from the injected environment');
   assert(providerOverride.includes('"X-Client-Hostname"="CODEX_CLIENT_HOSTNAME"}'),
@@ -670,7 +672,6 @@ function testCodexGatewayHeaderCases() {
     'Codex gateway provider must disable remote compaction: name="OpenAI" would otherwise trip the proxy on compaction_trigger');
   assert(spec.env.CODEX_LITELLM_END_USER_ID === 'huxiaojie', 'Codex child process must receive the end-user environment');
   assert(spec.env.CODEX_CLIENT_HOSTNAME === 'test-host', 'Codex child process must receive the client-hostname environment');
-  assert(spec.env.OPENAI_API_KEY === 'llmproxy-key', 'Codex proxy route must still inject the selected upstream key');
   assert(spec.codexProvider === 'ccweb_gateway', 'A new Codex thread must use the ccweb_gateway provider identity');
 
   const direct = runtime.buildCodexSpawnSpec({
@@ -678,8 +679,25 @@ function testCodexGatewayHeaderCases() {
   });
   const directProvider = direct.args.find((arg) => arg.startsWith('model_providers.ccweb_gateway={'));
   assert(directProvider.includes('base_url="https://apirouter.example/v1"'), 'Codex direct route must bypass the proxy');
-  assert(direct.env.OPENAI_API_KEY === 'apirouter-key', 'Codex direct route must use the apirouter key');
+  assert(directProvider.includes('env_key="APIROUTER_API_KEY"'),
+    'Codex direct apirouter route must read APIROUTER_API_KEY even when the CLI wrapper reloads shared env');
   assert(!direct.args.join(' ').includes('127.0.0.1:8799'), 'Codex direct route must not reference the proxy');
+
+  const proxyApiRouter = runtime.buildCodexSpawnSpec({
+    model: 'gpt-6-astra', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'proxy-apirouter',
+  });
+  const proxyApiRouterProvider = proxyApiRouter.args.find((arg) => arg.startsWith('model_providers.ccweb_gateway={'));
+  assert(proxyApiRouterProvider.includes('base_url="http://127.0.0.1:8799/apirouter/v1"')
+    && proxyApiRouterProvider.includes('env_key="APIROUTER_API_KEY"'),
+  'Codex new proxy-apirouter threads must use the APIRouter path and route-specific key');
+
+  const directLlmproxy = runtime.buildCodexSpawnSpec({
+    model: 'gpt-6-astra', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'direct-llmproxy',
+  });
+  const directLlmproxyProvider = directLlmproxy.args.find((arg) => arg.startsWith('model_providers.ccweb_gateway={'));
+  assert(directLlmproxyProvider.includes('base_url="https://llmproxy.example/v1"')
+    && directLlmproxyProvider.includes('env_key="LLMPROXY_API_KEY"'),
+  'Codex direct-llmproxy threads must use the LLMProxy base URL and route-specific key');
 
   runtimeThreadId = 'legacy-localproxy-thread';
   const resumedProxy = runtime.buildCodexSpawnSpec({
@@ -704,12 +722,39 @@ function testCodexGatewayHeaderCases() {
   assert(resumedDirectOverride?.includes('base_url="https://apirouter.example/v1"'),
     'A resumed thread direct route must update base_url without renaming the provider');
 
-  const claudeProxy = runtime.buildClaudeSpawnSpec({ model: 'claude-opus', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'proxy-apirouter' });
+  const claudeProxySettingsPath = '/tmp/cc-web-claude-proxy-settings.json';
+  const claudeProxy = runtime.buildClaudeSpawnSpec(
+    { model: 'claude-opus', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'proxy-apirouter' },
+    { settingsPath: claudeProxySettingsPath },
+  );
   assert(claudeProxy.env.ANTHROPIC_BASE_URL === 'http://127.0.0.1:8799/apirouter', 'Claude proxy route must use the selected proxy path');
   assert(claudeProxy.env.ANTHROPIC_AUTH_TOKEN === 'apirouter-token', 'Claude proxy route must use the selected upstream token');
-  const claudeDirect = runtime.buildClaudeSpawnSpec({ model: 'claude-opus', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'direct-llmproxy' });
+  assert(claudeProxy.args[claudeProxy.args.indexOf('--settings') + 1] === claudeProxySettingsPath,
+    'Claude --settings must reference a private file instead of embedding credentials in argv');
+  assert(!claudeProxy.args.join(' ').includes('apirouter-token'),
+    'Claude auth token must never be exposed through process arguments or spawn logs');
+  const claudeProxySettings = claudeProxy.settingsEnv;
+  assert(claudeProxySettings.ANTHROPIC_BASE_URL === 'http://127.0.0.1:8799/apirouter',
+    'Claude proxy settings must override the wrapper login environment base URL');
+  assert(claudeProxySettings.ANTHROPIC_AUTH_TOKEN === 'apirouter-token',
+    'Claude proxy settings must override the wrapper login environment token');
+  assert(claudeProxySettings.ANTHROPIC_CUSTOM_HEADERS.includes('X-LiteLLM-End-User-Id: huxiaojie'),
+    'Claude route settings must preserve the LiteLLM end-user header');
+  assert(claudeProxySettings.ANTHROPIC_CUSTOM_HEADERS.includes('X-Client-Hostname: test-host'),
+    'Claude route settings must preserve the client hostname header');
+  const claudeDirectSettingsPath = '/tmp/cc-web-claude-direct-settings.json';
+  const claudeDirect = runtime.buildClaudeSpawnSpec(
+    { model: 'claude-opus', permissionMode: 'yolo', cwd: '/tmp', codexGateway: 'direct-llmproxy' },
+    { settingsPath: claudeDirectSettingsPath },
+  );
   assert(claudeDirect.env.ANTHROPIC_BASE_URL === 'https://llmproxy.example', 'Claude direct route must bypass the proxy');
   assert(claudeDirect.env.ANTHROPIC_AUTH_TOKEN === 'llmproxy-token', 'Claude direct route must use the llmproxy token');
+  assert(claudeDirect.args[claudeDirect.args.indexOf('--settings') + 1] === claudeDirectSettingsPath,
+    'Claude direct route --settings must reference its private settings file');
+  const claudeDirectSettings = claudeDirect.settingsEnv;
+  assert(claudeDirectSettings.ANTHROPIC_BASE_URL === 'https://llmproxy.example'
+    && claudeDirectSettings.ANTHROPIC_AUTH_TOKEN === 'llmproxy-token',
+  'Claude direct llmproxy settings must match the selected route');
   console.log('Gateway runtime checks passed.');
 }
 
@@ -734,6 +779,159 @@ async function testCodexProxyManager() {
   });
   assert(await external.ensureReady() === 'http://127.0.0.1:8787', 'Compatible external proxy must be reused');
   assert(external.status().managed === false, 'Reused external proxy must not be marked as owned');
+
+  let externalAlive = true;
+  let ownedStarted = false;
+  let takeoverAttempts = 0;
+  const takeoverLogs = [];
+  const takeoverPort = await getFreePort();
+  const takeover = createCodexProxyManager({
+    port: takeoverPort,
+    proxyPath: path.join(REPO_DIR, 'lib', 'gateway-routing.js'),
+    logsDir: os.tmpdir(),
+    spawnImpl: () => {
+      takeoverAttempts += 1;
+      ownedStarted = true;
+      const replacement = new (require('events').EventEmitter)();
+      replacement.pid = 4244;
+      replacement.exitCode = null;
+      return replacement;
+    },
+    portAvailableImpl: async () => true,
+    healthImpl: async (port) => {
+      if (port !== takeoverPort) return { status: 0 };
+      if (!externalAlive) await sleep(20);
+      return externalAlive || ownedStarted ? compatibleHealth : { status: 0 };
+    },
+    log: (level, event, detail) => takeoverLogs.push({ level, event, detail }),
+    resolveUpstreams: () => ({ apirouter: 'https://api.example/v1', llmproxy: 'https://llm.example/v1' }),
+    healthCheckIntervalMs: 10,
+    externalFailureThreshold: 2,
+    takeoverTimeoutMs: 300,
+  });
+  assert(await takeover.ensureReady() === `http://127.0.0.1:${takeoverPort}`,
+    'External proxy must still be reused before takeover');
+  await sleep(50);
+  assert(takeoverAttempts === 0, 'A healthy reused proxy must not be replaced');
+  externalAlive = false;
+  const takeoverDeadline = Date.now() + 1500;
+  while (!takeover.status().managed && Date.now() < takeoverDeadline) await sleep(20);
+  assert(takeover.status().managed === true,
+    'CC-Web must take over a vanished external proxy so an already-running CLI can reconnect');
+  assert(takeover.status().port === takeoverPort,
+    'External proxy takeover must reuse the original port instead of moving to a nearby one');
+  assert(takeoverAttempts === 1, 'External proxy takeover must start exactly one owned process');
+  assert(takeoverLogs.filter((entry) => entry.event === 'codex_proxy_external_missing').length === 1,
+    'Concurrent health checks must schedule exactly one external proxy takeover');
+  takeover.stop();
+
+  let flapping = false;
+  let flappingStarts = 0;
+  const flappingPort = await getFreePort();
+  const flappingManager = createCodexProxyManager({
+    port: flappingPort,
+    proxyPath: path.join(REPO_DIR, 'lib', 'gateway-routing.js'),
+    logsDir: os.tmpdir(),
+    spawnImpl: () => {
+      flappingStarts += 1;
+      const replacement = new (require('events').EventEmitter)();
+      replacement.pid = 4245;
+      replacement.exitCode = null;
+      return replacement;
+    },
+    portAvailableImpl: async () => true,
+    healthImpl: async () => (flapping ? { status: 0 } : compatibleHealth),
+    resolveUpstreams: () => ({ apirouter: 'https://api.example/v1', llmproxy: 'https://llm.example/v1' }),
+    healthCheckIntervalMs: 10,
+    externalFailureThreshold: 2,
+  });
+  assert(await flappingManager.ensureReady() === `http://127.0.0.1:${flappingPort}`,
+    'Flapping test must begin by reusing the external proxy');
+  flapping = true;
+  await sleep(25);
+  flapping = false;
+  await sleep(100);
+  assert(flappingStarts === 0, 'A transient external health failure must not replace a recovered proxy');
+  flappingManager.stop();
+
+  let fallbackHealthPort = null;
+  let fallbackHealthUp = false;
+  let fallbackSpawned = false;
+  let fallbackExternalAlive = true;
+  const fallbackPort = await getFreePort();
+  const fallbackManager = createCodexProxyManager({
+    port: fallbackPort,
+    proxyPath: path.join(REPO_DIR, 'lib', 'gateway-routing.js'),
+    logsDir: os.tmpdir(),
+    spawnImpl: () => {
+      fallbackSpawned = true;
+      const replacement = new (require('events').EventEmitter)();
+      replacement.pid = 4246;
+      replacement.exitCode = null;
+      return replacement;
+    },
+    portAvailableImpl: async (port) => port !== fallbackPort,
+    healthImpl: async (port) => {
+      if (port === fallbackPort && fallbackExternalAlive && !fallbackSpawned) return compatibleHealth;
+      return fallbackHealthUp && port === fallbackHealthPort ? compatibleHealth : { status: 0 };
+    },
+    resolveUpstreams: () => ({ apirouter: 'https://api.example/v1', llmproxy: 'https://llm.example/v1' }),
+    healthCheckIntervalMs: 10,
+    externalFailureThreshold: 2,
+    takeoverTimeoutMs: 100,
+  });
+  assert(await fallbackManager.ensureReady() === `http://127.0.0.1:${fallbackPort}`,
+    'Fallback test must begin by reusing the external proxy');
+  fallbackExternalAlive = false;
+  fallbackHealthPort = await getFreePort();
+  fallbackHealthUp = true;
+  const fallbackDeadline = Date.now() + 1500;
+  while (!fallbackManager.status().managed && Date.now() < fallbackDeadline) await sleep(20);
+  assert(fallbackManager.status().managed === true,
+    'A taken-over proxy must recover on a nearby port when another process occupies the preferred port');
+  assert(fallbackManager.status().port !== fallbackPort,
+    'Busy-port fallback must use a different port');
+  fallbackManager.stop();
+
+  let interruptedFallbackSpawned = false;
+  let interruptedExternalAlive = true;
+  const interruptedLogs = [];
+  const interruptedPort = await getFreePort();
+  const interruptedManager = createCodexProxyManager({
+    port: interruptedPort,
+    proxyPath: path.join(REPO_DIR, 'lib', 'gateway-routing.js'),
+    logsDir: os.tmpdir(),
+    spawnImpl: () => {
+      interruptedFallbackSpawned = true;
+      const replacement = new (require('events').EventEmitter)();
+      replacement.pid = 4247;
+      replacement.exitCode = null;
+      return replacement;
+    },
+    portAvailableImpl: async (port) => port !== interruptedPort,
+    healthImpl: async (port) => {
+      if (port === interruptedPort && interruptedExternalAlive && !interruptedFallbackSpawned) {
+        return compatibleHealth;
+      }
+      return { status: 0 };
+    },
+    log: (level, event, detail) => interruptedLogs.push({ level, event, detail }),
+    resolveUpstreams: () => ({ apirouter: 'https://api.example/v1', llmproxy: 'https://llm.example/v1' }),
+    healthCheckIntervalMs: 10,
+    externalFailureThreshold: 2,
+    takeoverTimeoutMs: 50,
+    startupTimeoutMs: 500,
+  });
+  assert(await interruptedManager.ensureReady() === `http://127.0.0.1:${interruptedPort}`,
+    'Interrupted fallback test must begin by reusing the external proxy');
+  interruptedExternalAlive = false;
+  const interruptedDeadline = Date.now() + 1000;
+  while (!interruptedFallbackSpawned && Date.now() < interruptedDeadline) await sleep(10);
+  assert(interruptedFallbackSpawned, 'Interrupted fallback test must reach the nearby-port spawn');
+  interruptedManager.stop();
+  await sleep(100);
+  assert(!interruptedLogs.some((entry) => entry.event === 'codex_proxy_takeover_failed'),
+    'Stopping during nearby-port fallback must not report a takeover failure');
 
   const fakeChild = new (require('events').EventEmitter)();
   fakeChild.pid = 4242;
