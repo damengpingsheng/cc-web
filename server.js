@@ -47,6 +47,7 @@ const { createCodexProxyManager } = require('./lib/codex-proxy-manager');
 const {
   normalizeGateway,
   gatewayParts,
+  gatewayLabel,
 } = require('./lib/gateway-routing');
 const {
   mergeCodexHistoryByUserTurn,
@@ -790,10 +791,13 @@ let MODEL_MAP = {
 // claude CLI 的 --effort 合法取值（来源：claude --help，传错值时 CLI 也会回显这份列表）
 const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-// 网关模型列表缓存。/v1/models 是标准端点，但仍可能不可用（离线、
-// 第三方中转未实现），失败时回落到 MODEL_MAP 的别名，不阻塞 /model。
+// 网关模型列表缓存按上游分开。同一模型不一定同时存在于 APIRouter 和
+// llmproxy；不能用 ~/.claude/settings.json 当前指向的网关替代会话实际路由。
 const GATEWAY_MODELS_TTL_MS = 5 * 60 * 1000;
-let gatewayModelsCache = { models: null, ts: 0 };
+const gatewayModelsCache = {
+  apirouter: { models: null, ts: 0 },
+  llmproxy: { models: null, ts: 0 },
+};
 
 // 非对话模型（向量/重排/OCR）不能用于 -p 会话，从候选列表里剔除
 const NON_CHAT_MODEL_RE = /(embedding|reranker|rerank|ocr)/i;
@@ -933,7 +937,7 @@ async function loadCodexModelOptions() {
   const catalog = readCodexModelCatalog();
   if (catalog.length > 0) return catalog;
   const localModel = String(readCodexLocalConfigSnapshot().config.model || '').trim();
-  const gateway = await fetchGatewayModels();
+  const gateway = await fetchGatewayModels('llmproxy');
   // Codex CLI 走 OpenAI Responses 协议，网关里只有 gpt 系列能直接用
   const usable = (gateway || []).filter((id) => /^gpt-/i.test(id));
   return normalizeCodexModelList([localModel, ...usable]).map((id) => ({
@@ -1362,19 +1366,6 @@ function applyCustomTemplateToSettings(tpl) {
   }
 }
 
-// 解析查询网关所需的凭据。优先级与 claude CLI 一致：
-// settings.json 的 env 块覆盖进程环境变量。
-function resolveGatewayCreds() {
-  let settingsEnv = {};
-  try {
-    settingsEnv = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')).env || {};
-  } catch {}
-  const base = settingsEnv.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL || '';
-  const token = settingsEnv.ANTHROPIC_AUTH_TOKEN || settingsEnv.ANTHROPIC_API_KEY
-    || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY || '';
-  return { base: base.replace(/\/+$/, ''), token };
-}
-
 const gatewayEnv = createGatewayEnvResolver({ env: process.env });
 const codexProxyManager = createCodexProxyManager({
   port: CODEX_PROXY_PORT,
@@ -1486,13 +1477,17 @@ function loadClaudePickerModels() {
   }
 }
 
-// 从网关拉取可用模型列表。返回 null 表示不可用，调用方需回落到 MODEL_MAP。
-async function fetchGatewayModels() {
+// 从指定上游拉取可用模型列表。返回 null 表示不可用；未知结果不能当作
+// “模型不存在”，调用方应放行，并在 spawn 时继续使用该上游的配置。
+async function fetchGatewayModels(upstream, { force = false } = {}) {
+  const target = upstream === 'llmproxy' ? 'llmproxy' : 'apirouter';
   const now = Date.now();
-  if (gatewayModelsCache.models && now - gatewayModelsCache.ts < GATEWAY_MODELS_TTL_MS) {
-    return gatewayModelsCache.models;
+  const cache = gatewayModelsCache[target];
+  if (!force && cache.models && now - cache.ts < GATEWAY_MODELS_TTL_MS) {
+    return cache.models;
   }
-  const { base, token } = resolveGatewayCreds();
+  const { baseUrl, apiKey: token } = gatewayEnv.resolveGateway(target);
+  const base = baseUrl.replace(/\/v1$/i, '').replace(/\/+$/, '');
   if (!base || !token) return null;
   try {
     const ac = new AbortController();
@@ -1518,14 +1513,60 @@ async function fetchGatewayModels() {
       const cb = b.startsWith('claude-') ? 0 : 1;
       return ca !== cb ? ca - cb : a.localeCompare(b);
     });
-    gatewayModelsCache = { models: ids, ts: now };
-    plog('INFO', 'gateway_models_fetched', { count: ids.length });
+    gatewayModelsCache[target] = { models: ids, ts: now };
+    plog('INFO', 'gateway_models_fetched', { upstream: target, count: ids.length });
     return ids;
   } catch (e) {
     // 不缓存失败结果，下次调用可重试
-    plog('WARN', 'gateway_models_failed', { error: e.message });
+    plog('WARN', 'gateway_models_failed', { upstream: target, error: e.message });
     return null;
   }
+}
+
+function resolveClaudeRoute(session) {
+  return gatewayParts(session?.codexGateway || loadCodexConfig().gateway);
+}
+
+function gatewayModelMatches(model, models) {
+  if (!models) return false;
+  const candidates = [model, model.replace(/\[1m\]$/i, '')];
+  return candidates.some((candidate) => models.includes(candidate));
+}
+
+function isClaudePickerModel(model) {
+  const baseModel = model.replace(/\[1m\]$/i, '');
+  return loadClaudePickerModels().some((option) => (
+    option.value === model || option.value.replace(/\[1m\]$/i, '') === baseModel
+  ));
+}
+
+function claudeRouteSwitchHint(upstream) {
+  return `请把本会话网关切换为“代理走 ${upstream}”或“直连 ${upstream}”。`;
+}
+
+// Claude Code sends session.model unchanged.  Reject only when the selected
+// upstream returned a real model list and the model is absent from it; a
+// failed lookup must not block an otherwise working request.
+async function validateClaudeModelForRoute(session, model = session?.model) {
+  if (!isClaudeSession(session) || !model) return { ok: true };
+  const route = resolveClaudeRoute(session);
+  const models = await fetchGatewayModels(route.upstream);
+  if (!models) return { ok: true, route, models, unknown: true };
+  if (gatewayModelMatches(model, models) || isClaudePickerModel(model)) {
+    return { ok: true, route, models };
+  }
+  const alternateUpstream = route.upstream === 'apirouter' ? 'llmproxy' : 'apirouter';
+  const alternateModels = await fetchGatewayModels(alternateUpstream);
+  const alternateHint = gatewayModelMatches(model, alternateModels)
+    ? `该模型在 ${alternateUpstream} 中可用；${claudeRouteSwitchHint(alternateUpstream)}`
+    : '请检查模型名，或先切换模型。';
+  return {
+    ok: false,
+    route,
+    models,
+    message: `模型 ${model} 不在当前路由“${gatewayLabel(route.gateway)}”的 ${route.upstream} 模型列表中。\n`
+      + alternateHint,
+  };
 }
 
 function applyModelConfig() {
@@ -4515,7 +4556,7 @@ async function handleListModels(ws) {
   // slots on every request so /model never shows the startup snapshot.
   applyModelConfig();
   const picker = loadClaudePickerModels();
-  const gateway = picker.length > 0 ? null : await fetchGatewayModels();
+  const gateway = picker.length > 0 ? null : await fetchGatewayModels('llmproxy');
   const codexModels = await loadCodexModelOptions();
   // 槽位对应的真实模型名，去掉 [1m] 后缀，与终端 /model 的显示口径一致
   const aliasModels = {};
@@ -4672,7 +4713,7 @@ function handleFetchModels(ws, msg) {
  * @param {string} sessionId
  * @param {'claude'|'codex'} fallbackAgent - session 不存在时的回退 agent
  */
-function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
+async function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
   let session = sessionId ? loadSession(sessionId) : null;
@@ -4786,20 +4827,20 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       } else {
         const modelKey = modelInput.toLowerCase();
         const aliased = MODEL_MAP[modelKey];
-        // 别名优先；否则按 settings.json 登记项或网关模型名处理。
-        // 网关列表已缓存时校验，未缓存则放行，避免因网关暂时不可达而卡住切换。
-        let model = aliased;
-        if (!model) {
-          const cached = gatewayModelsCache.models;
-          const picker = loadClaudePickerModels().map((o) => o.value);
-          if (!picker.includes(modelInput) && cached && !cached.includes(modelInput)) {
-            wsSend(ws, {
-              type: 'system_message',
-              message: `无效模型: ${modelInput}\n别名: ${Object.keys(MODEL_MAP).join(', ')}\n或直接输入 /model 打开选择器查看网关可用模型`,
-            });
-            break;
-          }
-          model = modelInput;
+        // 别名也要按解析后的真实模型校验，避免切换成功后才在上游报
+        // model_not_found。网关列表不可用时放行，避免暂时不可达阻塞切换。
+        const model = aliased || modelInput;
+        const modelCheck = await validateClaudeModelForRoute(session, model);
+        if (!modelCheck.ok) {
+          const aliasPrefix = aliased ? `别名 ${modelKey} 对应模型 ${model}。\n` : '';
+          wsSend(ws, { type: 'system_message', message: aliasPrefix + modelCheck.message });
+          break;
+        }
+        if (modelCheck.unknown && !isClaudePickerModel(model)) {
+          wsSend(ws, {
+            type: 'system_message',
+            message: `暂时无法从 ${modelCheck.route.upstream} 获取模型列表，无法确认 ${model} 是否可用。本次仍按该模型设置；若上游返回 model_not_found，请切换网关或模型。`,
+          });
         }
         // 可选的第二个参数：effort，实现一次性设定模型与思考强度。
         // 'default' 是清除哨兵，表示不传 --effort、交回 CLI 默认。
@@ -5442,10 +5483,13 @@ function handleDeleteSession(ws, sessionId) {
 // 会话内切网关：只改 session.codexGateway。spawn 侧本来就是「会话级优先、缺省回落全局配置」
 // 现读现用，所以下一轮（含 resume 轮）即生效，既不换 CODEX_HOME 也不动 thread id。
 // 不碰 session.updated：这是配置项不是内容变更，与 save_codex_config 同一口径。
-function handleSetSessionGateway(ws, sessionId, gateway) {
+async function handleSetSessionGateway(ws, sessionId, gateway) {
   const session = sessionId ? loadSession(sessionId) : null;
   if (!session) return wsSend(ws, { type: 'error', message: '会话不存在，无法切换网关' });
-  session.codexGateway = normalizeGateway(gateway);
+  const nextGateway = normalizeGateway(gateway);
+  const check = await validateClaudeModelForRoute({ ...session, codexGateway: nextGateway });
+  if (!check.ok) return wsSend(ws, { type: 'error', message: check.message });
+  session.codexGateway = nextGateway;
   saveSession(session);
   wsSend(ws, { type: 'session_gateway', sessionId: session.id, codexGateway: session.codexGateway });
 }
@@ -5605,6 +5649,19 @@ async function handleMessage(ws, msg, options = {}) {
 
   if (mode && ['default', 'plan', 'yolo'].includes(mode)) {
     session.permissionMode = mode;
+  }
+
+  if (isClaudeSession(session)) {
+    const modelCheck = await validateClaudeModelForRoute(session);
+    if (!modelCheck.ok) {
+      plog('WARN', 'claude_model_route_mismatch', {
+        sessionId: session.id.slice(0, 8),
+        model: session.model,
+        gateway: modelCheck.route.gateway,
+        upstream: modelCheck.route.upstream,
+      });
+      return wsSend(ws, { type: 'error', message: modelCheck.message });
+    }
   }
 
   // Claude 的 runtime ID 只是原生 transcript 的 resume 句柄。transcript 被 CLI

@@ -1247,7 +1247,16 @@ async function withServer(env, fn) {
     //     会让 [1m] 后缀相关断言随环境时好时坏。
     //   HOST —— 仓库 .env 里的 HOST 会被 server.js 读走，绑到对外网卡后下面所有
     //     127.0.0.1 的连接都是 ECONNREFUSED；waitForPort 只看端口不看地址，抓不到。
-    env: { ...process.env, CLAUDE_CODE_DISABLE_1M_CONTEXT: '', HOST: '127.0.0.1', ...env },
+    env: {
+      ...process.env,
+      CLAUDE_CODE_DISABLE_1M_CONTEXT: '',
+      APIROUTER_BASE_URL: 'http://127.0.0.1:1/v1',
+      APIROUTER_API_KEY: 'regression-apirouter-key',
+      LLMPROXY_BASE_URL: 'http://127.0.0.1:1/v1',
+      LLMPROXY_API_KEY: 'regression-llmproxy-key',
+      HOST: '127.0.0.1',
+      ...env,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
