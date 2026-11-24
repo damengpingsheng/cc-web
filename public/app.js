@@ -6865,10 +6865,21 @@
     });
   }
 
+  // 标题被省略号截断时才挂原生 title，悬停可看完整标题。
+  chatTitle.addEventListener('mouseenter', () => {
+    if (chatTitle.contentEditable === 'true') return;
+    if (chatTitle.scrollWidth > chatTitle.clientWidth + 1) {
+      chatTitle.title = chatTitle.textContent;
+    } else {
+      chatTitle.removeAttribute('title');
+    }
+  });
+
   // --- Header title editing (contenteditable) ---
   chatTitle.addEventListener('click', () => {
     if (!currentSessionId || chatTitle.contentEditable === 'true') return;
     const originalText = chatTitle.textContent;
+    chatTitle.removeAttribute('title');
     chatTitle.contentEditable = 'true';
     chatTitle.style.background = '#fff';
     chatTitle.style.outline = '1px solid var(--accent)';
