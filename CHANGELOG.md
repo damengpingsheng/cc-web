@@ -8,6 +8,26 @@
 
 ---
 
+## 分叉 v1.5.60
+
+### 修复
+
+llmproxy 与 APIRouter 额度胶囊在刷新失败时保留最后一次成功数据，不再把全部明细覆盖成“暂不可用”。两套统计都会持久化最后一次成功快照，服务重启后先显示上次数据并在后台刷新。llmproxy 后续只补拉最近变化并按 `request_id` 去重，避免每次从 2000 年开始扫描全部分页；APIRouter 的定时刷新改为使用服务端缓存，遇到 429 时按 `Retry-After` 退避。
+
+### 验证
+
+- llmproxy 单测覆盖快照恢复、增量合并、重叠请求去重、跨多月空档以及日/月累计重置。
+- 真实 llmproxy 验证首轮全量 7908 条约 258 秒并落盘快照，第二次增量约 31 秒；两次历史调用数均为 7908，没有重复计数。
+- APIRouter 单测覆盖快照恢复、强制刷新仍受失败退避约束、`Retry-After` 解析以及缓存旧数据回退。
+- `node --check` 覆盖 `server.js`、`public/app.js`、两个 usage collector 和 `scripts/regression.js`；`git diff --check` 与全量 `npm run regression` 通过。
+
+### 生效前提
+
+- 本次包含 `server.js` 与 `lib/` 改动，需要重启 cc-web 服务进程并刷新页面。
+- 前端静态资源 `?v=` 已打到 `1.5.1-my.78`。
+
+---
+
 ## 分叉 v1.5.59
 
 ### 新增

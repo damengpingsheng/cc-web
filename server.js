@@ -86,6 +86,8 @@ const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const CODEX_CONFIG_PATH = path.join(CONFIG_DIR, 'codex.json');
 const LLMPROXY_USAGE_CONFIG_PATH = path.join(CONFIG_DIR, 'llmproxy-usage.json');
 const APIROUTER_USAGE_CONFIG_PATH = path.join(CONFIG_DIR, 'apirouter-usage.json');
+const LLMPROXY_USAGE_SNAPSHOT_PATH = path.join(CONFIG_DIR, 'llmproxy-usage-snapshot.json');
+const APIROUTER_USAGE_SNAPSHOT_PATH = path.join(CONFIG_DIR, 'apirouter-usage-snapshot.json');
 const BANNED_IPS_PATH = path.join(CONFIG_DIR, 'banned_ips.json');
 const GROUPS_CONFIG_PATH = path.join(CONFIG_DIR, 'groups.json');
 const JIRA_BASE_URL = (process.env.JIRA_BASE_URL || 'https://jira.aixin-chip.com').replace(/\/+$/, '');
@@ -1391,6 +1393,7 @@ function loadLlmproxyUsageConfig() {
 
 const llmproxyUsageCollector = createUsageCollector({
   cacheTtlMs: LLMPROXY_USAGE_REFRESH_MS,
+  snapshotPath: LLMPROXY_USAGE_SNAPSHOT_PATH,
 });
 
 function loadApirouterUsageConfig() {
@@ -1404,6 +1407,7 @@ function loadApirouterUsageConfig() {
 
 const apirouterUsageCollector = createApirouterUsageCollector({
   cacheTtlMs: APIROUTER_USAGE_REFRESH_MS,
+  snapshotPath: APIROUTER_USAGE_SNAPSHOT_PATH,
 });
 
 function resolveCodexGatewayEnv(gateway) {
@@ -1426,6 +1430,16 @@ async function refreshLlmproxyUsage(force = false) {
       : { ...payload, type: 'llmproxy_usage' };
   } catch (error) {
     plog('WARN', 'llmproxy_usage_failed', { error: error?.message || String(error) });
+    const cached = llmproxyUsageCollector.getCached(loadLlmproxyUsageConfig());
+    if (cached) {
+      return {
+        ...cached,
+        type: 'llmproxy_usage',
+        ok: true,
+        stale: true,
+        warning: 'llmproxy 刷新失败，显示上次成功数据',
+      };
+    }
     return {
       type: 'llmproxy_usage',
       ok: false,
@@ -1444,6 +1458,16 @@ async function refreshApirouterUsage(force = false) {
   } catch (error) {
     const detail = error?.message || String(error);
     plog('WARN', 'apirouter_usage_failed', { error: detail });
+    const cached = apirouterUsageCollector.getCached(loadApirouterUsageConfig());
+    if (cached) {
+      return {
+        ...cached,
+        type: 'apirouter_usage',
+        ok: true,
+        stale: true,
+        warning: 'APIRouter 刷新失败，显示上次成功数据',
+      };
+    }
     return {
       type: 'apirouter_usage',
       ok: false,
@@ -4109,16 +4133,18 @@ wss.on('connection', (ws, req) => {
         wsSend(ws, { type: 'auth_result', success: true, token: authToken, mustChangePassword: !!authConfig.mustChange });
         sendGroupList(ws);
         sendSessionList(ws);
-        const cachedUsage = llmproxyUsageCollector.getCached();
+        const cachedUsage = llmproxyUsageCollector.getCached(loadLlmproxyUsageConfig());
         if (cachedUsage) {
           wsSend(ws, { ...cachedUsage, type: 'llmproxy_usage' });
-        } else {
+        }
+        if (!cachedUsage || !llmproxyUsageCollector.isFresh()) {
           refreshLlmproxyUsage().then((usage) => wsSend(ws, usage));
         }
-        const cachedApirouterUsage = apirouterUsageCollector.getCached();
+        const cachedApirouterUsage = apirouterUsageCollector.getCached(loadApirouterUsageConfig());
         if (cachedApirouterUsage) {
           wsSend(ws, { ...cachedApirouterUsage, type: 'apirouter_usage' });
-        } else {
+        }
+        if (!cachedApirouterUsage || !apirouterUsageCollector.isFresh()) {
           refreshApirouterUsage().then((usage) => wsSend(ws, usage));
         }
       } else {

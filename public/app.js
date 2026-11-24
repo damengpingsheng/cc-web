@@ -320,6 +320,8 @@
   const apirouterUsageKey = $('#apirouter-usage-key');
   const apirouterUsageUpdated = $('#apirouter-usage-updated');
   const apirouterUsageRefresh = $('#apirouter-usage-refresh');
+  let llmproxyUsageHasData = false;
+  let apirouterUsageHasData = false;
   const chatModelState = $('#chat-model-state');
   const costDisplay = $('#cost-display');
   const messageQueueEl = $('#message-queue');
@@ -2813,8 +2815,13 @@
   function renderLlmproxyUsage(msg) {
     if (!llmproxyUsage) return;
     llmproxyUsage.hidden = false;
-    llmproxyUsage.classList.remove('warning', 'over-budget');
+    llmproxyUsage.classList.remove('warning', 'over-budget', 'stale');
     if (!msg || msg.ok !== true) {
+      if (llmproxyUsageHasData) {
+        llmproxyUsage.classList.add('stale');
+        llmproxyUsageUpdated.textContent = msg?.message || '刷新失败，显示上次成功数据';
+        return;
+      }
       llmproxyUsagePercent.textContent = '--';
       llmproxyUsageAmount.textContent = msg?.message || '用量暂不可用';
       llmproxyUsageRemaining.textContent = '';
@@ -2844,13 +2851,18 @@
     );
     if (percent >= 100) llmproxyUsage.classList.add('over-budget');
     else if (percent >= 90) llmproxyUsage.classList.add('warning');
+    if (msg.stale) llmproxyUsage.classList.add('stale');
+    llmproxyUsageHasData = true;
     setUsageDetails(llmproxyUsageToday, msg.today);
     setUsageDetails(llmproxyUsageMonth, msg.monthToDate);
     setUsageDetails(llmproxyUsageHistory, msg.history);
     setUsageModels(llmproxyUsageTodayModels, msg.today?.models);
     setUsageModels(llmproxyUsageMonthModels, msg.monthToDate?.models);
     setUsageModels(llmproxyUsageHistoryModels, msg.history?.models);
-    llmproxyUsageUpdated.textContent = `${formatUsageUpdated(msg.updatedAt)} · ${msg.endUser || ''}`;
+    llmproxyUsageUpdated.textContent = [
+      formatUsageUpdated(msg.updatedAt),
+      msg.stale ? (msg.warning || '刷新失败，显示上次成功数据') : (msg.endUser || ''),
+    ].filter(Boolean).join(' · ');
   }
 
   function formatApirouterAmount(value, msg) {
@@ -2867,8 +2879,13 @@
   function renderApirouterUsage(msg) {
     if (!apirouterUsage) return;
     apirouterUsage.hidden = false;
-    apirouterUsage.classList.remove('warning', 'over-budget');
+    apirouterUsage.classList.remove('warning', 'over-budget', 'stale');
     if (!msg || msg.ok !== true) {
+      if (apirouterUsageHasData) {
+        apirouterUsage.classList.add('stale');
+        apirouterUsageUpdated.textContent = msg?.message || '刷新失败，显示上次成功数据';
+        return;
+      }
       apirouterUsagePercent.textContent = '--';
       apirouterUsageAmount.textContent = msg?.message || '用量暂不可用';
       apirouterUsageRemaining.textContent = '';
@@ -2903,6 +2920,8 @@
       apirouterUsageRemaining.textContent = '';
       apirouterUsageFill.style.width = '0%';
     }
+    if (msg.stale) apirouterUsage.classList.add('stale');
+    apirouterUsageHasData = true;
 
     apirouterUsage.setAttribute(
       'aria-label',
@@ -2933,7 +2952,10 @@
       if (Number.isFinite(expires.getTime())) keyText += ` · 到期 ${expires.toLocaleDateString('zh-CN')}`;
     }
     apirouterUsageKey.textContent = keyText;
-    apirouterUsageUpdated.textContent = `${formatUsageUpdated(msg.updatedAt)} · 模型 key`;
+    apirouterUsageUpdated.textContent = [
+      formatUsageUpdated(msg.updatedAt),
+      msg.stale ? (msg.warning || '刷新失败，显示上次成功数据') : '模型 key',
+    ].filter(Boolean).join(' · ');
   }
 
 	  function _splitCodexThinkingModel(model) {
@@ -7704,8 +7726,8 @@
 
   setInterval(() => {
     if (!isWsConnected()) return;
-    send({ type: 'get_llmproxy_usage', force: true });
-    send({ type: 'get_apirouter_usage', force: true });
+    send({ type: 'get_llmproxy_usage' });
+    send({ type: 'get_apirouter_usage' });
   }, LLMPROXY_USAGE_REFRESH_INTERVAL);
 
   if (llmproxyUsageMeter) {

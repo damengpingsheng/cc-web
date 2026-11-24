@@ -73,6 +73,7 @@ const {
 } = require(path.join(REPO_DIR, 'lib', 'llmproxy-usage.js'));
 const {
   createApirouterUsageCollector,
+  parseRetryAfterMs,
 } = require(path.join(REPO_DIR, 'lib', 'apirouter-usage.js'));
 const {
   parseEnvFile,
@@ -369,6 +370,54 @@ async function testLlmproxyUsage() {
   const retryPayload = await retryCollector.refresh(retryConfig);
   assert(retryFetches === 2 && retryPayload.monthToDate.spend === 0, 'llmproxy usage must allow retry after a failed refresh');
 
+  const snapshotRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-llmproxy-snapshot-'));
+  const snapshotPath = path.join(snapshotRoot, 'usage.json');
+  const snapshotRequests = [];
+  let snapshotNow = new Date('2026-11-10T08:50:00Z');
+  const snapshotRows = [
+    { request_id: 'snapshot-1', startTime: '2026-11-10T08:40:00.000Z', model: 'openai/test-model', spend: 2, total_tokens: 10 },
+  ];
+  const snapshotFetch = async (url) => {
+    const parsed = new URL(url);
+    snapshotRequests.push(parsed);
+    const start = Date.parse(`${parsed.searchParams.get('start_date').replace(' ', 'T')}Z`);
+    const end = Date.parse(`${parsed.searchParams.get('end_date').replace(' ', 'T')}Z`);
+    const rows = snapshotRows.filter((row) => {
+      const at = Date.parse(row.startTime);
+      return at >= start && at <= end;
+    });
+    return { ok: true, json: async () => ({ data: rows, total_pages: 1, total_is_capped: false }) };
+  };
+  const snapshotCollector = createUsageCollector({
+    fetchImpl: snapshotFetch,
+    cacheTtlMs: 0,
+    snapshotPath,
+    nowProvider: () => snapshotNow,
+  });
+  const firstSnapshotPayload = await snapshotCollector.refresh(retryConfig);
+  assert(firstSnapshotPayload.history.spend === 2, 'llmproxy snapshot must include the initial history');
+  snapshotNow = new Date('2026-11-10T09:00:00Z');
+  snapshotRows.push({ request_id: 'snapshot-2', startTime: '2026-11-10T08:55:00.000Z', model: 'openai/test-model', spend: 3, total_tokens: 20 });
+  const incrementalPayload = await snapshotCollector.refresh(retryConfig, { force: true });
+  assert(incrementalPayload.history.spend === 5 && incrementalPayload.today.spend === 5, 'llmproxy snapshot must merge new rows incrementally');
+  assert(snapshotRequests.at(-1).searchParams.get('start_date') !== '2000-01-01 00:00:00', 'llmproxy snapshot refresh must not re-read the full history');
+  const restoredCollector = createUsageCollector({ fetchImpl: snapshotFetch, cacheTtlMs: 0, snapshotPath, nowProvider: () => snapshotNow });
+  assert(restoredCollector.getCached()?.history.spend === 5, 'llmproxy snapshot must restore cached history after restart');
+  assert(restoredCollector.isFresh() === false, 'llmproxy disk snapshots must still trigger an in-memory refresh');
+  const dedupedPayload = await restoredCollector.refresh(retryConfig, { force: true });
+  assert(dedupedPayload.history.spend === 5, 'llmproxy incremental overlap must not double-count request ids');
+  snapshotNow = new Date('2026-12-01T00:05:00Z');
+  snapshotRows.push({ request_id: 'snapshot-3', startTime: '2026-12-01T00:01:00.000Z', model: 'openai/test-model', spend: 7, total_tokens: 30 });
+  const rolloverPayload = await restoredCollector.refresh(retryConfig, { force: true });
+  assert(rolloverPayload.history.spend === 12 && rolloverPayload.monthToDate.spend === 7 && rolloverPayload.today.spend === 7, 'llmproxy incremental refresh must dedupe long gaps and reset day/month totals');
+  fs.rmSync(snapshotRoot, { recursive: true, force: true });
+
+  const appSource = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  assert(/setInterval\(\(\) => \{[\s\S]{0,220}send\(\{ type: 'get_llmproxy_usage' \}\);/.test(appSource), 'Periodic llmproxy refresh must use the server cache');
+  assert(/setInterval\(\(\) => \{[\s\S]{0,260}send\(\{ type: 'get_apirouter_usage' \}\);/.test(appSource), 'Periodic APIRouter refresh must use the server cache');
+  assert(/if \(llmproxyUsageHasData\)[\s\S]{0,180}classList\.add\('stale'\)/.test(appSource), 'llmproxy refresh errors must preserve rendered data');
+  assert(/if \(apirouterUsageHasData\)[\s\S]{0,180}classList\.add\('stale'\)/.test(appSource), 'APIRouter refresh errors must preserve rendered data');
+
   const protocolRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-llmproxy-protocol-'));
   const protocolConfigDir = path.join(protocolRoot, 'config');
   const protocolSessionsDir = path.join(protocolRoot, 'sessions');
@@ -555,8 +604,38 @@ async function testApirouterUsage() {
   };
   await failingCollector.refresh(failingConfig).catch(() => {});
   const fetchesAfterFirstRefresh = failureFetches;
-  await failingCollector.refresh(failingConfig).catch(() => {});
-  assert(fetchesAfterFirstRefresh > 0 && failureFetches === fetchesAfterFirstRefresh, 'APIRouter failures must use the short failure cache instead of retrying for every client');
+  await failingCollector.refresh(failingConfig, { force: true }).catch(() => {});
+  assert(fetchesAfterFirstRefresh > 0 && failureFetches === fetchesAfterFirstRefresh, 'APIRouter failures must back off even for forced refreshes');
+  assert(parseRetryAfterMs('120') === 120000, 'APIRouter must parse Retry-After seconds');
+
+  let staleMode = 'ok';
+  const staleCollector = createApirouterUsageCollector({
+    fetchImpl: async (url, options = {}) => {
+      if (staleMode === 'fail') throw new Error('temporary upstream failure');
+      return fetchImpl(url, options);
+    },
+    cacheTtlMs: 0,
+    failureCacheTtlMs: 60 * 1000,
+  });
+  await staleCollector.refresh(failingConfig);
+  staleMode = 'fail';
+  await staleCollector.refresh(failingConfig, { force: true }).catch(() => {});
+  const stalePayload = await staleCollector.refresh(failingConfig, { force: true });
+  assert(stalePayload.ok === true && stalePayload.stale === true && stalePayload.key.name === 'auto_group', 'APIRouter backoff must keep the last successful payload');
+
+  const apiSnapshotRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-apirouter-snapshot-'));
+  const apiSnapshotPath = path.join(apiSnapshotRoot, 'usage.json');
+  const persistedCollector = createApirouterUsageCollector({
+    fetchImpl,
+    cacheTtlMs: 0,
+    snapshotPath: apiSnapshotPath,
+    nowProvider: () => new Date('2026-11-12T09:32:00Z'),
+  });
+  await persistedCollector.refresh(failingConfig);
+  const restoredApirouterCollector = createApirouterUsageCollector({ fetchImpl, cacheTtlMs: 0, snapshotPath: apiSnapshotPath });
+  assert(restoredApirouterCollector.getCached()?.key.name === 'auto_group', 'APIRouter snapshot must restore the last successful payload');
+  assert(restoredApirouterCollector.isFresh() === false, 'APIRouter disk snapshots must still trigger an in-memory refresh');
+  fs.rmSync(apiSnapshotRoot, { recursive: true, force: true });
   console.log('APIRouter usage checks passed.');
 }
 
