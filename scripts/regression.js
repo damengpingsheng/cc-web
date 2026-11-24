@@ -1049,6 +1049,12 @@ async function testPerSessionGatewayRoutes() {
         }));
         const info = await nextMessage(page.messages, page.ws,
           (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.codexGateway === gateway);
+        const listed = await nextMessage(page.messages, page.ws,
+          (msg) => msg.type === 'session_list' && msg.sessions.some((item) => item.id === info.sessionId));
+        const listedSession = listed.sessions.find((item) => item.id === info.sessionId);
+        assert(listedSession.model === (info.model || ''), `session_list must expose model for ${gateway}`);
+        assert(listedSession.effort === (info.effort || ''), `session_list must expose effort for ${gateway}`);
+        assert(listedSession.codexGateway === gateway, `session_list must expose gateway for ${gateway}`);
         pages.push({ ...page, gateway, sessionId: info.sessionId });
       }
 

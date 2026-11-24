@@ -1816,6 +1816,63 @@
     </span>`;
   }
 
+  function getSessionOverviewGateway(session) {
+    if (normalizeAgent(session.agent) === 'claude' && currentClaudeMode === 'custom') {
+      return {
+        label: '自定义模板',
+        title: '该 Claude 会话使用全局自定义模板 endpoint',
+      };
+    }
+    const selected = String(session.codexGateway || codexConfigCache?.gateway || '').trim();
+    const gateway = normalizeGateway(selected);
+    return {
+      label: GATEWAY_LABELS[gateway],
+      title: selected
+        ? `该会话代理选项：${GATEWAY_LABELS[gateway]}`
+        : `该会话未单独指定代理选项，当前跟随全局设置：${GATEWAY_LABELS[gateway]}`,
+    };
+  }
+
+  function getSessionOverviewModel(session) {
+    const agent = normalizeAgent(session.agent);
+    const raw = String(session.model || '').trim();
+    if (!raw) {
+      return {
+        label: '默认模型',
+        title: '该会话未单独选择模型，使用 CLI 默认模型',
+      };
+    }
+    if (agent === 'codex') {
+      const { base, level } = _splitCodexThinkingModel(raw);
+      return {
+        label: base || raw,
+        title: `该会话模型：${base || raw}${level ? `\n思考强度：${level}` : ''}`,
+      };
+    }
+    const alias = modelCatalog?.aliasModels?.[raw];
+    return {
+      label: alias || raw,
+      title: alias ? `该会话模型：${alias}（${raw} 槽位）` : `该会话模型：${raw}`,
+    };
+  }
+
+  function syncSessionOverviewMetadata(sessionId, metadata) {
+    if (!sessionId || !metadata) return;
+    let changed = false;
+    sessions = sessions.map((session) => {
+      if (session.id !== sessionId) return session;
+      const next = { ...session };
+      for (const [key, value] of Object.entries(metadata)) {
+        if (next[key] !== value) {
+          next[key] = value;
+          changed = true;
+        }
+      }
+      return next;
+    });
+    if (changed && sessionOverviewOpen) renderSessionOverview();
+  }
+
   function buildSessionOverviewItem(session) {
     const agent = normalizeAgent(session.agent);
     const agentLabel = AGENT_LABELS[agent];
@@ -1868,6 +1925,8 @@
   function buildSessionOverviewFocusCard(session) {
     const agent = normalizeAgent(session.agent);
     const agentLabel = AGENT_LABELS[agent];
+    const gateway = getSessionOverviewGateway(session);
+    const model = getSessionOverviewModel(session);
     const statuses = [];
     if (session.isRunning) statuses.push('<span class="session-overview-state running"><i></i>运行中</span>');
     if (session.hasUnread) statuses.push('<span class="session-overview-state unread">未读</span>');
@@ -1875,7 +1934,11 @@
     return `
       <button type="button" class="session-overview-focus-card agent-${agent}" data-overview-session-id="${escapeHtml(session.id)}">
         <span class="session-overview-focus-top">
-          <span class="session-overview-agent">${escapeHtml(agentLabel)}</span>
+          <span class="session-overview-focus-identity">
+            <span class="session-overview-agent">${escapeHtml(agentLabel)}</span>
+            <span class="session-overview-focus-gateway" title="${escapeHtml(gateway.title)}">${escapeHtml(gateway.label)}</span>
+            <span class="session-overview-focus-model" title="${escapeHtml(model.title)}">${escapeHtml(model.label)}</span>
+          </span>
           <time datetime="${escapeHtml(session.updated || '')}">${escapeHtml(timeAgo(session.updated))}</time>
         </span>
         <span class="session-overview-focus-title">${escapeHtml(session.title || 'Untitled')}</span>
@@ -3401,6 +3464,7 @@
         updateCachedSession(msg.sessionId, (snapshot) => {
           snapshot.codexGateway = msg.codexGateway || '';
         });
+        syncSessionOverviewMetadata(msg.sessionId, { codexGateway: msg.codexGateway || '' });
         if (msg.sessionId === currentSessionId) {
           currentCodexGateway = msg.codexGateway || '';
           updateGatewayBadge();
@@ -3589,6 +3653,9 @@
               snapshot.model = msg.model;
               if (msg.effort !== undefined) snapshot.effort = msg.effort || '';
             });
+            const metadata = { model: msg.model };
+            if (msg.effort !== undefined) metadata.effort = msg.effort || '';
+            syncSessionOverviewMetadata(currentSessionId, metadata);
           }
           updateModelBadge();
         }
@@ -3598,6 +3665,7 @@
         currentEffort = msg.effort || '';
         if (currentSessionId) {
           updateCachedSession(currentSessionId, (snapshot) => { snapshot.effort = currentEffort; });
+          syncSessionOverviewMetadata(currentSessionId, { effort: currentEffort });
         }
         updateModelBadge();
         break;
@@ -3607,6 +3675,7 @@
         // 目录里的 aliasModels 决定徽标显示真实模型名还是槽位名，
         // 而它通常晚于 session_info 到达（服务端要 await 网关），到手后补刷一次
         updateModelBadge();
+        if (sessionOverviewOpen) renderSessionOverview();
         break;
 
       case 'resume_generating':
@@ -3730,12 +3799,14 @@
       case 'model_config':
         currentClaudeMode = msg.config?.mode === 'custom' ? 'custom' : 'local';
         updateGatewayBadge();
+        if (sessionOverviewOpen) renderSessionOverview();
         if (typeof _onModelConfig === 'function') _onModelConfig(msg.config);
         break;
 
       case 'codex_config':
         codexConfigCache = msg.config || null;
         updateGatewayBadge();
+        if (sessionOverviewOpen) renderSessionOverview();
         if (typeof _onCodexConfig === 'function') _onCodexConfig(msg.config);
         break;
 

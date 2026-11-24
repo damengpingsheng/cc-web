@@ -2717,6 +2717,9 @@ function sendSessionList(ws) {
             // Codex 侧同理：~/.codex/sessions 下 rollout jsonl 的文件名（codex thread id），
             // 侧栏 Codex 会话项的标题下方展示这一行。
             codexThreadId: s.codexThreadId || '',
+            model: sessionModelLabel(s) || '',
+            effort: s.effort || '',
+            codexGateway: s.codexGateway || '',
           };
           sessionSummaryCache.set(f, { mtimeMs: stat.mtimeMs, size: stat.size, summary });
         }

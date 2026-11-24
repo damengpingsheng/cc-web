@@ -3948,7 +3948,39 @@ mark.search-hit.current {
   justify-content: space-between;
   gap: 10px;
 }
+.session-overview-focus-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  overflow: hidden;
+}
+.session-overview-focus-identity .session-overview-agent { flex-shrink: 0; }
+.session-overview-focus-gateway,
+.session-overview-focus-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-overview-focus-gateway {
+  flex-shrink: 1;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--overview-agent-color) 28%, var(--border-color));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--overview-agent-color) 7%, transparent);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+}
+.session-overview-focus-model {
+  flex-shrink: 2;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
 .session-overview-focus-top time {
+  flex-shrink: 0;
   color: var(--text-muted);
   font-size: 10px;
   white-space: nowrap;
