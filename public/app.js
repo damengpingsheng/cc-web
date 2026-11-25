@@ -3043,6 +3043,7 @@
 
   // --- marked config ---
   const PREVIEW_LANGS = new Set(['html', 'svg']);
+  const LINK_TARGET_DATA_ATTR = 'data-cc-link-target';
 
   // 简化 renderer.code：仅输出纯 <pre><code>，按钮/iframe 由 decorateCodeBlocks 在
   // DOMPurify sanitize 之后通过 DOM API 注入（受信任代码不经过 sanitize）。
@@ -3062,6 +3063,15 @@
     return `<pre><code class="hljs language-${escapeHtml(lang)}" data-lang="${escapeHtml(lang)}">${highlighted}</code></pre>`;
   };
   marked.setOptions({ renderer, breaks: true, gfm: true });
+
+  // DOMPurify 会删除 file:/javascript: 等不允许的 href，但在清理属性前把原始目标
+  // 存到无害的 data 属性中，供悬停提示展示。真正的 href 仍然完全交给 DOMPurify 决定。
+  if (typeof DOMPurify !== 'undefined') {
+    DOMPurify.addHook('uponSanitizeElement', (node, data) => {
+      if (data.tagName !== 'a' || !node.hasAttribute('href')) return;
+      node.setAttribute(LINK_TARGET_DATA_ATTR, node.getAttribute('href'));
+    });
+  }
 
   // marked 的内联 del 规则是 /^(~~?)(?=[^\s~])([\s\S]*?[^\s~])\1(?=[^~]|$)/，`~~?` 里的
   // 第二个 `?` 让单个 `~` 也算删除线定界符（GFM 规范只认 `~~`），于是正文里成对出现的
@@ -4139,6 +4149,54 @@
       return escapeHtml(text);
     }
   }
+
+  // 浏览器原生状态栏只显示仍带 href 的链接。危险协议被 DOMPurify 删除 href 后，
+  // 用页面内状态条展示原始目标，但不恢复 href，因此链接仍不可点击。
+  let activeLinkTargetPreview = null;
+  function hideLinkTargetPreview() {
+    activeLinkTargetPreview = null;
+    const preview = document.getElementById('cc-link-target-preview');
+    if (!preview) return;
+    preview.hidden = true;
+    preview.textContent = '';
+  }
+
+  function showLinkTargetPreview(link) {
+    const target = link.getAttribute(LINK_TARGET_DATA_ATTR);
+    if (!target) return;
+    let displayTarget = target;
+    try {
+      displayTarget = decodeURI(target);
+    } catch {}
+    let preview = document.getElementById('cc-link-target-preview');
+    if (!preview) {
+      preview = document.createElement('div');
+      preview.id = 'cc-link-target-preview';
+      preview.className = 'cc-link-target-preview';
+      preview.setAttribute('aria-hidden', 'true');
+      document.body.appendChild(preview);
+    }
+    preview.textContent = displayTarget;
+    preview.hidden = false;
+    activeLinkTargetPreview = link;
+  }
+
+  document.addEventListener('pointerover', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const link = target.closest(`.msg-bubble a[${LINK_TARGET_DATA_ATTR}]`);
+    if (link && !link.hasAttribute('href')) showLinkTargetPreview(link);
+    else hideLinkTargetPreview();
+  });
+
+  document.addEventListener('pointerout', (event) => {
+    if (!activeLinkTargetPreview) return;
+    const related = event.relatedTarget;
+    if (related instanceof Node && activeLinkTargetPreview.contains(related)) return;
+    hideLinkTargetPreview();
+  });
+  document.addEventListener('scroll', hideLinkTargetPreview, true);
+  window.addEventListener('blur', hideLinkTargetPreview);
 
   // 气泡外侧底角的分钟级时间戳。只看 HH:MM 在跨天回看时有歧义，完整时间挂 title。
   function setMsgTimeText(el, date) {
