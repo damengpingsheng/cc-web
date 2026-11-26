@@ -3185,9 +3185,18 @@
     return Promise.resolve(fallbackCopy(text));
   }
 
-  // 在 sanitize 之后通过 DOM API 装饰代码块：Copy/Preview 按钮 + 预览 iframe。
+  // 在 sanitize 之后通过 DOM API 装饰代码块：Wrap/Copy/Preview 按钮 + 预览 iframe。
   // 幂等：每个 pre.ccweb-decorated 跳过，避免流式刷新重复装饰导致 iframe 状态丢失。
   // 闭包捕获当前 code 文本，不再用全局 cid Map（避免流式刷新产生废弃条目）。
+  function setCodeBlockWrapMode(wrapper, enabled) {
+    wrapper.classList.toggle('wrap-off', !enabled);
+    const btn = wrapper.querySelector('.code-wrap-btn');
+    if (!btn) return;
+    btn.textContent = enabled ? 'Wrap: On' : 'Wrap: Off';
+    btn.setAttribute('aria-pressed', String(enabled));
+    btn.title = enabled ? '关闭代码自动换行' : '开启代码自动换行';
+  }
+
   function decorateCodeBlocks(container) {
     if (!container) return;
     const nodes = container.querySelectorAll('pre > code.hljs:not([data-cc-decorated])');
@@ -3208,6 +3217,14 @@
       langLabel.textContent = lang;
       const actions = document.createElement('div');
       actions.className = 'code-block-actions';
+
+      const wrapBtn = document.createElement('button');
+      wrapBtn.type = 'button';
+      wrapBtn.className = 'code-wrap-btn';
+      wrapBtn.addEventListener('click', () => {
+        setCodeBlockWrapMode(wrapper, wrapper.classList.contains('wrap-off'));
+      });
+      actions.appendChild(wrapBtn);
 
       const copyBtn = document.createElement('button');
       copyBtn.type = 'button';
@@ -3260,6 +3277,7 @@
       wrapper.appendChild(header);
       if (previewPane) wrapper.appendChild(previewPane);
       wrapper.appendChild(pre);
+      setCodeBlockWrapMode(wrapper, true);
     });
   }
 
@@ -4202,8 +4220,18 @@
       decorateCodeBlocks(textDiv);
     }
     const tailText = text.slice(st.committed.length);
+    // 流式尾巴会整段重建。先记住每块当前 Wrap 状态，装饰完再恢复，
+    // 避免用户关闭换行后，下一段文本到达就把代码块重新折行。
+    const wrapStates = Array.from(st.tail.querySelectorAll('.code-block-wrapper'))
+      .map((wrapper) => wrapper.classList.contains('wrap-off'));
     st.tail.innerHTML = tailText ? renderMarkdown(tailText) : '';
-    if (tailText) decorateCodeBlocks(st.tail);
+    if (tailText) {
+      decorateCodeBlocks(st.tail);
+      const wrappers = st.tail.querySelectorAll('.code-block-wrapper');
+      if (wrappers.length === wrapStates.length) wrappers.forEach((wrapper, index) => {
+        if (wrapStates[index]) setCodeBlockWrapMode(wrapper, false);
+      });
+    }
   }
 
   // 不变量：marked.parse 输出经 DOMPurify sanitize 后返回。Copy/Preview 按钮 + 预览

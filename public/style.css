@@ -2082,7 +2082,7 @@ mark.search-hit.current {
   gap: 4px;
   align-items: center;
 }
-.code-copy-btn, .code-preview-btn {
+.code-copy-btn, .code-preview-btn, .code-wrap-btn {
   background: none;
   border: none;
   color: #999;
@@ -2091,8 +2091,9 @@ mark.search-hit.current {
   padding: 2px 8px;
   border-radius: 4px;
 }
-.code-copy-btn:hover, .code-preview-btn:hover { color: #fff; background: #444; }
-.code-preview-btn { border: 1px solid #555; }
+.code-copy-btn:hover, .code-preview-btn:hover, .code-wrap-btn:hover { color: #fff; background: #444; }
+.code-preview-btn, .code-wrap-btn { border: 1px solid #555; }
+.code-wrap-btn[aria-pressed='true'] { color: #fff; background: #3a3a3a; }
 .code-block-wrapper pre {
   margin: 0;
   padding: 12px;
@@ -2101,11 +2102,32 @@ mark.search-hit.current {
   max-width: 100%;
   -webkit-overflow-scrolling: touch;
 }
+.code-block-wrapper pre,
+.code-block-wrapper pre code {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+.code-block-wrapper pre::-webkit-scrollbar,
+.code-block-wrapper pre code::-webkit-scrollbar { display: block; height: 8px; }
+.code-block-wrapper pre::-webkit-scrollbar-track,
+.code-block-wrapper pre code::-webkit-scrollbar-track { background: transparent; }
+.code-block-wrapper pre::-webkit-scrollbar-thumb,
+.code-block-wrapper pre code::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+}
 .code-block-wrapper pre code {
   font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
   font-size: 13px;
   line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.code-block-wrapper.wrap-off pre code {
   white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 /* HTML/SVG preview pane */
 .code-preview-pane {

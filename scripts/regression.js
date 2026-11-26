@@ -3699,6 +3699,7 @@ async function testXssHardening() {
     assert(!/window\.ccCopyCode|window\.ccTogglePreview/.test(appJs), 'app.js must not expose global onclick handlers (replaced by decorateCodeBlocks closure)');
     assert(/DOMPurify\.sanitize/.test(appJs), 'app.js renderMarkdown must call DOMPurify.sanitize');
     assert(/decorateCodeBlocks/.test(appJs), 'app.js must define decorateCodeBlocks');
+    assert(/code-wrap-btn/.test(appJs) && /setCodeBlockWrapMode/.test(appJs), 'app.js must apply the code block Wrap toggle');
     assert(/uponSanitizeElement/.test(appJs) && /data-cc-link-target/.test(appJs), 'app.js must preserve original link targets for hover preview');
     // Fail-closed: DOMPurify missing path must never return raw marked output
     assert(!/return raw;/.test(appJs.replace(/\/\/[^\n]*/g, '')), 'app.js renderMarkdown must not return raw unsanitized HTML when DOMPurify is unavailable (fail-closed)');
@@ -3707,6 +3708,9 @@ async function testXssHardening() {
     const css = await (await fetch(`http://127.0.0.1:${port}/style.css`)).text();
     assert(/\.code-block-wrapper/.test(css), 'style.css must still define .code-block-wrapper');
     assert(/\.code-preview-iframe/.test(css), 'style.css must still define .code-preview-iframe');
+    assert(/\.code-block-wrapper\.wrap-off pre code/.test(css), 'style.css must define the non-wrapping code block mode');
+    assert(/\.code-block-wrapper pre::-webkit-scrollbar/.test(css), 'style.css must expose the code block horizontal scrollbar');
+    assert(/\.code-block-wrapper pre code::-webkit-scrollbar/.test(css), 'style.css must expose the highlight.js code horizontal scrollbar');
     assert(/\.cc-link-target-preview/.test(css), 'style.css must define the unsafe-link hover preview');
   });
 
