@@ -197,12 +197,14 @@ CLI 执行压缩时 cc-web 把 compact 边界事件转成 `system_message`（`ki
 
 #### 预防性水位压缩（P2，事前预防）
 
-与事后兜底（上面 P0）叠加成双保险，互不依赖。Claude resume 和 Codex resume 都生效：
+与事后兜底（上面 P0）叠加成双保险，互不依赖。仅 Claude resume 生效：
 
-1. `handleMessage` 在构造 spawn 之前定位原生上下文文件。Claude 用 `locateClaudeSessionJsonl` 找 `~/.claude/projects/<dir>/<sessionId>.jsonl`；Codex 用 `locateCodexThreadJsonl` 从默认、托管和会话隔离 home 中按 `codexThreadId` 及 rollout `session_meta` 归属查找。
-2. Claude 的 `estimateClaudeContextUsage` 从 transcript 末尾向前找最后一条带 usage 的 assistant 记录，取 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。Codex 的 `estimateCodexContextUsage` 从 rollout 末尾向前找最后一条非零 `token_count`，取 `last_token_usage.total_tokens`（缺失时用 input + output）和 `model_context_window`。
-3. `shouldPreemptiveCompact(usage, model, CC_WEB_AUTOCOMPACT_PCT, windowTokens?)`：Claude 按模型标签推断 1M / 200k 窗口；Codex 优先使用 rollout 报告的实际窗口（例如 237,500）。水位 ≥ 窗口 × 阈值%（默认 80%）即触发。
+1. `handleMessage` 在构造 spawn 之前用 `locateClaudeSessionJsonl` 定位 `~/.claude/projects/<dir>/<sessionId>.jsonl`。
+2. `estimateClaudeContextUsage` 从 transcript 末尾向前找最后一条带 usage 的 assistant 记录，取 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。
+3. `shouldPreemptiveCompact(usage, model, CC_WEB_AUTOCOMPACT_PCT)`：按模型标签推断 1M / 200k 窗口，水位 ≥ 窗口 × 阈值%（默认 80%）即触发。
 4. 触发时发 `◎ 检测到上下文接近上限，先执行压缩再发送您的消息`，然后**复用 P0 注入链路**：写 `pendingCompactRetries`（`reason:'auto'`，text=原消息）+ `pendingSlashCommands`（`kind:'compact'`）+ 以 `/compact` 为输入走 `handleMessage` spawn；compact 完成后原消息由现有 `handleProcessComplete` 重放链路发送。
+
+Codex 不注入 `/compact`：`codex exec` 会把它当普通用户消息，压缩轮多一条无意义回复；且 80% 水位（237,500 × 0.8 = 190,000）低于 Codex 自身的 `model_auto_compact_token_limit`（本机 200,000），中间区间只会白跑一轮。Codex 的压缩交给它自己在真实用户消息那一轮完成；真正撞 context limit 时仍由上面 P0 兜底。
 
 **零改变约束**：定位不到原生文件 / 无 usage / 解析异常 / 带附件（无法重放）/ 文本为空——一律静默走原流程。防循环护栏 `preemptCompactGuard`：预防压缩后直到观察到一次正常（非 slash 注入）运行完成、或用户手动 `/compact`、或删除会话之前，不再对同一会话重复预防压缩。
 

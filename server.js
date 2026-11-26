@@ -33,7 +33,6 @@ const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
 const {
   estimateClaudeContextUsage,
-  estimateCodexContextUsage,
   shouldPreemptiveCompact,
 } = require('./lib/context-usage');
 const { createAuthStore } = require('./lib/auth');
@@ -5886,14 +5885,17 @@ async function handleMessage(ws, msg, options = {}) {
     return requestClaudeRecovery(ws, session, textValue, attachments, session.permissionMode || 'yolo', { hideInHistory });
   }
 
-  // === P2 预防性水位压缩（Claude transcript / Codex rollout）===
+  // === P2 预防性水位压缩（仅 Claude transcript）===
   // 发送前读原生上下文水位，接近上限（默认 80%）则先 /compact 再重放原消息，
   // 复用 P0 自动 compact 注入链路（pendingCompactRetries + pendingSlashCommands + 重放）。
+  // Codex 不注入：codex exec 把 /compact 当普通用户消息，压缩轮会多一条无意义回复，
+  // 且 80% 水位（237500 × 0.8 = 190000）低于 Codex 自身的 200000 自动压缩阈值。
+  // Codex 交给 model_auto_compact_token_limit 在真实用户消息那一轮压缩。
   // 约束：定位/估算/判定任何一步不确定（无 jsonl、无 usage、解析失败、带附件无法重放、
   // 处于自动压缩重试循环等）一律不触发，直接走原流程——正常路径零改变。
   if (
-    ((isClaudeSession(session) && session.claudeSessionId)
-      || (!isClaudeSession(session) && session.codexThreadId))
+    isClaudeSession(session)
+    && session.claudeSessionId
     && normalizedText
     && normalizedText !== '/compact'
     && !hideInHistory
@@ -5902,26 +5904,17 @@ async function handleMessage(ws, msg, options = {}) {
     && pendingCompactRetries.get(session.id)?.reason !== 'auto'
   ) {
     try {
-      let usageTokens = null;
-      let windowTokens = null;
-      if (isClaudeSession(session)) {
-        const jsonlPath = locateClaudeSessionJsonl(session.claudeSessionId);
-        usageTokens = jsonlPath ? estimateClaudeContextUsage(jsonlPath) : null;
-      } else {
-        const jsonlPath = locateCodexThreadJsonl(session);
-        const usage = jsonlPath ? estimateCodexContextUsage(jsonlPath) : null;
-        usageTokens = usage?.usageTokens ?? null;
-        windowTokens = usage?.windowTokens ?? null;
-      }
+      const jsonlPath = locateClaudeSessionJsonl(session.claudeSessionId);
+      const usageTokens = jsonlPath ? estimateClaudeContextUsage(jsonlPath) : null;
       if (usageTokens !== null
-          && shouldPreemptiveCompact(usageTokens, session.model, AUTOCOMPACT_PCT, windowTokens)) {
+          && shouldPreemptiveCompact(usageTokens, session.model, AUTOCOMPACT_PCT)) {
         preemptCompactGuard.add(session.id);
         session.updated = new Date().toISOString();
         saveSession(session);
         plog('INFO', 'preemptive_compact', {
           sessionId: session.id.slice(0, 8),
           usageTokens,
-          windowTokens: windowTokens || (/1m/i.test(String(session.model || '')) ? 1_000_000 : 200_000),
+          windowTokens: /1m/i.test(String(session.model || '')) ? 1_000_000 : 200_000,
           pct: AUTOCOMPACT_PCT,
           model: session.model || 'default',
           agent: getSessionAgent(session),

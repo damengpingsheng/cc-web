@@ -1748,12 +1748,10 @@ async function testAuthStoreTokenMigration() {
 //   - estimateClaudeContextUsage 从文件末尾向前找最后一条含 usage 的 assistant 行，
 //     返回 input + cache_read + cache_creation 三项之和（更早的 usage 行、坏行不参与）
 //   - 无 usage / 文件不存在 → null（调用方必须跳过预防逻辑）
-//   - estimateCodexContextUsage 从 rollout 末尾取非零 last_token_usage 和窗口
-//   - shouldPreemptiveCompact：[1m]、普通窗口、显式 Codex 窗口与高低水位组合
+//   - shouldPreemptiveCompact：[1m] / 普通窗口 × 高低水位组合
 async function testContextUsage() {
   const {
     estimateClaudeContextUsage,
-    estimateCodexContextUsage,
     shouldPreemptiveCompact,
   } = require('../lib/context-usage');
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-usage-'));
@@ -1780,40 +1778,12 @@ async function testContextUsage() {
   assert(estimateClaudeContextUsage(noUsagePath) === null, 'jsonl without usage must return null');
   assert(estimateClaudeContextUsage(path.join(tempDir, 'missing.jsonl')) === null, 'missing file must return null');
 
-  const codexUsage = (input, output, total, window) => JSON.stringify({
-    type: 'event_msg',
-    payload: {
-      type: 'token_count',
-      info: {
-        last_token_usage: {
-          input_tokens: input,
-          output_tokens: output,
-          total_tokens: total,
-        },
-        model_context_window: window,
-      },
-    },
-  });
-  const codexPath = path.join(tempDir, 'codex-rollout.jsonl');
-  fs.writeFileSync(codexPath, [
-    codexUsage(100000, 5000, 105000, 237500),
-    codexUsage(0, 0, 0, 237500),
-    codexUsage(190000, 1000, 191000, 237500),
-    '',
-  ].join('\n'));
-  const codexEstimate = estimateCodexContextUsage(codexPath);
-  assert(codexEstimate?.usageTokens === 191000 && codexEstimate?.windowTokens === 237500,
-    'Codex estimate should use the last non-zero rollout token_count');
-  assert(estimateCodexContextUsage(noUsagePath) === null, 'Codex rollout without token_count must return null');
-
   // 4 combos: window size from model label × water level (threshold 80%)
   assert(shouldPreemptiveCompact(200000, 'claude-opus-4-6[1m]', 80) === false, '1M window: 200k is below 80% threshold');
   assert(shouldPreemptiveCompact(800000, 'claude-opus-4-6[1m]', 80) === true, '1M window: 800k reaches 80% threshold');
   assert(shouldPreemptiveCompact(160000, 'claude-sonnet-4-6', 80) === true, '200k window: 160k reaches 80% threshold');
   assert(shouldPreemptiveCompact(159999, 'claude-sonnet-4-6', 80) === false, '200k window: 159,999 is below 80% threshold');
   assert(shouldPreemptiveCompact(null, 'claude-opus-4-6[1m]', 80) === false, 'null usage must never preempt');
-  assert(shouldPreemptiveCompact(190000, '', 80, 237500) === true, 'Codex explicit window: 190k reaches 80% threshold');
-  assert(shouldPreemptiveCompact(189999, '', 80, 237500) === false, 'Codex explicit window: 189,999 is below 80% threshold');
 
   fs.rmSync(tempDir, { recursive: true, force: true });
   console.log('Context usage estimation checks passed.');
@@ -2758,30 +2728,25 @@ async function main() {
       type: 'message', text: 'preempt codex usage replay prompt',
       sessionId: codexUsageSession.sessionId, mode: 'yolo', agent: 'codex',
     }));
-    const codexPreemptNotice = await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
-      msg.type === 'system_message' && /◎ 检测到上下文接近上限，先执行压缩再发送您的消息/.test(msg.message || '')
-    ));
-    assert(codexPreemptNotice.kind === 'compact', 'Codex preemptive compact should surface as kind=compact');
-    await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => msg.type === 'text_delta' && /Codex compact finished/.test(msg.text || ''));
-    await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
-      msg.type === 'system_message' && /已执行 Codex \/compact/.test(msg.message || '')
-    ));
-    await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
-      msg.type === 'system_message' && /按 Codex 压缩计划继续执行/.test(msg.message || '')
-    ));
-    const codexPreemptReplay = await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
+    // Codex 不注入 /compact：高水位也直接走普通路径，由 Codex 自身的
+    // model_auto_compact_token_limit 在真实用户消息那一轮压缩。
+    const codexDirectReply = await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => (
       msg.type === 'text_delta' && /preempt codex usage replay prompt/.test(msg.text || '')
     ));
-    assert(/preempt codex usage replay prompt/.test(codexPreemptReplay.text || ''),
-      'Codex preemptive compact should replay the original prompt');
+    assert(/Codex mock handled/.test(codexDirectReply.text || ''),
+      'Codex high-usage prompt should be answered directly without a compact round');
     await nextMessage(codexPreemptPage.messages, codexPreemptPage.ws, (msg) => msg.type === 'done' && msg.sessionId === codexUsageSession.sessionId);
     codexPreemptPage.ws.close();
-    const codexPreemptSpawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+    const codexPreemptLogLines = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
       .trim()
-      .split('\n')
+      .split('\n');
+    const codexPreemptSpawns = codexPreemptLogLines
       .filter((line) => line.includes('"event":"process_spawn"') && line.includes(codexUsageSession.sessionId.slice(0, 8)));
-    assert(codexPreemptSpawns.length === 2,
-      `Codex preemptive compact should spawn compact+replay = 2 processes (got ${codexPreemptSpawns.length})`);
+    assert(codexPreemptSpawns.length === 1,
+      `Codex must not preemptively spawn /compact (got ${codexPreemptSpawns.length} processes)`);
+    const codexPreemptEvents = codexPreemptLogLines
+      .filter((line) => line.includes('"event":"preemptive_compact"') && line.includes(codexUsageSession.sessionId.slice(0, 8)));
+    assert(codexPreemptEvents.length === 0, 'Codex session must not emit preemptive_compact');
 
     fs.appendFileSync(codexFixture.rolloutPath, [
       JSON.stringify({
