@@ -203,8 +203,12 @@ function readStdin() {
     try { fs.unlinkSync(statePath); } catch {}
   }
 
-  if (!isContextLimitPrompt || state.compacted) process.stdout.write(`${JSON.stringify({
+  if (!isContextLimitPrompt || state.compacted) {
+    // Keep a measurable turn window for cc-web's turn.started -> turn.completed speed.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    process.stdout.write(`${JSON.stringify({
     type: 'turn.completed',
     usage: { input_tokens: 10, cached_input_tokens: 2, output_tokens: 5 },
-  })}\n`);
+    })}\n`);
+  }
 })();

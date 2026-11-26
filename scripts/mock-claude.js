@@ -70,6 +70,13 @@ function readStdin() {
       type: 'result',
       session_id: sessionId,
       total_cost_usd: 0,
+      duration_api_ms: 1500,
+      usage: {
+        input_tokens: 120,
+        cache_read_input_tokens: 30,
+        cache_creation_input_tokens: 50,
+        output_tokens: 40,
+      },
     })}\n`);
     return;
   }
@@ -104,6 +111,13 @@ function readStdin() {
       type: 'result',
       session_id: sessionId,
       total_cost_usd: 0,
+      duration_api_ms: 1500,
+      usage: {
+        input_tokens: 120,
+        cache_read_input_tokens: 30,
+        cache_creation_input_tokens: 50,
+        output_tokens: 40,
+      },
     })}\n`);
     return;
   }
@@ -136,6 +150,13 @@ function readStdin() {
       type: 'result',
       session_id: sessionId,
       total_cost_usd: 0,
+      duration_api_ms: 1500,
+      usage: {
+        input_tokens: 120,
+        cache_read_input_tokens: 30,
+        cache_creation_input_tokens: 50,
+        output_tokens: 40,
+      },
     })}\n`);
     return;
   }
@@ -163,5 +184,12 @@ function readStdin() {
     type: 'result',
     session_id: sessionId,
     total_cost_usd: 0,
+    duration_api_ms: 1500,
+    usage: {
+      input_tokens: 120,
+      cache_read_input_tokens: 30,
+      cache_creation_input_tokens: 50,
+      output_tokens: 40,
+    },
   })}\n`);
 })();

@@ -324,6 +324,9 @@
   let apirouterUsageHasData = false;
   const chatModelState = $('#chat-model-state');
   const costDisplay = $('#cost-display');
+  const turnStatsEl = $('#turn-stats');
+  const turnCacheHitEl = $('#turn-cache-hit');
+  const turnOutputSpeedEl = $('#turn-output-speed');
   const messageQueueEl = $('#message-queue');
   const attachmentTray = $('#attachment-tray');
   const imageUploadInput = $('#image-upload-input');
@@ -1089,6 +1092,7 @@
       agent: snapshot.agent || '',
       cwd: snapshot.cwd || '',
       updated: snapshot.updated || '',
+      lastTurnStats: snapshot.lastTurnStats || null,
     }).length;
     return base + (snapshot.messages || []).reduce((sum, message) => sum + estimateSessionMessageWeight(message), 0);
   }
@@ -1107,6 +1111,7 @@
       cwd: payload.cwd || null,
       totalCost: typeof payload.totalCost === 'number' ? payload.totalCost : 0,
       totalUsage: payload.totalUsage ? deepClone(payload.totalUsage) : null,
+      lastTurnStats: payload.lastTurnStats ? deepClone(payload.lastTurnStats) : null,
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
       // 运行中会话的实时全量输出（仅服务端 session_info 携带；断线补齐守卫消费，见 case 'session_info'）
@@ -2534,6 +2539,7 @@
     messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
     scheduleNavRebuild();
     setStatsDisplay(null);
+    setTurnStatsDisplay(null);
     renderPendingAttachments();
     renderMessageQueue();
     syncComposerAction();
@@ -2568,6 +2574,7 @@
     }
     setCurrentSessionRunningState(snapshot.isRunning);
     setStatsDisplay(snapshot);
+    setTurnStatsDisplay(snapshot.lastTurnStats);
     currentCwd = snapshot.cwd || null;
     updateCwdBadge();
     currentCodexGateway = snapshot.codexGateway || '';
@@ -2746,6 +2753,59 @@
       return;
     }
     costDisplay.textContent = '';
+  }
+
+  function formatTurnRate(value, digits = 1) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) return '--';
+    return number.toFixed(digits).replace(/\.0$/, '');
+  }
+
+  function describeTurnStats(stats) {
+    if (!stats || !stats.usage) return '';
+    const usage = stats.usage;
+    const hasCacheRate = typeof stats.cacheHitRate === 'number' && Number.isFinite(stats.cacheHitRate);
+    const hasSpeed = typeof stats.outputTokensPerSecond === 'number' && Number.isFinite(stats.outputTokensPerSecond);
+    const cachePercent = hasCacheRate ? formatTurnRate(stats.cacheHitRate * 100, 1) : '--';
+    const speed = hasSpeed ? formatTurnRate(stats.outputTokensPerSecond, 1) : '--';
+    const durationSeconds = Number(stats.durationMs) > 0 ? (Number(stats.durationMs) / 1000).toFixed(2) : '--';
+    const lines = [
+      `本轮输入 ${usage.inputTokens} tokens`,
+      `缓存读取 ${usage.cachedInputTokens} tokens`,
+    ];
+    if (Number(usage.cacheCreationInputTokens) > 0) lines.push(`缓存写入 ${usage.cacheCreationInputTokens} tokens`);
+    lines.push(`输出 ${usage.outputTokens} tokens`);
+    lines.push(`缓存命中 ${cachePercent === '--' ? '--' : `${cachePercent}%`}`);
+    lines.push(`输出速度 ${speed === '--' ? '--' : `${speed} tok/s`}（${durationSeconds}s）`);
+    if (stats.durationSource === 'claude_api_duration') {
+      lines.push('时间口径：Claude API 实际耗时，不含工具执行等待');
+    } else if (stats.durationSource === 'codex_turn_started_to_completed') {
+      lines.push('时间口径：Codex turn.started 至 turn.completed，包含工具执行等待，不含 CLI 启动');
+    } else if (stats.durationSource === 'codex_turn_duration') {
+      lines.push('时间口径：Codex turn.completed 自带的 duration，不含 CLI 启动');
+    } else {
+      lines.push('时间口径：本轮进程启动至结束，包含启动和工具执行等待');
+    }
+    return lines.join('\n');
+  }
+
+  function setTurnStatsDisplay(stats) {
+    if (!turnStatsEl || !turnCacheHitEl || !turnOutputSpeedEl) return;
+    if (!stats || !stats.usage) {
+      turnStatsEl.classList.add('is-empty');
+      turnStatsEl.title = '';
+      turnCacheHitEl.textContent = '--';
+      turnOutputSpeedEl.textContent = '--';
+      turnStatsEl.setAttribute('aria-label', '本轮缓存命中率和 token 输出速度暂不可用');
+      return;
+    }
+    const cacheRate = typeof stats.cacheHitRate === 'number' ? stats.cacheHitRate : NaN;
+    const speed = typeof stats.outputTokensPerSecond === 'number' ? stats.outputTokensPerSecond : NaN;
+    turnStatsEl.classList.remove('is-empty');
+    turnCacheHitEl.textContent = Number.isFinite(cacheRate) ? `${formatTurnRate(cacheRate * 100)}%` : '--';
+    turnOutputSpeedEl.textContent = Number.isFinite(speed) ? formatTurnRate(speed) : '--';
+    turnStatsEl.title = describeTurnStats(stats);
+    turnStatsEl.setAttribute('aria-label', `本轮缓存命中 ${turnCacheHitEl.textContent}，输出 ${turnOutputSpeedEl.textContent} tokens每秒`);
   }
 
   function formatUsageUsd(value) {
@@ -3628,6 +3688,15 @@
             updateCachedSession(currentSessionId, (snapshot) => { snapshot.totalUsage = deepClone(msg.totalUsage); });
           }
         }
+        break;
+
+      case 'turn_stats':
+        if (msg.sessionId) {
+          updateCachedSession(msg.sessionId, (snapshot) => {
+            snapshot.lastTurnStats = msg.stats ? deepClone(msg.stats) : null;
+          });
+        }
+        if (msg.sessionId === currentSessionId) setTurnStatsDisplay(msg.stats);
         break;
 
       case 'done':

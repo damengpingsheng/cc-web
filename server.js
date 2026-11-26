@@ -53,6 +53,7 @@ const {
   mergeCodexHistoryByUserTurn,
   needsCodexToolLayoutMigration,
 } = require('./lib/codex-history-migration');
+const { createTurnStats, normalizeTurnUsage, turnUsageToRaw } = require('./lib/turn-stats');
 
 // Load .env
 const envPath = path.join(__dirname, '.env');
@@ -1832,6 +1833,7 @@ function normalizeSession(session) {
   if (!Object.prototype.hasOwnProperty.call(session, 'totalUsage') || !session.totalUsage) {
     session.totalUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
   }
+  if (!Object.prototype.hasOwnProperty.call(session, 'lastTurnStats')) session.lastTurnStats = null;
   if (!Object.prototype.hasOwnProperty.call(session, 'taskMode')) session.taskMode = 'local';
   if (!Object.prototype.hasOwnProperty.call(session, 'sshHostId')) session.sshHostId = '';
   if (!Object.prototype.hasOwnProperty.call(session, 'remoteCwd')) session.remoteCwd = '';
@@ -3087,10 +3089,66 @@ function normalizeUsageTotals(usage) {
   };
 }
 
+function recoveredSessionUsage(session, entry) {
+  const previous = normalizeUsageTotals(session?.totalUsage);
+  if (entry?.agent === 'codex' && entry.codexCumulativeUsage) {
+    return normalizeUsageTotals({
+      inputTokens: entry.codexCumulativeUsage.input_tokens,
+      cachedInputTokens: entry.codexCumulativeUsage.cached_input_tokens,
+      outputTokens: entry.codexCumulativeUsage.output_tokens,
+    });
+  }
+  if (!entry?.lastUsage) return previous;
+  return {
+    inputTokens: previous.inputTokens + (Number(entry.lastUsage.input_tokens) || 0),
+    cachedInputTokens: previous.cachedInputTokens + (Number(entry.lastUsage.cached_input_tokens) || 0),
+    outputTokens: previous.outputTokens + (Number(entry.lastUsage.output_tokens) || 0),
+  };
+}
+
 function usageTotalsEqual(left, right) {
   return left.inputTokens === right.inputTokens &&
     left.cachedInputTokens === right.cachedInputTokens &&
     left.outputTokens === right.outputTokens;
+}
+
+function completedTurnStats(entry, completedAtMs) {
+  if (!entry?.lastUsage) return null;
+  const agent = entry.agent === 'codex' ? 'codex' : 'claude';
+  const startMs = Number(entry.startedAtMs);
+  const completedMs = Number(completedAtMs);
+  const turnStartMs = Number(entry.turnStartedAtMs);
+  const turnEndMs = Number.isFinite(completedMs) ? completedMs : Number(entry.turnEndedAtMs);
+  const hasTurnWindow = Number.isFinite(turnStartMs) && Number.isFinite(turnEndMs) && turnEndMs >= turnStartMs;
+  const processEndMs = Number.isFinite(completedMs) ? completedMs : Number(entry.turnEndedAtMs);
+  const hasProcessWindow = Number.isFinite(startMs) && Number.isFinite(processEndMs) && processEndMs >= startMs;
+
+  let durationMs = hasTurnWindow ? turnEndMs - turnStartMs : (hasProcessWindow ? processEndMs - startMs : null);
+  let durationSource = 'process_wall_time';
+  let durationIncludesToolWait = true;
+  if (agent === 'claude' && Number(entry.apiDurationMs) > 0) {
+    durationMs = Number(entry.apiDurationMs);
+    durationSource = 'claude_api_duration';
+    durationIncludesToolWait = false;
+  } else if (agent === 'codex' && Number(entry.turnDurationMs) > 0) {
+    durationMs = Number(entry.turnDurationMs);
+    durationSource = 'codex_turn_duration';
+    durationIncludesToolWait = false;
+  } else if (agent === 'codex' && hasTurnWindow) {
+    durationSource = 'codex_turn_started_to_completed';
+  }
+
+  return createTurnStats({
+    agent,
+    usage: entry.lastUsage,
+    durationMs,
+    durationSource,
+    durationIncludesToolWait,
+    usageSource: entry.usageSource || (agent === 'claude'
+      ? (entry.claudeUsageFromResult ? 'claude_result' : 'claude_assistant')
+      : 'codex_turn_completed'),
+    completedAt: Number.isFinite(turnEndMs) ? new Date(turnEndMs).toISOString() : new Date().toISOString(),
+  });
 }
 
 function firstChangedMessageIndex(previous, next) {
@@ -3541,6 +3599,13 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     entry.tailer.stop();
   }
   let session = loadSession(sessionId);
+  if (entry.agent === 'codex' && session) {
+    const turnUsage = readCodexTurnUsageForEntry(session, entry);
+    if (turnUsage) {
+      entry.lastUsage = turnUsageToRaw(normalizeTurnUsage(turnUsage));
+      entry.usageSource = 'codex_rollout_turn';
+    }
+  }
   let contextLimitExceeded = false;
 
   // Read stderr for error clues
@@ -3643,6 +3708,18 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     saveSession(session);
   }
 
+  if (session && entry.agent === 'codex' && entry.codexCumulativeUsage) {
+    // Codex turn.completed.usage is thread-cumulative. Runtime preserves that
+    // total here while keeping entry.lastUsage strictly turn-local.
+    session.totalUsage = normalizeUsageTotals({
+      inputTokens: entry.codexCumulativeUsage.input_tokens,
+      cachedInputTokens: entry.codexCumulativeUsage.cached_input_tokens,
+      outputTokens: entry.codexCumulativeUsage.output_tokens,
+    });
+    session.updated = new Date().toISOString();
+    saveSession(session);
+  }
+
   if (pendingSlash?.kind === 'compact' && session) {
     if (entry.lastCost) {
       session.totalCost = Math.max(0, (session.totalCost || 0) - entry.lastCost);
@@ -3678,12 +3755,51 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     shouldAutoCompact = true;
   }
 
-  activeProcesses.delete(sessionId);
-  cleanRunDir(sessionId);
-  pendingSlashCommands.delete(sessionId);
   const willContinue = !!((retryCodexWithoutResume && wsConnected)
     || (shouldRetryCodexEmptyFinal && wsConnected)
     || shouldReturnForFollowup || shouldAutoCompact);
+  const shouldFinalizeTurnStats = !willContinue
+    && !intentionalAbort
+    && !completionError
+    && !contextLimitExceeded
+    && !codexEmptyFinalFailed;
+  let finalTurnStats = null;
+  if (shouldFinalizeTurnStats) {
+    finalTurnStats = completedTurnStats(entry);
+    if (session) {
+      session.lastTurnStats = finalTurnStats;
+      session.updated = new Date().toISOString();
+      saveSession(session);
+    }
+  }
+
+  if (session && entry.agent === 'codex' && shouldFinalizeTurnStats && finalTurnStats) {
+    // The rollout writer can finish just after the CLI exits. Retry once after
+    // responding with `done`; stale records before process start are ignored.
+    const refreshTimer = setTimeout(() => {
+      const turnUsage = readCodexTurnUsageForEntry(session, entry, entry.startedAtMs);
+      if (!turnUsage) return;
+      const latestSession = loadSession(sessionId);
+      if (!latestSession || latestSession.lastTurnStats?.completedAt !== finalTurnStats.completedAt) return;
+      const refreshedStats = completedTurnStats({
+        ...entry,
+        lastUsage: turnUsageToRaw(normalizeTurnUsage(turnUsage)),
+        usageSource: 'codex_rollout_turn',
+      });
+      latestSession.lastTurnStats = refreshedStats;
+      latestSession.updated = new Date().toISOString();
+      saveSession(latestSession);
+      const owningWs = entry.ws && entry.ws.readyState === 1 ? entry.ws : null;
+      if (owningWs) {
+        wsSend(owningWs, { type: 'turn_stats', sessionId, stats: refreshedStats });
+      }
+    }, 700);
+    refreshTimer.unref?.();
+  }
+
+  activeProcesses.delete(sessionId);
+  cleanRunDir(sessionId);
+  pendingSlashCommands.delete(sessionId);
 
   // Notify client
   if (wsConnected) {
@@ -3718,6 +3834,9 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       wsSend(entry.ws, { type: 'error', message: completionError });
     }
 
+    if (finalTurnStats) {
+      wsSend(entry.ws, { type: 'turn_stats', sessionId, stats: finalTurnStats });
+    }
     wsSend(entry.ws, { type: 'done', sessionId, costUsd: entry.lastCost || null, willContinue });
     sendSessionList(entry.ws);
     // 同步给其他客户端，避免只有发起的那个标签页知道任务完成
@@ -3860,11 +3979,36 @@ function recoverProcesses() {
       }
 
       const pid = parseInt(fs.readFileSync(pidPath, 'utf8'));
+      let runStartedAtMs = null;
+      let outputCompletedAtMs = null;
+      try { runStartedAtMs = fs.statSync(pidPath).mtimeMs; } catch {}
+      try { outputCompletedAtMs = fs.statSync(outputPath).mtimeMs; } catch {}
 
       if (isProcessRunning(pid)) {
         console.log(`[recovery] Re-attaching to session ${sessionId} (PID ${pid})`);
         plog('INFO', 'recovery_alive', { sessionId: sessionId.slice(0, 8), pid, agent });
-        const entry = { pid, ws: null, agent, fullText: '', toolCalls: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null };
+        const entry = {
+          pid,
+          ws: null,
+          agent,
+          fullText: '',
+          toolCalls: [],
+          lastCost: null,
+          lastUsage: null,
+          startedAtMs: runStartedAtMs,
+          turnStartedAtMs: null,
+          turnEndedAtMs: null,
+          apiDurationMs: null,
+          turnDurationMs: null,
+          codexThreadUsageBaseline: agent === 'codex'
+            ? turnUsageToRaw(normalizeUsageTotals(session?.totalUsage))
+            : null,
+          claudeUsageByMessageId: new Map(),
+          claudeUsageFromResult: false,
+          lastError: null,
+          errorSent: false,
+          tailer: null,
+        };
         activeProcesses.set(sessionId, entry);
 
         if (fs.existsSync(outputPath)) {
@@ -3881,7 +4025,29 @@ function recoverProcesses() {
         console.log(`[recovery] Processing completed output for session ${sessionId}`);
         plog('INFO', 'recovery_dead', { sessionId: sessionId.slice(0, 8), pid, agent });
         if (fs.existsSync(outputPath)) {
-          const tempEntry = { pid: 0, ws: null, agent, fullText: '', toolCalls: [], lastCost: null, lastUsage: null, lastError: null, errorSent: false, tailer: null, recoveryReplay: true };
+          const tempEntry = {
+            pid: 0,
+            ws: null,
+            agent,
+            fullText: '',
+            toolCalls: [],
+            lastCost: null,
+            lastUsage: null,
+            startedAtMs: runStartedAtMs,
+            turnStartedAtMs: null,
+            turnEndedAtMs: outputCompletedAtMs,
+            apiDurationMs: null,
+            turnDurationMs: null,
+            codexThreadUsageBaseline: agent === 'codex'
+              ? turnUsageToRaw(normalizeUsageTotals(session?.totalUsage))
+              : null,
+            claudeUsageByMessageId: new Map(),
+            claudeUsageFromResult: false,
+            lastError: null,
+            errorSent: false,
+            tailer: null,
+            recoveryReplay: true,
+          };
           // A detached Claude process can leave thousands of system events in
           // output.jsonl. Decode complete lines incrementally so recovery stays
           // bounded and cannot stall startup before listen().
@@ -3921,13 +4087,17 @@ function recoverProcesses() {
             }
             const recoveredRuntimeId = tempEntry.recoveredRuntimeSessionId;
             if (recoveredRuntimeId) setRuntimeSessionId(session, recoveredRuntimeId);
+            if (session.agent === 'codex') {
+              const rolloutUsage = readCodexTurnUsageForEntry(session, tempEntry, runStartedAtMs);
+              if (rolloutUsage) {
+                tempEntry.lastUsage = turnUsageToRaw(normalizeTurnUsage(rolloutUsage));
+                tempEntry.usageSource = 'codex_rollout_turn';
+              }
+            }
             if (tempEntry.lastCost) session.totalCost = (session.totalCost || 0) + tempEntry.lastCost;
-            if (tempEntry.lastUsage) {
-              session.totalUsage = {
-                inputTokens: (session.totalUsage?.inputTokens || 0) + (tempEntry.lastUsage.input_tokens || 0),
-                cachedInputTokens: (session.totalUsage?.cachedInputTokens || 0) + (tempEntry.lastUsage.cached_input_tokens || 0),
-                outputTokens: (session.totalUsage?.outputTokens || 0) + (tempEntry.lastUsage.output_tokens || 0),
-              };
+            if (tempEntry.lastUsage) session.totalUsage = recoveredSessionUsage(session, tempEntry);
+            if (!tempEntry.lastError) {
+              session.lastTurnStats = completedTurnStats(tempEntry, outputCompletedAtMs);
             }
             session.updated = new Date().toISOString();
             saveSession(session);
@@ -4770,6 +4940,7 @@ async function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
         }
         session.messages = [];
         clearRuntimeSessionId(session);
+        session.lastTurnStats = null;
         session.updated = new Date().toISOString();
         saveSession(session);
         wsSend(ws, {
@@ -4786,6 +4957,7 @@ async function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
           cwd: session.cwd || null,
           totalCost: session.totalCost || 0,
           totalUsage: session.totalUsage || null,
+          lastTurnStats: session.lastTurnStats || null,
           taskMode: session.taskMode || 'local',
           sshHostId: session.sshHostId || '',
           remoteCwd: session.remoteCwd || '',
@@ -5243,6 +5415,7 @@ function handleNewSession(ws, msg) {
     cwd: session.cwd,
     totalCost: 0,
     totalUsage: session.totalUsage,
+    lastTurnStats: session.lastTurnStats || null,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -5334,6 +5507,7 @@ function handleLoadSession(ws, sessionId) {
     cwd: effectiveCwd,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
+    lastTurnStats: session.lastTurnStats || null,
     historyTotal: session.messages.length,
     historyBuffered: recentMessages.length,
     historyPending: olderChunks.length > 0,
@@ -5796,6 +5970,7 @@ async function handleMessage(ws, msg, options = {}) {
       cwd: session.cwd || null,
       totalCost: session.totalCost || 0,
       totalUsage: session.totalUsage || null,
+      lastTurnStats: session.lastTurnStats || null,
       updated: session.updated,
       hasUnread: false,
       historyPending: false,
@@ -5887,6 +6062,7 @@ async function handleMessage(ws, msg, options = {}) {
   const outputFd = fs.openSync(outputPath, 'w');
   const errorFd = fs.openSync(errorPath, 'w');
 
+  const processStartedAtMs = Date.now();
   let proc;
   try {
     let stdinSource;
@@ -6002,6 +6178,13 @@ async function handleMessage(ws, msg, options = {}) {
     segments: [],
     lastCost: null,
     lastUsage: null,
+    startedAtMs: processStartedAtMs,
+    turnStartedAtMs: null,
+    turnEndedAtMs: null,
+    apiDurationMs: null,
+    turnDurationMs: null,
+    claudeUsageByMessageId: new Map(),
+    claudeUsageFromResult: false,
     lastError: null,
     errorSent: false,
     codexHomeDir: spawnSpec.codexHomeDir || '',
@@ -6539,6 +6722,42 @@ const {
   sanitizeToolInput,
 });
 
+function readLatestCodexTurnUsage(filePath, afterMs = 0) {
+  if (!filePath) return null;
+  let content;
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+  let latest = null;
+  let latestMs = -Infinity;
+  let latestTokenCount = null;
+  let latestTokenCountMs = -Infinity;
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes('token')) continue;
+    let record;
+    try { record = JSON.parse(trimmed); } catch { continue; }
+    const recordedMs = Date.parse(record.timestamp || '');
+    if (!Number.isFinite(recordedMs) || recordedMs < afterMs) continue;
+    if (record.type === 'token_usage_record' && record.payload?.turn_token_usage) {
+      if (recordedMs >= latestMs) {
+        latest = record.payload.turn_token_usage;
+        latestMs = recordedMs;
+      }
+    } else if (record.type === 'event_msg' && record.payload?.type === 'token_count') {
+      const usage = record.payload?.info?.last_token_usage;
+      if (usage && recordedMs >= latestTokenCountMs) {
+        latestTokenCount = usage;
+        latestTokenCountMs = recordedMs;
+      }
+    }
+  }
+  return latest || latestTokenCount;
+}
+
+function readCodexTurnUsageForEntry(session, entry, afterMs = entry?.startedAtMs) {
+  const filePath = session?.agent === 'codex' ? locateCodexThreadJsonl(session) : null;
+  return readLatestCodexTurnUsage(filePath, Number(afterMs) || 0);
+}
+
 function getImportedSessionIds() {
   const imported = new Set();
   try {
@@ -6676,6 +6895,7 @@ function handleImportNativeSession(ws, msg) {
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
     totalUsage: existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    lastTurnStats: existingSession?.lastTurnStats || null,
     messages,
     cwd: cwd || existingSession?.cwd || null,
   };
@@ -6694,6 +6914,7 @@ function handleImportNativeSession(ws, msg) {
     cwd: session.cwd,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
+    lastTurnStats: session.lastTurnStats || null,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,
@@ -6783,6 +7004,7 @@ function handleImportCodexSession(ws, msg) {
     permissionMode: existingSession?.permissionMode || 'yolo',
     totalCost: existingSession?.totalCost || 0,
     totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    lastTurnStats: existingSession?.lastTurnStats || null,
     messages: parsed.messages,
     cwd: parsed.meta.cwd || existingSession?.cwd || null,
   };
@@ -6802,6 +7024,7 @@ function handleImportCodexSession(ws, msg) {
     cwd: session.cwd,
     totalCost: session.totalCost || 0,
     totalUsage: session.totalUsage || null,
+    lastTurnStats: session.lastTurnStats || null,
     updated: session.updated,
     hasUnread: false,
     historyPending: false,

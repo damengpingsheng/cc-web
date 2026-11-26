@@ -70,6 +70,7 @@ const {
 const {
   buildUsageRanges,
   createUsageCollector,
+  cacheReadTokensFromRow,
 } = require(path.join(REPO_DIR, 'lib', 'llmproxy-usage.js'));
 const {
   createApirouterUsageCollector,
@@ -87,6 +88,12 @@ const {
   createCodexProxyManager,
   isCompatibleHealth,
 } = require(path.join(REPO_DIR, 'lib', 'codex-proxy-manager.js'));
+const {
+  calculateCacheHitRate,
+  calculateOutputTokensPerSecond,
+  createTurnStats,
+  subtractTurnUsage,
+} = require(path.join(REPO_DIR, 'lib', 'turn-stats.js'));
 
 function mkdirp(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -203,6 +210,74 @@ function testCodexHistoryMigration() {
   console.log('Codex history migration checks passed.');
 }
 
+function testTurnStats() {
+  const claudeUsage = {
+    input_tokens: 120,
+    cache_read_input_tokens: 30,
+    cache_creation_input_tokens: 50,
+    output_tokens: 40,
+  };
+  const codexUsage = { input_tokens: 100, cached_input_tokens: 25, output_tokens: 20 };
+  assert(Math.abs(calculateCacheHitRate('claude', claudeUsage) - 0.15) < 1e-12,
+    'Claude cache hit rate must use cache read divided by all input categories');
+  assert(Math.abs(calculateCacheHitRate('codex', codexUsage) - 0.25) < 1e-12,
+    'Codex cache hit rate must use cached input divided by input');
+  assert(calculateCacheHitRate('claude', {}) === null, 'Zero cache denominator must be unavailable');
+  assert(calculateCacheHitRate('codex', { input_tokens: 0, cached_input_tokens: 5 }) === null,
+    'Codex cache rate must not divide by zero');
+  assert(calculateCacheHitRate('codex', { input_tokens: 100, output_tokens: 10 }) === null,
+    'Missing Codex cache details must remain unavailable');
+  assert(calculateCacheHitRate('claude', { input_tokens: 100 }) === null,
+    'Missing Claude cache details must remain unavailable');
+  assert(calculateOutputTokensPerSecond(40, 1500) === 40 / 1.5,
+    'Output speed must use exact turn duration rather than session age');
+  assert(calculateOutputTokensPerSecond(40, 0) === null, 'Zero duration must not produce infinite speed');
+  assert(calculateOutputTokensPerSecond(0, 1000) === 0, 'Zero output tokens are a valid measured value');
+
+  const claudeStats = createTurnStats({
+    agent: 'claude', usage: claudeUsage, durationMs: 1500,
+    durationSource: 'claude_api_duration', durationIncludesToolWait: false,
+  });
+  assert(claudeStats.usage.cacheCreationInputTokens === 50, 'Claude cache-write tokens must survive normalization');
+  assert(claudeStats.durationIncludesToolWait === false, 'Claude API duration must be marked as excluding tools');
+
+  const codexStats = createTurnStats({ agent: 'codex', usage: codexUsage, durationMs: 2000 });
+  assert(codexStats.durationIncludesToolWait === true, 'Codex wall time must disclose included process wait');
+  const codexDelta = subtractTurnUsage(
+    { input_tokens: 150, cached_input_tokens: 50, output_tokens: 40 },
+    { input_tokens: 100, cached_input_tokens: 25, output_tokens: 20 },
+  );
+  assert(codexDelta.inputTokens === 50 && codexDelta.cachedInputTokens === 25 && codexDelta.outputTokens === 20,
+    'Codex cumulative usage fallback must produce the current-turn delta');
+  console.log('Turn stats checks passed.');
+}
+
+function testRecoveredSessionUsage() {
+  const source = fs.readFileSync(SERVER_PATH, 'utf8');
+  const start = source.indexOf('function normalizeUsageTotals');
+  const end = source.indexOf('function usageTotalsEqual', start);
+  assert(start >= 0 && end > start, 'Recovered session usage helpers must be extractable');
+  const recoveredSessionUsage = new Function('fs',
+    `${source.slice(start, end)}\nreturn recoveredSessionUsage;`)(fs);
+
+  const codexSession = { totalUsage: { inputTokens: 10, cachedInputTokens: 4, outputTokens: 2 } };
+  const codexUsage = recoveredSessionUsage(codexSession, {
+    agent: 'codex',
+    lastUsage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 1 },
+    codexCumulativeUsage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 2 },
+  });
+  assert(codexUsage.inputTokens === 10 && codexUsage.cachedInputTokens === 4 && codexUsage.outputTokens === 2,
+    'Codex recovery must replace cumulative usage instead of adding the turn delta again');
+
+  const claudeUsage = recoveredSessionUsage(
+    { totalUsage: { inputTokens: 10, cachedInputTokens: 4, outputTokens: 2 } },
+    { agent: 'claude', lastUsage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 1 } },
+  );
+  assert(claudeUsage.inputTokens === 13 && claudeUsage.cachedInputTokens === 5 && claudeUsage.outputTokens === 3,
+    'Claude recovery must add one turn-local usage to the persisted total');
+  console.log('Recovered session usage checks passed.');
+}
+
 function testSessionOverviewMatcher() {
   const source = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
   const start = source.indexOf('  function createSessionOverviewMatcher');
@@ -302,6 +377,18 @@ function testSessionBodySearch() {
 }
 
 async function testLlmproxyUsage() {
+  assert(cacheReadTokensFromRow({
+    metadata: { usage_object: { prompt_tokens_details: { cached_tokens: 321 } } },
+  }) === 321, 'llmproxy usage must read OpenAI-style prompt_tokens_details.cached_tokens');
+  assert(cacheReadTokensFromRow({
+    metadata: { usage_object: { input_tokens_details: { cached_tokens: 123 } } },
+  }) === 123, 'llmproxy usage must accept Responses-style input_tokens_details.cached_tokens');
+  assert(cacheReadTokensFromRow({
+    metadata: { usage_object: { cache_read_input_tokens: 77 } },
+  }) === 77, 'llmproxy usage must retain legacy cache_read_input_tokens compatibility');
+  assert(cacheReadTokensFromRow({ metadata: { usage_object: { prompt_tokens: 100 } } }) === 0,
+    'llmproxy usage must not invent cache tokens when the upstream omits the field');
+
   const ranges = buildUsageRanges(new Date('2026-11-10T08:50:00Z'), 'Asia/Shanghai', '2000-01-01');
   assert(ranges.today.start === '2026-11-09 16:00:00', `llmproxy today start must be UTC (got ${ranges.today.start})`);
   assert(ranges.today.end === '2026-11-10 16:00:00', `llmproxy today end must be UTC (got ${ranges.today.end})`);
@@ -316,7 +403,7 @@ async function testLlmproxyUsage() {
   const rows = [
     { startTime: '2026-11-09T15:59:59.000Z', model: 'openai/grok-4.7', spend: 1, total_tokens: 1000000, prompt_tokens: 600000, completion_tokens: 400000, metadata: { usage_object: { cache_read_input_tokens: 100000 } } },
     { startTime: '2026-11-09T16:00:00.000Z', model: 'openai/grok-4.7', spend: 2, total_tokens: 2000000, prompt_tokens: 1200000, completion_tokens: 800000, metadata: { usage_object: { cache_read_input_tokens: 200000 } } },
-    { startTime: '2026-11-10T15:59:59.000Z', model: 'openai/claude-sonnet-test', spend: 3, total_tokens: 3000000, prompt_tokens: 1800000, completion_tokens: 1200000, metadata: { usage_object: { cache_read_input_tokens: 300000 } } },
+    { startTime: '2026-11-10T15:59:59.000Z', model: 'openai/claude-sonnet-test', spend: 3, total_tokens: 3000000, prompt_tokens: 1800000, completion_tokens: 1200000, metadata: { usage_object: { prompt_tokens_details: { cached_tokens: 300000 } } } },
     { startTime: '2026-11-10T16:00:00.000Z', model: 'openai/grok-4.7', spend: 4, total_tokens: 4000000, prompt_tokens: 2400000, completion_tokens: 1600000, metadata: { usage_object: { cache_read_input_tokens: 400000 } } },
   ];
   const fetchImpl = async (url) => {
@@ -1771,11 +1858,120 @@ async function testRecoveryReplayRuntime() {
   assert(codexSegmentEntry.segments.map((segment) => segment.type).join(',') === 'text,tools,text,tools', 'Codex runtime must split tools at every text boundary');
   assert(codexSegmentEntry.segments[1].toolCalls.map((tool) => tool.id).join(',') === 'segment-codex-1,segment-codex-2', 'Adjacent Codex runtime tools must share one segment');
   assert(codexSegmentEntry.segments[3].toolCalls.map((tool) => tool.id).join(',') === 'segment-codex-3', 'Codex runtime tool after text must stay in a later segment');
+  const claudeUsageEntry = { agent: 'claude', ws: null, fullText: '', toolCalls: [], lastError: null, recoveryReplay: true };
+  const sharedResponseUsage = {
+    input_tokens: 100,
+    cache_read_input_tokens: 20,
+    cache_creation_input_tokens: 5,
+    output_tokens: 7,
+  };
+  runtime.processClaudeEvent(claudeUsageEntry, {
+    type: 'assistant',
+    message: { id: 'response-a', content: [{ type: 'text', text: 'one' }], usage: sharedResponseUsage },
+  }, 'session');
+  runtime.processClaudeEvent(claudeUsageEntry, {
+    type: 'assistant',
+    message: { id: 'response-a', content: [{ type: 'text', text: 'two' }], usage: sharedResponseUsage },
+  }, 'session');
+  runtime.processClaudeEvent(claudeUsageEntry, {
+    type: 'assistant',
+    message: { id: 'response-b', content: [{ type: 'text', text: 'three' }], usage: sharedResponseUsage },
+  }, 'session');
+  assert(claudeUsageEntry.lastUsage.input_tokens === 200,
+    'Claude assistant fallback must count distinct message IDs once');
+  runtime.processClaudeEvent(claudeUsageEntry, {
+    type: 'result',
+    duration_api_ms: 1500,
+    usage: { input_tokens: 240, cache_read_input_tokens: 60, cache_creation_input_tokens: 100, output_tokens: 80 },
+  }, 'session');
+  assert(claudeUsageEntry.lastUsage.input_tokens === 240 && claudeUsageEntry.claudeUsageFromResult,
+    'Claude result usage must supersede the assistant fallback');
+  assert(claudeUsageEntry.apiDurationMs === 1500, 'Claude API duration must be retained for output speed');
+
+  const codexUsageEntry = { agent: 'codex', ws: null, fullText: '', toolCalls: [], lastError: null, recoveryReplay: true };
+  runtime.processCodexEvent(codexUsageEntry, { type: 'turn.started' }, 'session');
+  assert(Number.isFinite(codexUsageEntry.turnStartedAtMs), 'Codex turn start must be recorded');
+  runtime.processCodexEvent(codexUsageEntry, { type: 'turn.completed', usage: { input_tokens: 4, output_tokens: 2 } }, 'session');
+  assert(Number.isFinite(codexUsageEntry.turnEndedAtMs), 'Codex turn completion must record its exact end time');
+  assert(codexUsageEntry.turnEndedAtMs >= codexUsageEntry.turnStartedAtMs,
+    'Codex completed timestamp must bound the turn started timestamp');
   console.log('Recovery replay runtime checks passed.');
+}
+
+function testCodexCumulativeUsage() {
+  const saved = [];
+  const session = { agent: 'codex', totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 } };
+  const runtime = createAgentRuntime({
+    processEnv: process.env, CLAUDE_PATH: '', CODEX_PATH: '', MODEL_MAP: {},
+    loadModelConfig: () => ({}), applyCustomTemplateToSettings: () => {},
+    loadCodexConfig: () => ({}), prepareCodexCustomRuntime: () => null,
+    wsSend: () => {}, truncateObj: (x) => x, sanitizeToolInput: (_, x) => x,
+    isInjectedClaudeUserEntry: () => false, loadSession: () => session,
+    saveSession: (value) => saved.push(JSON.parse(JSON.stringify(value))),
+    setRuntimeSessionId: () => {}, clearRuntimeSessionId: () => {}, getRuntimeSessionId: () => null,
+  });
+  const entry = { agent: 'codex', ws: null, recoveryReplay: false };
+  runtime.processCodexEvent(entry, {
+    type: 'turn.completed',
+    usage: { input_tokens: 150, cached_input_tokens: 50, output_tokens: 40 },
+  }, 'session');
+  assert(entry.lastUsage.input_tokens === 150 && entry.lastUsage.cached_input_tokens === 50 && entry.lastUsage.output_tokens === 40,
+    'The first cumulative usage in a Codex process must be the full current turn');
+  assert(session.totalUsage.inputTokens === 150 && session.totalUsage.cachedInputTokens === 50 && session.totalUsage.outputTokens === 40,
+    'Codex cumulative usage must replace rather than accumulate again');
+  assert(saved.length === 1 && saved[0].totalUsage.inputTokens === 150,
+    'Codex cumulative usage must persist exactly once');
+  runtime.processCodexEvent(entry, {
+    type: 'turn.completed',
+    usage: { input_tokens: 210, cached_input_tokens: 70, output_tokens: 60 },
+  }, 'session');
+  assert(entry.lastUsage.input_tokens === 60 && entry.lastUsage.cached_input_tokens === 20 && entry.lastUsage.output_tokens === 20,
+    'A later cumulative usage in the same Codex process must be reduced to the current-turn delta');
+  console.log('Codex cumulative usage checks passed.');
+}
+
+function testCodexRolloutUsageReader() {
+  const source = fs.readFileSync(SERVER_PATH, 'utf8');
+  const start = source.indexOf('function readLatestCodexTurnUsage');
+  const end = source.indexOf('function readCodexTurnUsageForEntry', start);
+  assert(start >= 0 && end > start, 'Codex rollout usage reader must be extractable');
+  const readLatest = new Function('fs', `${source.slice(start, end)}\nreturn readLatestCodexTurnUsage;`)(fs);
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-codex-usage-'));
+  const rolloutPath = path.join(tempDir, 'rollout.jsonl');
+  try {
+    fs.writeFileSync(rolloutPath, [
+      JSON.stringify({
+        timestamp: '2026-11-25T00:00:00.000Z', type: 'token_usage_record',
+        payload: { turn_token_usage: { input_tokens: 10, cached_input_tokens: 5, output_tokens: 2 } },
+      }),
+      JSON.stringify({ timestamp: '2026-11-25T00:00:01.000Z', type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 20, cached_input_tokens: 10, output_tokens: 4 } } } }),
+      JSON.stringify({
+        timestamp: '2026-11-25T00:00:02.000Z', type: 'token_usage_record',
+        payload: { turn_token_usage: { input_tokens: 30, cached_input_tokens: 20, output_tokens: 6 } },
+      }),
+      '',
+    ].join('\n'));
+    const usage = readLatest(rolloutPath, Date.parse('2026-11-25T00:00:01.500Z'));
+    assert(usage.input_tokens === 30 && usage.cached_input_tokens === 20 && usage.output_tokens === 6,
+      'Codex rollout reader must choose the current turn and prefer exact turn_token_usage');
+    fs.writeFileSync(rolloutPath, JSON.stringify({ timestamp: '2026-11-25T00:00:01.000Z', type: 'event_msg',
+      payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 20, cached_input_tokens: 10, output_tokens: 4 } } } }));
+    const legacyUsage = readLatest(rolloutPath, Date.parse('2026-11-25T00:00:00.000Z'));
+    assert(legacyUsage?.input_tokens === 20 && legacyUsage?.cached_input_tokens === 10,
+      'Codex rollout reader must fall back to token_count.last_token_usage for older CLIs');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  console.log('Codex rollout usage reader checks passed.');
 }
 
 async function main() {
   testCodexHistoryMigration();
+  testTurnStats();
+  testRecoveredSessionUsage();
+  testCodexCumulativeUsage();
+  testCodexRolloutUsageReader();
   testSessionOverviewMatcher();
   testSessionBodySearch();
   await testLlmproxyUsage();
@@ -1998,6 +2194,13 @@ async function main() {
     const runningSessionList = await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning));
     assert(runningSessionList.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning), 'Running Codex session should be marked as isRunning');
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === firstMessageSession.sessionId);
+    const codexTurnStats = await nextMessage(messages, ws, (msg) => (
+      msg.type === 'turn_stats' && msg.sessionId === firstMessageSession.sessionId
+    ));
+    assert(Math.abs(codexTurnStats.stats.cacheHitRate - 0.2) < 1e-12,
+      'Codex turn stats must report cached_input_tokens / input_tokens');
+    assert(codexTurnStats.stats.outputTokensPerSecond > 0,
+      'Codex turn stats must report output speed from completed turns');
 
     // Switching permission mode must not clear Codex thread id (otherwise resume loses context).
     const codexSessionPath = path.join(sessionsDir, `${firstMessageSession.sessionId}.json`);
@@ -2005,6 +2208,8 @@ async function main() {
     const storedAfterFirst = JSON.parse(fs.readFileSync(codexSessionPath, 'utf8'));
     const threadIdBeforeMode = storedAfterFirst.codexThreadId;
     assert(threadIdBeforeMode, 'Codex thread id should be persisted after first run');
+    assert(Math.abs(storedAfterFirst.lastTurnStats?.cacheHitRate - 0.2) < 1e-12,
+      'Codex turn stats must persist with the session');
 
     ws.send(JSON.stringify({ type: 'set_mode', sessionId: firstMessageSession.sessionId, mode: 'plan' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'mode_changed' && msg.mode === 'plan');
@@ -2219,12 +2424,25 @@ async function main() {
     ws.send(JSON.stringify({ type: 'message', text: 'describe attachment', attachments: [claudeAttachment], mode: 'yolo', agent: 'claude' }));
     const claudeImageSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.title === 'describe attachment');
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === claudeImageSession.sessionId);
+    const claudeTurnStats = await nextMessage(messages, ws, (msg) => (
+      msg.type === 'turn_stats' && msg.sessionId === claudeImageSession.sessionId
+    ));
+    assert(Math.abs(claudeTurnStats.stats.cacheHitRate - 0.15) < 1e-12,
+      'Claude turn stats must use cache reads divided by all input categories');
+    assert(Math.abs(claudeTurnStats.stats.outputTokensPerSecond - (40 / 1.5)) < 1e-12,
+      'Claude turn stats must use duration_api_ms for output speed');
+    assert(claudeTurnStats.stats.durationIncludesToolWait === false,
+      'Claude API duration must exclude tool wait');
     const claudeSpawnLine = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
       .trim()
       .split('\n')
       .find((line) => line.includes(`"event":"process_spawn"`) && line.includes(claudeImageSession.sessionId.slice(0, 8)));
     assert(claudeSpawnLine && claudeSpawnLine.includes('--input-format stream-json'), 'Claude image message should switch stdin to stream-json');
     const storedClaudeSession = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${claudeImageSession.sessionId}.json`), 'utf8'));
+    assert(Math.abs(storedClaudeSession.lastTurnStats?.cacheHitRate - 0.15) < 1e-12,
+      'Claude turn stats must persist with the session');
+    assert(Math.abs(storedClaudeSession.lastTurnStats?.outputTokensPerSecond - (40 / 1.5)) < 1e-12,
+      'Claude persisted turn stats must retain the API-duration output speed');
     assert(Array.isArray(storedClaudeSession.messages?.[0]?.attachments) && storedClaudeSession.messages[0].attachments.length === 1, 'Claude message should persist attachment metadata');
     assert(storedClaudeSession.claudeSessionId, 'Claude session id should be persisted after first run');
     const claudeSessionIdBeforeMode = storedClaudeSession.claudeSessionId;

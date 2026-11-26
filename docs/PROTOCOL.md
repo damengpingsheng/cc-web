@@ -69,12 +69,13 @@
 | `text_delta` | 文本流增量（**经 DOMPurify sanitize 后注入 DOM**，详见 [ARCHITECTURE.md](./ARCHITECTURE.md)） |
 | `tool_start` / `tool_end` | 工具调用起止 |
 | `cost` / `usage` | 成本/用量更新 |
+| `turn_stats` | 最近一轮的缓存命中率与输出速度。含 `sessionId`、`stats`：`usage`（本轮 `inputTokens` / `cachedInputTokens` / `cacheCreationInputTokens` / `outputTokens`）、`cacheHitRate`、`outputTokensPerSecond`、`durationMs`、`durationSource`、`durationIncludesToolWait`、`usageSource`。Claude 速度优先取 `duration_api_ms`；Codex 优先取 rollout 的 `token_usage_record.payload.turn_token_usage`，速度取 `turn.started` 至 `turn.completed`。上游未提供缓存字段时 `cacheHitRate=null`，UI 显示 `--` |
 | `done` | 一轮进程结束。`willContinue: true` 表示服务端还会自动重试或续跑（含 Codex 空最终回答的一次恢复），前端不应在该事件后立即发送排队消息 |
 | `background_done` | 后台完成（推送通知触发） |
 | `notify_config` / `notify_test_result` | 通知配置回执 |
 | `password_changed` | 改密通知。成功时返回新 `token`，前端必须用新 token 替换旧 token；改密副作用：**踢掉所有其他已认证 WS 连接**（详见 [CONFIG.md](./CONFIG.md#鉴权与安全)） |
 | `model_config` / `codex_config` / `dev_config` | 配置回执 |
-| `llmproxy_usage` | llmproxy 个人用量。成功时含 `endUser`、`monthlyQuotaUsd`、`today`、`monthToDate`、`history`、`remainingUsd`、`usedPercent`、`updatedAt`；每个范围含 `spend`、`totalTokens`、`promptTokens`、`completionTokens`、`cacheReadTokens`，以及按消费降序排列的 `models`（每项含 `model`、`calls`、`spend` 和各类 Token）。失败时 `ok=false` 并含 `message` |
+| `llmproxy_usage` | llmproxy 个人用量。成功时含 `endUser`、`monthlyQuotaUsd`、`today`、`monthToDate`、`history`、`remainingUsd`、`usedPercent`、`updatedAt`；每个范围含 `spend`、`totalTokens`、`promptTokens`、`completionTokens`、`cacheReadTokens`，以及按消费降序排列的 `models`（每项含 `model`、`calls`、`spend` 和各类 Token）。`cacheReadTokens` 依次兼容 `usage_object.prompt_tokens_details.cached_tokens`、`input_tokens_details.cached_tokens`、旧版 `cache_read_input_tokens` 和 `cached_tokens`；这里的 `promptTokens` 是 CLI/网关的总输入，已包含缓存命中部分。失败时 `ok=false` 并含 `message` |
 | `apirouter_usage` | APIRouter 模型 key 用量。成功时含 `key`（名称、无限额度标志、可用/授予/累计用量、到期时间）、可选 `wallet`（用户额度可用/累计）、可选 `subscription`（最新一条带订阅计费日志的计划名、总额/已用/剩余、使用比例、观测时间），以及 `currency`、`currencySymbol`、`timezone`、`updatedAt`。日志接口失败时仍返回 key/wallet；失败时 `ok=false` 并含 `message`。不包含 API key 或 access token |
 | `claude_local_config` / `codex_local_config` | 本地配置回执 |
 | `fetch_models_result` | 模型列表回执 |
@@ -109,7 +110,7 @@ client: message
 server: text_delta × N         (流式)
 server: tool_start × N
 server: tool_end × N
-server: cost / usage
+server: cost / usage / turn_stats
 server: done | background_done
 ```
 

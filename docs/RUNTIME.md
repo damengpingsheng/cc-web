@@ -26,7 +26,7 @@ Claude Code 会按 `cleanupPeriodDays` 清理 `~/.claude/projects/<project>/<ses
 
 `server.js` 中 `normalizeSession()` 在加载时统一字段默认值。**新增字段必须在 `normalizeSession` 设默认值**，保证前向兼容。
 
-当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `codexProvider` / `totalCost` / `totalUsage` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `titleSource` / `messages`。
+当前在该函数设默认值的字段：`agent` / `claudeSessionId` / `codexThreadId` / `codexHomeDir` / `codexRuntimeKey` / `codexProvider` / `totalCost` / `totalUsage` / `lastTurnStats` / `taskMode` / `sshHostId` / `remoteCwd` / `group` / `titleSource` / `messages`。
 
 **不在该函数设默认值**（由创建/业务路径显式赋值）：
 - `permissionMode` — 由 `handleNewSession` / `handleMessage` 创建时赋值，默认 `'yolo'`
@@ -62,6 +62,9 @@ Claude Code 会按 `cleanupPeriodDays` 清理 `~/.claude/projects/<project>/<ses
 | `taskMode` | `'local'` 或 `'remote'`（remote 携带 `sshHostId` + `remoteCwd`） |
 | `totalCost` | 累计美元成本 |
 | `totalUsage` | 累计 token 用量（`inputTokens` / `cachedInputTokens` / `outputTokens`） |
+| `lastTurnStats` | 最近完成一轮的用量、缓存命中率和输出速度；不含进行中的轮次 |
+
+Codex 的 `turn.completed.usage` 是线程累计值，不是当前轮值。`lastTurnStats.usage` 优先读取 rollout 的 `token_usage_record.payload.turn_token_usage`（`usageSource=codex_rollout_turn`）；读取不到时，用同一进程内前后两次累计值的差值（`usageSource=codex_thread_delta`）。`session.totalUsage` 保存累计值，不能逐轮相加。服务重启恢复已完成的 Codex 任务时，若输出里有 `turn.completed.usage`，直接覆盖 `totalUsage`；没有累计值时才按本轮 `lastUsage` 增加旧会话总量。缓存命中率只在 usage 明确包含缓存字段时计算，缺失时前端显示 `--`。
 | `hasUnread` | 是否有未读消息（侧栏高亮） |
 | `updated` | 最后更新时间戳（ISO） |
 | `group` | 所属分组 id（`''`=未分组，`normalizeSession` 设默认值） |
