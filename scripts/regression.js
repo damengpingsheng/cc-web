@@ -83,6 +83,8 @@ const {
 const {
   normalizeGateway,
   gatewayParts,
+  DEFAULT_NEW_SESSION_GATEWAYS,
+  defaultNewSessionGateway,
 } = require(path.join(REPO_DIR, 'lib', 'gateway-routing.js'));
 const {
   createCodexProxyManager,
@@ -795,6 +797,20 @@ function testGatewayRouting() {
   }
   assert(normalizeGateway('apirouter') === 'direct-apirouter', 'Legacy apirouter must map to direct-apirouter');
   assert(normalizeGateway('localproxy') === 'proxy-apirouter', 'Legacy localproxy must map to proxy-apirouter');
+  assert(defaultNewSessionGateway('claude') === 'direct-llmproxy',
+    'New Claude sessions must default to direct llmproxy');
+  assert(defaultNewSessionGateway('codex') === 'proxy-llmproxy',
+    'New Codex sessions must default to proxy llmproxy');
+
+  const appSource = fs.readFileSync(path.join(REPO_DIR, 'public', 'app.js'), 'utf8');
+  const start = appSource.indexOf('  const DEFAULT_NEW_SESSION_GATEWAYS');
+  const end = appSource.indexOf('  function defaultNewSessionGateway', start);
+  assert(start >= 0 && end > start, 'Browser new-session gateway defaults must be extractable from public/app.js');
+  const browserDefaults = new Function(`${appSource.slice(start, end)}\nreturn DEFAULT_NEW_SESSION_GATEWAYS;`)();
+  assert(JSON.stringify(browserDefaults) === JSON.stringify(DEFAULT_NEW_SESSION_GATEWAYS),
+    'Browser and server new-session gateway defaults must stay aligned');
+  assert((appSource.match(/gatewayOptionsHtml\(defaultNewSessionGateway\(targetAgent\)\)/g) || []).length === 2,
+    'Both new-session gateway selects must use the agent-specific default');
   console.log('Gateway routing checks passed.');
 }
 
@@ -1206,6 +1222,21 @@ async function testPerSessionGatewayRoutes() {
       LLMPROXY_BASE_URL: 'https://llmproxy.example/v1',
       LLMPROXY_API_KEY: 'llmproxy-key',
     }, async () => {
+      const defaultPage = await connectWs(port, password);
+      await nextMessage(defaultPage.messages, defaultPage.ws, (msg) => msg.type === 'session_list');
+      for (const [agent, expectedGateway] of Object.entries(DEFAULT_NEW_SESSION_GATEWAYS)) {
+        defaultPage.ws.send(JSON.stringify({
+          type: 'new_session', agent, cwd: workDir, mode: 'yolo',
+        }));
+        const info = await nextMessage(defaultPage.messages, defaultPage.ws,
+          (msg) => msg.type === 'session_info' && msg.agent === agent);
+        assert(info.codexGateway === expectedGateway,
+          `New ${agent} sessions without an explicit route must default to ${expectedGateway}`);
+        await nextMessage(defaultPage.messages, defaultPage.ws,
+          (msg) => msg.type === 'session_list' && msg.sessions.some((item) => item.id === info.sessionId));
+      }
+      defaultPage.ws.close();
+
       const pages = [];
       for (const gateway of gateways) {
         const page = await connectWs(port, password);
@@ -2168,7 +2199,9 @@ async function main() {
 
     const codexInitCwd = path.join(tempRoot, 'codex-space');
     mkdirp(codexInitCwd);
-    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: codexInitCwd, mode: 'plan' }));
+    ws.send(JSON.stringify({
+      type: 'new_session', agent: 'codex', cwd: codexInitCwd, mode: 'plan', codexGateway: 'direct-apirouter',
+    }));
     const codexSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === codexInitCwd);
     assert(codexSession.mode === 'plan', 'Codex new_session should follow requested mode');
     assert(codexSession.model === 'gpt-5.5', 'Codex new_session should inject configured profile model');
@@ -2188,7 +2221,10 @@ async function main() {
       mime: 'image/png',
       data: Buffer.from('codex-image'),
     });
-    ws.send(JSON.stringify({ type: 'message', text: 'first codex prompt', attachments: [codexAttachment], mode: 'yolo', agent: 'codex' }));
+    ws.send(JSON.stringify({
+      type: 'message', text: 'first codex prompt', attachments: [codexAttachment],
+      mode: 'yolo', agent: 'codex', codexGateway: 'direct-apirouter',
+    }));
     const firstMessageSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'first codex prompt');
     assert(firstMessageSession.agent === 'codex', 'First-message path created wrong agent');
     const runningSessionList = await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.some((s) => s.id === firstMessageSession.sessionId && s.isRunning));
@@ -2357,7 +2393,9 @@ async function main() {
 
     const autoCompactCwd = path.join(tempRoot, 'codex-auto-compact');
     mkdirp(autoCompactCwd);
-    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: autoCompactCwd, mode: 'yolo' }));
+    ws.send(JSON.stringify({
+      type: 'new_session', agent: 'codex', cwd: autoCompactCwd, mode: 'yolo', codexGateway: 'direct-apirouter',
+    }));
     const autoCompactSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === autoCompactCwd);
     ws.send(JSON.stringify({ type: 'message', text: 'warm up auto compact', sessionId: autoCompactSession.sessionId, mode: 'yolo', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === autoCompactSession.sessionId);
@@ -2381,7 +2419,9 @@ async function main() {
     await nextMessage(detachedPage.messages, detachedPage.ws, (msg) => msg.type === 'session_list');
     const detachedCwd = path.join(tempRoot, 'codex-detached-compact');
     mkdirp(detachedCwd);
-    detachedPage.ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: detachedCwd, mode: 'yolo' }));
+    detachedPage.ws.send(JSON.stringify({
+      type: 'new_session', agent: 'codex', cwd: detachedCwd, mode: 'yolo', codexGateway: 'direct-apirouter',
+    }));
     const detachedSession = await nextMessage(detachedPage.messages, detachedPage.ws, (msg) => (
       msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === detachedCwd
     ));
@@ -3580,7 +3620,9 @@ async function testCodexAbortGracefulSignal() {
     const { ws, messages } = await connectWs(port, password);
     await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
 
-    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    ws.send(JSON.stringify({
+      type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: 'direct-apirouter',
+    }));
     const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex');
     ws.send(JSON.stringify({
       type: 'message',
@@ -4049,7 +4091,9 @@ async function testAutoSessionTitle() {
         },
       }, null, 2));
 
-      ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+      ws.send(JSON.stringify({
+        type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: 'direct-apirouter',
+      }));
       const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
       ws.send(JSON.stringify({ type: 'message', text: '自动标题回归测试', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
@@ -4106,7 +4150,9 @@ async function testAutoSessionTitle() {
       assert(apiRequests === 13, `Auto title should call API once per completed turn (got ${apiRequests})`);
 
       const jiraRequestsBeforeIncidental = jiraRequests;
-      ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+      ws.send(JSON.stringify({
+        type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: 'direct-apirouter',
+      }));
       const incidentalSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.sessionId !== session.sessionId);
       ws.send(JSON.stringify({ type: 'message', text: '排查agent异常命名目录 trigger codex incidental jira example', sessionId: incidentalSession.sessionId, mode: 'yolo', agent: 'codex' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === incidentalSession.sessionId);
@@ -4137,7 +4183,9 @@ async function testAutoSessionTitle() {
           model: 'test-model',
         },
       }, null, 2));
-      ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+      ws.send(JSON.stringify({
+        type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: 'direct-apirouter',
+      }));
       const disabledSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.sessionId !== session.sessionId);
       ws.send(JSON.stringify({ type: 'message', text: '关闭开关后不应自动整理', sessionId: disabledSession.sessionId, mode: 'yolo', agent: 'codex' }));
       await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === disabledSession.sessionId);
@@ -4182,7 +4230,9 @@ async function testBenignCodexStderrExit() {
   }, async () => {
     const { ws, messages } = await connectWs(port, password);
     await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
-    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    ws.send(JSON.stringify({
+      type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: 'direct-apirouter',
+    }));
     const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
     ws.send(JSON.stringify({ type: 'message', text: 'trigger codex benign stderr', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
     await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === session.sessionId);
@@ -4228,7 +4278,9 @@ async function testCodexHistoricalToolOutputWarning() {
   }, async () => {
     const { ws, messages } = await connectWs(port, password);
     await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
-    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    ws.send(JSON.stringify({
+      type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: 'direct-apirouter',
+    }));
     const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
     const sessionPath = path.join(sessionsDir, `${session.sessionId}.json`);
 
@@ -4298,7 +4350,9 @@ async function testCodexEmptyFinalRecovery() {
   }, async () => {
     const { ws, messages } = await connectWs(port, password);
     await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
-    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    ws.send(JSON.stringify({
+      type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: 'direct-apirouter',
+    }));
     const session = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.cwd === workDir);
 
     ws.send(JSON.stringify({ type: 'message', text: 'trigger codex empty final', sessionId: session.sessionId, mode: 'yolo', agent: 'codex' }));
@@ -4410,7 +4464,9 @@ async function testSpawnFailureIsolation() {
     assert(/找不到 Claude CLI/.test(secondError.message || ''), 'Second failed spawn must still report the error');
 
     // 4) Codex 走同一条 spawn 路径，错误文案不能串到 Claude 版
-    ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo' }));
+    ws.send(JSON.stringify({
+      type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', codexGateway: 'direct-apirouter',
+    }));
     const codexSession = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex');
     ws.send(JSON.stringify({ type: 'message', text: 'hi', sessionId: codexSession.sessionId, mode: 'yolo', agent: 'codex' }));
     const codexError = await nextMessage(messages, ws, (msg) => msg.type === 'error');

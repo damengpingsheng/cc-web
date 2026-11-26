@@ -226,11 +226,18 @@
   ];
   const GATEWAY_LABELS = Object.fromEntries(GATEWAY_OPTIONS);
   const GATEWAY_ALIASES = { apirouter: 'direct-apirouter', localproxy: 'proxy-apirouter' };
+  const DEFAULT_NEW_SESSION_GATEWAYS = {
+    claude: 'direct-llmproxy',
+    codex: 'proxy-llmproxy',
+  };
   function normalizeGateway(value) {
     const raw = String(value || '').trim();
     const gatewayId = Object.prototype.hasOwnProperty.call(GATEWAY_LABELS, raw)
       ? raw : (GATEWAY_ALIASES[raw] || 'direct-apirouter');
     return gatewayId;
+  }
+  function defaultNewSessionGateway(agent) {
+    return DEFAULT_NEW_SESSION_GATEWAYS[agent] || 'direct-apirouter';
   }
   function gatewayOptionsHtml(selected) {
     const active = normalizeGateway(selected);
@@ -9548,13 +9555,13 @@
           <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
             <span style="opacity:0.75;white-space:nowrap;font-size:0.92em">网关</span>
             <select class="settings-select" id="ns-gateway-select" style="flex:1" title="选择本会话的代理/直连及上游；代理由 CC-Web 自动启动和守护">
-              ${gatewayOptionsHtml(codexConfigCache?.gateway)}
+              ${gatewayOptionsHtml(defaultNewSessionGateway(targetAgent))}
             </select>
           </div>` : `
           <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
             <span style="opacity:0.75;white-space:nowrap;font-size:0.92em">网关</span>
             <select class="settings-select" id="ns-gateway-select" style="flex:1" title="选择本会话的代理/直连及上游；代理由 CC-Web 自动启动和守护">
-              ${gatewayOptionsHtml(codexConfigCache?.gateway)}
+              ${gatewayOptionsHtml(defaultNewSessionGateway(targetAgent))}
             </select>
           </div>`}
           <div style="display:flex;gap:8px;margin-bottom:12px">
@@ -9763,7 +9770,7 @@
         pendingComposerDraftMigration = { agent: targetAgent };
         close();
         saveRecentCwd(cwd);
-        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local', codexGateway: normalizeGateway(overlay.querySelector('#ns-gateway-select')?.value || codexConfigCache?.gateway) });
+        send({ type: 'new_session', cwd, agent: targetAgent, mode: currentMode, taskMode: 'local', codexGateway: normalizeGateway(overlay.querySelector('#ns-gateway-select')?.value || defaultNewSessionGateway(targetAgent)) });
       } else {
         // Remote task
         if (!selectedHostId) {
@@ -9773,7 +9780,7 @@
         const remoteCwd = remoteView.querySelector('#ns-remote-cwd')?.value?.trim() || '';
         pendingComposerDraftMigration = { agent: targetAgent };
         close();
-        send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd, codexGateway: normalizeGateway(overlay.querySelector('#ns-gateway-select')?.value || codexConfigCache?.gateway) });
+        send({ type: 'new_session', agent: targetAgent, mode: currentMode, taskMode: 'remote', sshHostId: selectedHostId, remoteCwd, codexGateway: normalizeGateway(overlay.querySelector('#ns-gateway-select')?.value || defaultNewSessionGateway(targetAgent)) });
       }
     });
   }

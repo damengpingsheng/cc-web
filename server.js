@@ -48,6 +48,7 @@ const {
   normalizeGateway,
   gatewayParts,
   gatewayLabel,
+  defaultNewSessionGateway,
 } = require('./lib/gateway-routing');
 const {
   mergeCodexHistoryByUserTurn,
@@ -5339,8 +5340,11 @@ function handleNewSession(ws, msg) {
   const cwd = rawCwd ? expandUserPath(rawCwd) : null;
   const agent = normalizeAgent(msg?.agent);
   const requestedMode = ['default', 'plan', 'yolo'].includes(msg?.mode) ? msg.mode : 'yolo';
-  // 会话级 Codex 网关（新建会话弹窗选择）；空值/旧会话回落到全局配置的 gateway
-  const codexGateway = normalizeGateway(msg?.codexGateway || loadCodexConfig().gateway);
+  // 会话级网关由新建弹窗选择；未显式传入时按 agent 取不同的默认路由。
+  const requestedGateway = String(msg?.codexGateway || '').trim();
+  const codexGateway = requestedGateway
+    ? normalizeGateway(requestedGateway)
+    : defaultNewSessionGateway(agent);
   const taskMode = msg?.taskMode === 'remote' ? 'remote' : 'local';
   const sshHostId = String(msg?.sshHostId || '').trim();
   const remoteCwd = String(msg?.remoteCwd || '').trim();
@@ -5823,6 +5827,7 @@ async function handleMessage(ws, msg, options = {}) {
   if (!session) {
     const id = crypto.randomUUID();
     const agent = normalizeAgent(msg.agent);
+    const requestedGateway = String(msg?.codexGateway || '').trim();
     const resolvedCwd = agent === 'claude' ? (process.env.HOME || process.env.USERPROFILE || process.cwd()) : null;
 	    session = {
 	      id,
@@ -5835,7 +5840,9 @@ async function handleMessage(ws, msg, options = {}) {
 	      codexThreadId: null,
 	      codexProvider: '',
 	      model: agent === 'codex' ? resolveDefaultCodexModel() : null,
-	      codexGateway: normalizeGateway(msg.codexGateway || loadCodexConfig().gateway),
+	      codexGateway: requestedGateway
+	        ? normalizeGateway(requestedGateway)
+	        : defaultNewSessionGateway(agent),
 	      permissionMode: mode || 'yolo',
 	      totalCost: 0,
 	      totalUsage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
