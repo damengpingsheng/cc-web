@@ -296,6 +296,20 @@ function summaryApiIdentity() {
   ).trim();
 }
 
+function extractSummaryApiText(json) {
+  const content = json?.choices?.[0]?.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => (
+      typeof part === 'string' ? part : (typeof part?.text === 'string' ? part.text : '')
+    )).join('');
+  }
+  if (Array.isArray(json?.content)) {
+    return json.content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('');
+  }
+  return '';
+}
+
 function callSummaryApi(creds, prompt, options = {}) {
   return new Promise((resolve) => {
     try {
@@ -303,9 +317,10 @@ function callSummaryApi(creds, prompt, options = {}) {
       const url = new URL(base + '/v1/chat/completions');
       const mod = url.protocol === 'https:' ? require('https') : require('http');
       const model = creds.model || 'claude-opus-4-6';
+      const outputTokenLimit = options.maxTokens || 1024;
       const body = JSON.stringify({
         model,
-        max_tokens: options.maxTokens || 1024,
+        max_tokens: outputTokenLimit,
         messages: [{ role: 'user', content: prompt }],
       });
       const headers = {
@@ -327,9 +342,36 @@ function callSummaryApi(creds, prompt, options = {}) {
         res.on('end', () => {
           try {
             const json = JSON.parse(data);
-            const text = json.choices?.[0]?.message?.content || json.content?.[0]?.text || '';
-            const error = text ? '' : (json.error?.message || `HTTP ${res.statusCode}：摘要 API 未返回文本`);
-            resolve({ ok: !!text, text: text.trim(), statusCode: res.statusCode, error });
+            const rawText = extractSummaryApiText(json);
+            const text = rawText.trim();
+            const finishReason = json.choices?.[0]?.finish_reason || '';
+            const usage = json.usage && typeof json.usage === 'object' ? json.usage : {};
+            const completionDetails = usage.completion_tokens_details || usage.output_tokens_details || {};
+            const reasoningTokens = Number.isFinite(completionDetails.reasoning_tokens)
+              ? completionDetails.reasoning_tokens
+              : null;
+            const textTokens = Number.isFinite(completionDetails.text_tokens)
+              ? completionDetails.text_tokens
+              : null;
+            const truncated = finishReason === 'length';
+            const error = text
+              ? ''
+              : (json.error?.message || (truncated
+                ? `HTTP ${res.statusCode}：摘要 API 输出达到 ${outputTokenLimit} token 上限被截断`
+                : `HTTP ${res.statusCode}：摘要 API 未返回文本`));
+            resolve({
+              ok: !!text,
+              text,
+              statusCode: res.statusCode,
+              error,
+              finishReason,
+              truncated,
+              reasoningTokens,
+              textTokens,
+              contentLength: rawText.length,
+              outputTokenLimit,
+              responseLength: data.length,
+            });
           } catch {
             resolve({ ok: false, text: '', statusCode: res.statusCode, error: `HTTP ${res.statusCode}：摘要 API 返回了无效 JSON` });
           }
@@ -2515,6 +2557,169 @@ function getSessionTitleSuggestionCredentials() {
   return null;
 }
 
+const SESSION_TITLE_BATCH_SIZE = 8;
+const SESSION_TITLE_RETRY_BATCH_SIZE = 4;
+const SESSION_TITLE_MAX_TOKENS = 4096;
+const SESSION_TITLE_TIMEOUT_MS = 45000;
+
+function summarizeTitleApiResult(result) {
+  return {
+    statusCode: result.statusCode || null,
+    finishReason: result.finishReason || null,
+    truncated: !!result.truncated,
+    reasoningTokens: result.reasoningTokens,
+    textTokens: result.textTokens,
+    contentLength: result.contentLength ?? 0,
+    outputTokenLimit: result.outputTokenLimit || null,
+    responseLength: result.responseLength || 0,
+  };
+}
+
+function isRetryableTitleBatchFailure(result) {
+  if (!result.statusCode) return true;
+  if ([401, 403, 429].includes(result.statusCode)) return false;
+  return result.statusCode >= 500 || result.statusCode === 200;
+}
+
+function describeTitleBatchFailure(result, candidateCount) {
+  if (result.error) return result.error;
+  if (result.truncated) {
+    return `HTTP ${result.statusCode}：摘要 API 输出达到 ${result.outputTokenLimit} token 上限被截断`;
+  }
+  return `摘要 API 未返回全部 ${candidateCount} 个候选的标题`;
+}
+
+async function requestSessionTitleBatch(creds, candidates, sessionId, attempt) {
+  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(candidates), {
+    maxTokens: SESSION_TITLE_MAX_TOKENS,
+    timeoutMs: SESSION_TITLE_TIMEOUT_MS,
+    sessionId,
+  });
+  const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, candidates) : new Map();
+  const missing = candidates.filter((candidate) => !suggestions.has(candidate.id));
+  const failed = missing.length > 0;
+  const diagnostics = {
+    attempt,
+    requested: candidates.length,
+    suggested: suggestions.size,
+    missing: missing.length,
+    ...summarizeTitleApiResult(result),
+  };
+  plog(failed ? 'WARN' : 'INFO', failed
+    ? 'session_title_api_batch_failed'
+    : 'session_title_api_batch_completed', diagnostics);
+  return { suggestions, missing, result, diagnostics };
+}
+
+async function retrySessionTitleBatchTree(
+  creds,
+  candidates,
+  maxBatchSize,
+  sessionIdPrefix,
+  nextRetryNumber,
+) {
+  const retryResults = [];
+  for (let start = 0; start < candidates.length; start += maxBatchSize) {
+    const retryBatch = candidates.slice(start, start + maxBatchSize);
+    const retry = await requestSessionTitleBatch(
+      creds,
+      retryBatch,
+      `${sessionIdPrefix}r${nextRetryNumber()}`,
+      'retry',
+    );
+    retryResults.push(retry);
+    if (!isRetryableTitleBatchFailure(retry.result)) {
+      return { retryResults, stopFailure: retry };
+    }
+    if (retry.missing.length === 0 || retryBatch.length === 1) continue;
+
+    const nextBatchSize = Math.max(1, Math.floor(maxBatchSize / 2));
+    const nested = await retrySessionTitleBatchTree(
+      creds,
+      retry.missing,
+      nextBatchSize,
+      sessionIdPrefix,
+      nextRetryNumber,
+    );
+    retryResults.push(...nested.retryResults);
+    if (nested.stopFailure) return { retryResults, stopFailure: nested.stopFailure };
+  }
+  return { retryResults, stopFailure: null };
+}
+
+async function requestSessionTitleSuggestions(creds, candidates, sessionIdPrefix) {
+  const suggestions = new Map();
+  const failedBatches = [];
+  const batchCount = Math.ceil(candidates.length / SESSION_TITLE_BATCH_SIZE);
+  let processedBatchCount = 0;
+  let stopInfo = null;
+  for (let start = 0; start < candidates.length; start += SESSION_TITLE_BATCH_SIZE) {
+    const batchIndex = start / SESSION_TITLE_BATCH_SIZE + 1;
+    const batch = candidates.slice(start, start + SESSION_TITLE_BATCH_SIZE);
+    processedBatchCount += 1;
+    const primary = await requestSessionTitleBatch(
+      creds,
+      batch,
+      `${sessionIdPrefix}-${batchIndex}`,
+      'primary',
+    );
+    for (const [id, title] of primary.suggestions) suggestions.set(id, title);
+
+    const retryResults = [];
+    let stopFailure = !isRetryableTitleBatchFailure(primary.result) ? primary : null;
+    if (isRetryableTitleBatchFailure(primary.result)) {
+      let retryNumber = 0;
+      const retried = await retrySessionTitleBatchTree(
+        creds,
+        primary.missing,
+        SESSION_TITLE_RETRY_BATCH_SIZE,
+        `${sessionIdPrefix}-${batchIndex}`,
+        () => { retryNumber += 1; return retryNumber; },
+      );
+      retryResults.push(...retried.retryResults);
+      for (const retry of retried.retryResults) {
+        for (const [id, title] of retry.suggestions) suggestions.set(id, title);
+      }
+      stopFailure = retried.stopFailure;
+    }
+
+    if (stopFailure) {
+      stopInfo = {
+        batchIndex,
+        error: describeTitleBatchFailure(stopFailure.result, stopFailure.diagnostics.requested),
+        diagnostics: stopFailure.diagnostics,
+      };
+    }
+    const suggestedInBatch = batch.filter((candidate) => suggestions.has(candidate.id)).length;
+    if (suggestedInBatch === batch.length) {
+      if (stopInfo) break;
+      continue;
+    }
+    const lastFailure = stopFailure
+      || [...retryResults].reverse().find((retry) => retry.missing.length > 0)
+      || primary;
+    failedBatches.push({
+      index: batchIndex,
+      requested: batch.length,
+      suggested: suggestedInBatch,
+      missing: batch.length - suggestedInBatch,
+      stopped: !!stopInfo,
+      error: describeTitleBatchFailure(lastFailure.result, lastFailure.diagnostics.requested),
+      attempts: [primary.diagnostics, ...retryResults.map((retry) => retry.diagnostics)],
+    });
+    if (stopInfo) break;
+  }
+  const failureCount = candidates.length - suggestions.size;
+  return {
+    suggestions,
+    failedBatches,
+    failureCount,
+    batchCount,
+    processedBatchCount,
+    stopInfo,
+  };
+}
+
 async function handleAuditSessionTitles(ws) {
   let candidates = [];
   try {
@@ -2547,19 +2752,31 @@ async function handleAuditSessionTitles(ws) {
   }
 
   const enriched = await Promise.all(candidates.map(attachJiraIssues));
-  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(enriched), { maxTokens: 4096, timeoutMs: 45000, sessionId: `cc-web-title-audit-${Date.now()}` });
-  const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, enriched) : new Map();
-  if (!result.ok) plog('WARN', 'session_title_api_failed', { error: result.error || 'no_text' });
+  const request = await requestSessionTitleSuggestions(
+    creds,
+    enriched,
+    `cc-web-title-audit-${Date.now()}`,
+  );
+  const { suggestions, failedBatches, failureCount, batchCount, processedBatchCount, stopInfo } = request;
+  const reportedFailure = failedBatches.find((batch) => batch.stopped) || failedBatches[0];
+  const failureError = reportedFailure?.error || stopInfo?.error || '';
+  const failedBatchText = failedBatches.length > 0 ? `，其中 ${failedBatches.length} 批未完成` : '';
+  const stoppedText = stopInfo && processedBatchCount < batchCount ? '，后续请求已停止' : '';
+  const failureSummary = failureCount > 0
+    ? `仍有 ${failureCount} 个候选未生成标题；已处理 ${processedBatchCount}/${batchCount} 批${failedBatchText}${stoppedText}${failureError ? `：${failureError}` : ''}`
+    : '';
   wsSend(ws, {
     type: 'session_title_audit',
     candidates: enriched.map((candidate) => ({
       ...candidate,
       suggestion: suggestions.get(candidate.id) || '',
     })),
-    aiStatus: suggestions.size > 0 ? 'ready' : 'failed',
+    aiStatus: suggestions.size > 0 ? (failureCount > 0 ? 'partial' : 'ready') : 'failed',
     aiMessage: suggestions.size > 0
-      ? `已根据完整对话生成 ${suggestions.size} 条建议，请确认后应用。`
-      : `标题建议生成失败${result.error ? `：${result.error}` : ''}，候选已列出，可手工填写。`,
+      ? (failedBatches.length > 0
+        ? `已根据完整对话生成 ${suggestions.size} 条建议；${failureSummary}。可手工补填未生成项后再应用。`
+        : `已根据完整对话生成 ${suggestions.size} 条建议，请确认后应用。`)
+      : `标题建议生成失败${failureSummary ? `：${failureSummary}` : ''}，候选已列出，可手工填写。`,
   });
 }
 
@@ -2621,13 +2838,25 @@ function scheduleAutoSessionTitle(sessionId) {
 
   state.running = (async () => {
     const enrichedCandidate = await attachJiraIssues(candidate);
-    const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt([enrichedCandidate]), { maxTokens: 4096, timeoutMs: 45000, sessionId });
+    const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt([enrichedCandidate]), {
+      maxTokens: SESSION_TITLE_MAX_TOKENS,
+      timeoutMs: SESSION_TITLE_TIMEOUT_MS,
+      sessionId,
+    });
     const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, [enrichedCandidate]) : new Map();
-    if (!result.ok) {
+    const apiDiagnostics = {
+      sessionId: sessionId.slice(0, 8),
+      ...summarizeTitleApiResult(result),
+    };
+    if (!result.ok || suggestions.size === 0) {
       plog('WARN', 'auto_title_api_failed', {
-        sessionId: sessionId.slice(0, 8),
-        statusCode: result.statusCode || null,
-        error: result.error || 'no_text',
+        ...apiDiagnostics,
+        error: describeTitleBatchFailure(result, 1),
+      });
+    } else if (result.truncated) {
+      plog('WARN', 'auto_title_api_truncated', {
+        ...apiDiagnostics,
+        error: describeTitleBatchFailure(result, 1),
       });
     }
     const suggestedTitle = suggestions.get(sessionId) || '';

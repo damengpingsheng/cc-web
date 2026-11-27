@@ -3946,26 +3946,81 @@ async function testSessionTitleAudit() {
   const sleepChild = spawn('sleep', ['60'], { stdio: 'ignore' });
 
   let titleApiRequest = null;
+  let titleApiRequests = [];
+  let titleAuditRunCount = 0;
+  const titleAuditCandidates = [];
+  const titleAuditPrompt = '帮我整理这些会话的标题并保留完整事务';
+  for (let index = 0; index < 8; index++) {
+    titleAuditCandidates.push({
+      id: `title-audit-batch-${String(index).padStart(2, '0')}`,
+      title: `${titleAuditPrompt} ${index}`,
+      agent: index % 2 === 0 ? 'codex' : 'claude',
+      updated: fixedUpdated,
+      cwd: '/tmp/title-audit',
+      messages: [
+        { role: 'user', content: `${titleAuditPrompt} ${index}`, timestamp: fixedUpdated },
+        { role: 'assistant', content: `第 ${index} 个候选的结论。`, timestamp: fixedUpdated },
+      ],
+    });
+  }
   const titleApiServer = http.createServer((req, res) => {
     let body = '';
     req.setEncoding('utf8');
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
       titleApiRequest = JSON.parse(body);
+      titleApiRequests.push(titleApiRequest);
       assert(req.headers['x-litellm-end-user-id'] === 'title-regression-user', 'Title API must identify the real end user');
-      assert(/^cc-web-title-audit-\d+$/.test(req.headers['x-session-id'] || ''), 'Title audit must send a stable per-request session id');
+      assert(/^cc-web-title-audit-\d+-\d+(?:r\d+)?$/.test(req.headers['x-session-id'] || ''), 'Title audit must send a stable per-batch or retry session id');
       const prompt = titleApiRequest.messages?.[0]?.content || '';
       const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
-      const content = JSON.stringify(candidates.map((candidate) => ({ id: candidate.id, title: `整理后的标题：${candidate.oldTitle}` })));
+      const retryAttempt = /r\d+$/.test(req.headers['x-session-id'] || '');
+      const currentAuditRun = titleAuditRunCount;
+      const rateLimited = currentAuditRun === 4;
+      const targetedRetryFailure = currentAuditRun === 2
+        && candidates.some((candidate) => candidate.id === titleAuditCandidates[3].id);
+      const adaptivePrimaryFailure = currentAuditRun === 3 && !retryAttempt && candidates.length > 4;
+      const adaptiveFourFailure = currentAuditRun === 3 && retryAttempt && candidates.length === 4;
+      const truncateThisBatch = adaptivePrimaryFailure || adaptiveFourFailure || (retryAttempt
+        ? targetedRetryFailure
+        : (currentAuditRun === 0 || currentAuditRun === 1 || targetedRetryFailure));
+      let returned = candidates;
+      if (adaptiveFourFailure) {
+        returned = [];
+      } else if (adaptivePrimaryFailure) {
+        returned = candidates.slice(0, 4);
+      } else if (truncateThisBatch) {
+        returned = retryAttempt
+          ? []
+          : (currentAuditRun === 2
+            ? candidates.filter((candidate) => candidate.id !== titleAuditCandidates[3].id)
+            : candidates.slice(0, Math.max(0, candidates.length - 1)));
+      }
+      const content = JSON.stringify(returned.map((candidate) => ({ id: candidate.id, title: `整理后的标题：${candidate.oldTitle}` })));
       setTimeout(() => {
         if (res.destroyed) return;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        const responseBody = Buffer.from(JSON.stringify({ choices: [{ message: { content } }] }), 'utf8');
+        res.writeHead(rateLimited ? 429 : 200, { 'Content-Type': 'application/json' });
+        const responseBody = Buffer.from(JSON.stringify(rateLimited ? {
+          error: { message: 'HTTP 429：限流测试' },
+        } : {
+          choices: [{
+            message: { content },
+            finish_reason: truncateThisBatch ? 'length' : 'stop',
+          }],
+          usage: {
+            completion_tokens: 4096,
+            completion_tokens_details: {
+              reasoning_tokens: truncateThisBatch ? 3072 : 512,
+              text_tokens: truncateThisBatch ? 1024 : 256,
+            },
+          },
+        }), 'utf8');
         const splitAt = responseBody.indexOf(Buffer.from('整')) + 1;
-        assert(splitAt > 0, 'Title API mock must find a multi-byte character to split');
-        res.write(responseBody.subarray(0, splitAt));
-        res.end(responseBody.subarray(splitAt));
-      }, 20500);
+        const writeSplit = splitAt > 0
+          ? () => { res.write(responseBody.subarray(0, splitAt)); res.end(responseBody.subarray(splitAt)); }
+          : () => res.end(responseBody);
+        writeSplit();
+      }, 20);
     });
   });
   await new Promise((resolve, reject) => {
@@ -3990,6 +4045,9 @@ async function testSessionTitleAudit() {
   writeSession(semanticId, '分析缓存链路抖动', 'claude', [
     { role: 'user', content: '看看缓存链路为什么抖动', timestamp: fixedUpdated },
   ]);
+  for (const candidate of titleAuditCandidates) {
+    writeSession(candidate.id, candidate.title, candidate.agent, candidate.messages);
+  }
   const activeRunDir = path.join(sessionsDir, `${activeId}-run`);
   mkdirp(activeRunDir);
   fs.writeFileSync(path.join(activeRunDir, 'pid'), String(sleepChild.pid));
@@ -4008,7 +4066,7 @@ async function testSessionTitleAudit() {
       CODEX_PATH: MOCK_CODEX,
     }, async () => {
       const { ws, messages } = await connectWs(port, password);
-      await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.length === 3);
+      await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && msg.sessions.length === titleAuditCandidates.length + 3);
 
       ws.send(JSON.stringify({ type: 'audit_session_titles' }));
       const unavailable = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit');
@@ -4024,13 +4082,21 @@ async function testSessionTitleAudit() {
           model: 'test-model',
         },
       }, null, 2));
+      titleAuditRunCount += 1;
       ws.send(JSON.stringify({ type: 'audit_session_titles' }));
-      const audit = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit', 30000);
-      assert(audit.aiStatus === 'ready', `Configured title API should generate suggestions (got ${audit.aiStatus}: ${audit.aiMessage})`);
-      assert(titleApiRequest?.max_tokens === 4096, `Title API should request 4096 output tokens (got ${titleApiRequest?.max_tokens})`);
-      assert(titleApiRequest?.model === 'test-model', `Title API should use configured model (got ${titleApiRequest?.model})`);
-      assert(audit.candidates.length === 2, `Audit should find exactly two prompt-derived titles (got ${audit.candidates.length})`);
-      assert(audit.candidates.every((item) => item.suggestion.includes('整理后的标题') && !item.suggestion.includes('\uFFFD')), 'UTF-8 split across HTTP chunks must not corrupt title suggestions');
+      const audit = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit', 60000);
+      assert(audit.aiStatus === 'ready', `Retries should recover truncated batches (got ${audit.aiStatus}: ${audit.aiMessage})`);
+      assert(titleApiRequests.length === 4, `Title audit should retry only the missing candidates (got ${titleApiRequests.length})`);
+      assert(titleApiRequests.every((request) => request.max_tokens === 4096), 'Every title batch should request 4096 output tokens');
+      assert(titleApiRequests.every((request) => request.model === 'test-model'), 'Every title batch should use the configured model');
+      const batchSizes = titleApiRequests.map((request) => {
+        const prompt = request.messages?.[0]?.content || '';
+        return JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1)).length;
+      });
+      assert(batchSizes.join(',') === '8,1,2,1', `Title audit should retry one missing candidate per primary batch (got ${batchSizes.join(',')})`);
+      assert(audit.candidates.every((item) => item.suggestion.includes('整理后的标题')), 'All candidates should have suggestions after successful retries');
+      const titleAuditCandidatesForAssertions = audit.candidates.filter((item) => item.id !== inactiveId && item.id !== activeId);
+      assert(titleAuditCandidatesForAssertions.every((item) => !item.suggestion.includes('\uFFFD')), 'UTF-8 split across HTTP chunks must not corrupt title suggestions');
       assert(!audit.candidates.some((item) => item.id === semanticId), 'Semantic title must not be an audit candidate');
       assert(audit.candidates.find((item) => item.id === activeId)?.active === true, 'Running session must be marked active');
       assert(audit.candidates.find((item) => item.id === inactiveId)?.users.length === 2, 'Audit should expose later user intent as context');
@@ -4065,6 +4131,45 @@ async function testSessionTitleAudit() {
       delete inactiveAfter.titleSource;
       assert(JSON.stringify(inactiveAfter) === JSON.stringify(inactiveBefore), 'Apply must only change the title field');
       assert(applied.backupDir && fs.existsSync(path.join(applied.backupDir, `${inactiveId}.json`)), 'Apply must create a recoverable backup');
+
+      const auditLogs = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line))
+        .filter((entry) => entry.event === 'session_title_api_batch_failed');
+      const auditLog = auditLogs[0];
+      assert(auditLog && auditLog.truncated === true, 'Title batch diagnostics must be logged');
+      assert(auditLog.finishReason === 'length', 'Title batch log must record finish_reason');
+      assert(auditLog.reasoningTokens === 3072 && auditLog.textTokens === 1024, 'Title batch log must record reasoning and text token counts');
+
+      titleAuditRunCount += 1;
+      ws.send(JSON.stringify({ type: 'audit_session_titles' }));
+      const partialAudit = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit', 60000);
+      assert(partialAudit.aiStatus === 'partial', `A failed retry should report partial results (got ${partialAudit.aiStatus}: ${partialAudit.aiMessage})`);
+      assert(partialAudit.candidates.filter((item) => item.suggestion).length === 8, 'Suggestions from successful entries should survive one failed retry');
+      assert(partialAudit.candidates.filter((item) => !item.suggestion).length === 1, 'The candidate omitted by every retry should stay manually editable');
+      assert(partialAudit.candidates.length === 9, 'Partial audit must retain every eligible candidate for manual editing');
+      assert(/输出达到 4096 token 上限被截断/.test(partialAudit.aiMessage), `Failed retry must report the truncation cause (got ${partialAudit.aiMessage})`);
+      assert(/已处理 2\/2 批/.test(partialAudit.aiMessage), `Partial audit must report processed batches (got ${partialAudit.aiMessage})`);
+
+      titleAuditRunCount += 1;
+      const requestsBeforeAdaptiveRetry = titleApiRequests.length;
+      ws.send(JSON.stringify({ type: 'audit_session_titles' }));
+      const adaptiveAudit = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit', 60000);
+      assert(adaptiveAudit.aiStatus === 'ready', `Adaptive retries should recover a failed four-candidate batch (got ${adaptiveAudit.aiStatus}: ${adaptiveAudit.aiMessage})`);
+      assert(adaptiveAudit.candidates.every((item) => item.suggestion), 'Adaptive retries should fill every candidate');
+      const adaptiveBatchSizes = titleApiRequests.slice(requestsBeforeAdaptiveRetry).map((request) => {
+        const prompt = request.messages?.[0]?.content || '';
+        return JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1)).length;
+      });
+      assert(adaptiveBatchSizes.join(',') === '8,4,2,2,1', `Adaptive retries should split 4 into 2 and 1 (got ${adaptiveBatchSizes.join(',')})`);
+
+      titleAuditRunCount += 1;
+      const requestsBeforeRateLimit = titleApiRequests.length;
+      ws.send(JSON.stringify({ type: 'audit_session_titles' }));
+      const rateLimitedAudit = await nextMessage(messages, ws, (msg) => msg.type === 'session_title_audit', 60000);
+      assert(rateLimitedAudit.aiStatus === 'failed', `HTTP 429 must fail the audit (got ${rateLimitedAudit.aiStatus})`);
+      assert(titleApiRequests.length === requestsBeforeRateLimit + 1, 'HTTP 429 must stop the audit without retrying or sending later batches');
+      assert(/HTTP 429/.test(rateLimitedAudit.aiMessage), `HTTP 429 must be shown to the user (got ${rateLimitedAudit.aiMessage})`);
+      assert(/已处理 1\/2 批/.test(rateLimitedAudit.aiMessage) && /后续请求已停止/.test(rateLimitedAudit.aiMessage), `Rate-limit message must explain that later batches were skipped (got ${rateLimitedAudit.aiMessage})`);
 
       ws.close();
     });
@@ -4132,7 +4237,9 @@ async function testAutoSessionTitle() {
             : 'LAGSW-9877 Jira字段更新与评论规避';
       const content = JSON.stringify([{ id: candidates[0]?.id, title }]);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+      res.end(JSON.stringify({
+        choices: [{ message: { content }, finish_reason: apiRequests === 4 ? 'length' : 'stop' }],
+      }));
     });
   });
   await new Promise((resolve, reject) => {
@@ -4199,6 +4306,11 @@ async function testAutoSessionTitle() {
       const saved = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${session.sessionId}.json`), 'utf8'));
       assert(saved.title.startsWith('LAGSW-9877 demo双进程，8555出图偏绿'), `Auto title must include the Jira issue summary (got ${saved.title})`);
       assert(saved.titleSource === 'auto', 'Auto title source should be persisted');
+      const autoTitleApiLogs = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line))
+        .filter((entry) => entry.event === 'auto_title_api_failed' || entry.event === 'auto_title_api_truncated');
+      assert(autoTitleApiLogs.some((entry) => entry.event === 'auto_title_api_truncated' && entry.truncated === true), 'A truncated auto title with a usable suggestion must be logged as truncated');
+      assert(!autoTitleApiLogs.some((entry) => entry.event === 'auto_title_api_failed' && entry.truncated === true), 'A usable truncated auto title must not be logged as failed');
       assert(titlePrompt.includes('jiraIssues') && titlePrompt.includes('8555出图偏绿'), 'Auto-title prompt must include the Jira issue summary');
       assert(titlePrompt.includes('不能只写后续操作而丢掉工单主题'), 'Auto-title prompt must require the Jira issue topic');
       assert(jiraRequests === 1, `Auto title should fetch each Jira issue once (got ${jiraRequests})`);

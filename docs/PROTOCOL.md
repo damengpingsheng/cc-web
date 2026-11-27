@@ -61,7 +61,7 @@
 | `resume_generating` | 恢复生成态 |
 | `claude_recovery_required` | 检测到 Claude `claudeSessionId` 对应的原生 transcript 已不存在。含 `sessionId`、短时 `recoveryToken`、`snapshotAvailable` 和可选 `snapshotPath`；此时本轮消息未写入历史，也未启动 CLI |
 | `session_renamed` | 重命名通知。`source: 'manual'` 表示用户命名，`source: 'auto'` 表示每轮完成后的自动整理 |
-| `session_title_audit` | 标题体检结果。含 `candidates`、`aiStatus`（`ready` / `unavailable` / `failed` / `empty` / `error`）和 `aiMessage`；候选附带历史用户意图、助手结论与可选 `suggestion` |
+| `session_title_audit` | 标题体检结果。含 `candidates`、`aiStatus`（`ready` / `partial` / `unavailable` / `failed` / `empty` / `error`）和 `aiMessage`；候选附带历史用户意图、助手结论与可选 `suggestion`。标题建议按每批最多 8 个候选请求模型；批次截断或漏项时，对缺失候选按 4 / 2 / 1 逐级拆分重试，仍缺项时保留成功结果并标记 `partial` |
 | `session_titles_applied` | 标题批量更新回执。成功时含 `count` 与备份目录 `backupDir`；失败时不写入 |
 | `session_body_search_result` | 正文搜索结果。原样返回 `requestId`、`query`、`regex`，并含 `ok`、`error` 与 `results`；每项结果含 `sessionId`、`matchCount`、`matchCountCapped`、`snippet`、`snippetStart`、`snippetEnd` |
 | `mode_changed` / `model_changed` | 模式/模型切换通知 |
