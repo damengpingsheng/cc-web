@@ -853,6 +853,9 @@ const MIDRUN_CLAUDE_DISK_SYNC_MS = 30000;
 
 // 单次用户请求连续触发运行中熔断续跑计数：sessionId -> count
 const midRunCompactCounts = new Map();
+// 单次用户请求连续触发 P0 自动 compact-replay 计数：sessionId -> count
+const autoCompactReplayCounts = new Map();
+const AUTO_COMPACT_MAX_RETRIES = MIDRUN_MAX_CONTINUATIONS;
 
 // Per-session loop timers. Schedule data itself is persisted on session.loop.
 const activeLoops = new Map();
@@ -4157,7 +4160,18 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       ? (actionableStderr || null)
       : null
   );
-  contextLimitExceeded = isContextLimitError(entry.agent || 'claude', `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`);
+  const hasProcessFailure = !!(
+    rawCompletionError
+    || entry.claudeResultIsError
+    || (typeof exitCode === 'number' && exitCode !== 0)
+    || signal
+  );
+  contextLimitExceeded = (!intentionalAbort && hasProcessFailure)
+    ? isContextLimitError(
+      entry.agent || 'claude',
+      `${entry.fullText || ''}\n${stderrSnippet || ''}\n${rawCompletionError || ''}`,
+    )
+    : false;
   let completionError = rawCompletionError ? formatRuntimeError(entry.agent || 'claude', rawCompletionError, { exitCode, signal }) : null;
   if (!entry.lastError && rawCompletionError) entry.lastError = rawCompletionError;
 
@@ -4264,6 +4278,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   let shouldAutoCompact = false;
   let compactAutoRetryRequested = false;
   let midRunLimitReached = false;
+  let autoCompactLimitReached = false;
 
   // Compact/replay is a logical continuation of the failed turn, not a UI-only
   // action. Decide it before checking WebSocket state so a detached task can
@@ -4283,19 +4298,38 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     // A hidden mid-run continuation can itself hit P0 repeatedly. Count those
     // compactions against the same budget as proactive mid-run interruptions.
     const isMidRunContinuation = !!entry.midRunContinuation;
-    const nextCount = (midRunCompactCounts.get(sessionId) || 0) + 1;
-    if (isMidRunContinuation && nextCount > MIDRUN_MAX_CONTINUATIONS) {
-      midRunLimitReached = true;
+    if (isMidRunContinuation) {
+      const nextCount = (midRunCompactCounts.get(sessionId) || 0) + 1;
+      if (nextCount > MIDRUN_MAX_CONTINUATIONS) {
+        midRunLimitReached = true;
+      } else {
+        midRunCompactCounts.set(sessionId, nextCount);
+        pendingCompactRetries.set(sessionId, {
+          text: pendingRetry?.text || entry.inputText || '',
+          mode: pendingRetry?.mode || entry.mode || session.permissionMode || 'yolo',
+          reason: 'auto',
+          hideInHistory: true,
+          skipUserHistory: true,
+          rootTaskText: pendingRetry?.rootTaskText || entry.rootTaskText,
+        });
+        shouldAutoCompact = true;
+      }
     } else {
-      if (isMidRunContinuation) midRunCompactCounts.set(sessionId, nextCount);
-      pendingCompactRetries.set(sessionId, {
-        text: pendingRetry?.text || entry.inputText || '',
-        mode: pendingRetry?.mode || entry.mode || session.permissionMode || 'yolo',
-        reason: 'auto',
-        hideInHistory: pendingRetry?.hideInHistory || entry.hideInHistory,
-        rootTaskText: pendingRetry?.rootTaskText || entry.rootTaskText,
-      });
-      shouldAutoCompact = true;
+      const nextAutoCount = (autoCompactReplayCounts.get(sessionId) || 0) + 1;
+      if (nextAutoCount > AUTO_COMPACT_MAX_RETRIES) {
+        autoCompactLimitReached = true;
+      } else {
+        autoCompactReplayCounts.set(sessionId, nextAutoCount);
+        pendingCompactRetries.set(sessionId, {
+          text: pendingRetry?.text || entry.inputText || '',
+          mode: pendingRetry?.mode || entry.mode || session.permissionMode || 'yolo',
+          reason: 'auto',
+          hideInHistory: pendingRetry?.hideInHistory || entry.hideInHistory,
+          skipUserHistory: true,
+          rootTaskText: pendingRetry?.rootTaskText || entry.rootTaskText,
+        });
+        shouldAutoCompact = true;
+      }
     }
   }
 
@@ -4327,6 +4361,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     || shouldReturnForFollowup || shouldAutoCompact);
   if (!midRunCompactAbort && !willContinue && pendingSlash?.kind !== 'compact' && !contextLimitExceeded) {
     midRunCompactCounts.delete(sessionId);
+    autoCompactReplayCounts.delete(sessionId);
   }
   const shouldFinalizeTurnStats = !willContinue
     && !intentionalAbort
@@ -4396,6 +4431,12 @@ function handleProcessComplete(sessionId, exitCode, signal) {
         type: 'system_message',
         kind: 'compact',
         message: `◎ 本次任务已连续 ${MIDRUN_MAX_CONTINUATIONS} 次自动压缩，续跑仍然超出上下文限制，已暂停，请手动处理。`,
+      });
+    } else if (autoCompactLimitReached) {
+      wsSend(entry.ws, {
+        type: 'system_message',
+        kind: 'compact',
+        message: `◎ 本次请求已连续 ${AUTO_COMPACT_MAX_RETRIES} 次自动压缩并重放仍超出上下文限制，已停止自动重放，请手动处理。`,
       });
     }
 
@@ -4518,6 +4559,8 @@ function handleProcessComplete(sessionId, exitCode, signal) {
           { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' },
           {
             hideInHistory: !!retry.hideInHistory,
+            skipUserHistory: !!retry.skipUserHistory,
+            isCompactReplay: true,
             midRunContinuation: !!retry.hideInHistory,
             rootTaskText: retry.rootTaskText || null,
           },
@@ -5816,6 +5859,7 @@ async function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       wsSend(ws, { type: 'system_message', message: compactStartMessage(agent) });
       preemptCompactGuard.delete(session.id); // 手动 /compact 会重置水位，解除预防压缩护栏
       midRunCompactCounts.delete(session.id);
+      autoCompactReplayCounts.delete(session.id);
       pendingSlashCommands.set(session.id, { kind: 'compact' });
       handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
       break;
@@ -6316,6 +6360,7 @@ function deleteSessionCleanup(sessionId) {
   }
   preemptCompactGuard.delete(sessionId);
   midRunCompactCounts.delete(sessionId);
+  autoCompactReplayCounts.delete(sessionId);
   if (activeProcesses.has(sessionId)) {
     const entry = activeProcesses.get(sessionId);
     clearMidRunGraceTimer(entry.contextGuard);
@@ -6454,6 +6499,8 @@ async function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
   const {
     hideInHistory = false,
+    skipUserHistory = false,
+    isCompactReplay = false,
     recoveryReplay = false,
     codexEmptyFinalRetry = false,
     midRunContinuation = false,
@@ -6516,8 +6563,9 @@ async function handleMessage(ws, msg, options = {}) {
 	    };
 	  }
   normalizeSession(session);
-  if (!midRunContinuation && !hideInHistory) {
+  if (!midRunContinuation && !hideInHistory && !isCompactReplay) {
     midRunCompactCounts.delete(session.id);
+    autoCompactReplayCounts.delete(session.id);
   }
   if (!isClaudeSession(session) && prepareCodexThreadProvider(session)) saveSession(session);
 
@@ -6611,7 +6659,7 @@ async function handleMessage(ws, msg, options = {}) {
     session.titleSource = 'prompt';
   }
 
-  if (!hideInHistory) {
+  if (!hideInHistory && !skipUserHistory) {
     session.messages.push({
       role: 'user',
       content: textValue,

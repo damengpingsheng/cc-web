@@ -5232,6 +5232,66 @@ async function testMidRunContextGuard() {
         .filter((e) => e?.event === 'process_spawn' && e.sessionId === sid5.slice(0, 8));
       assert(spawns5.length === 5, `Expected run + 2 compact/replay pairs, got ${spawns5.length}`);
 
+      // 6) 正常 exitCode=0 正文包含 context window 等短语时，不能误判为超限并触发 /compact。
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo', taskMode: 'local' }));
+      const s6 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && ![sid1, sid2, sid3, sid5].includes(msg.sessionId));
+      const sid6 = s6.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'explain context window prose', sessionId: sid6, mode: 'yolo', agent: 'claude' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /Normal prose discussing context window/.test(msg.text || ''));
+      const done6 = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid6);
+      assert(done6.willContinue === false, 'Exit 0 prose containing context window must not trigger auto-compact');
+      const saved6 = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sid6}.json`), 'utf8'));
+      if (saved6.claudeSessionId) mockStateFiles.push(path.join(os.tmpdir(), `cc-web-mock-claude-${saved6.claudeSessionId}.json`));
+      const spawns6 = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'process_spawn' && e.sessionId === sid6.slice(0, 8));
+      assert(spawns6.length === 1, `Prose turn must spawn exactly once, got ${spawns6.length}`);
+
+      // 7) Claude exitCode=0 但 result.is_error=true 时，必须仍触发 /compact -> replay，且重放不重复写入 user 消息。
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo', taskMode: 'local' }));
+      const s7 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && ![sid1, sid2, sid3, sid5, sid6].includes(msg.sessionId));
+      const sid7 = s7.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'trigger claude result is_error limit', sessionId: sid7, mode: 'yolo', agent: 'claude' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid7 && msg.willContinue === false);
+      const saved7 = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sid7}.json`), 'utf8'));
+      if (saved7.claudeSessionId) mockStateFiles.push(path.join(os.tmpdir(), `cc-web-mock-claude-${saved7.claudeSessionId}.json`));
+      assert((saved7.messages || []).filter((m) => m.role === 'user').length === 1, 'Auto compact-replay must not duplicate user history');
+      const spawns7 = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'process_spawn' && e.sessionId === sid7.slice(0, 8));
+      assert(spawns7.length === 3, `Expected run + compact + replay (3 spawns), got ${spawns7.length}`);
+
+      // 8) Codex 正常 exitCode=0 正文包含 context window 等短语时，同样不能误判为超限并触发 /compact。
+      ws.send(JSON.stringify({
+        type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', taskMode: 'local', codexGateway: 'direct-apirouter',
+      }));
+      const s8 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && ![sid4, sCum.sessionId].includes(msg.sessionId));
+      const sid8 = s8.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'explain codex context window prose', sessionId: sid8, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /Normal Codex prose discussing context window/.test(msg.text || ''));
+      const done8 = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid8);
+      assert(done8.willContinue === false, 'Codex exit 0 prose containing context window must not trigger auto-compact');
+      const spawns8 = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'process_spawn' && e.sessionId === sid8.slice(0, 8));
+      assert(spawns8.length === 1, `Codex prose turn must spawn exactly once, got ${spawns8.length}`);
+
+      // 9) 普通轮次反复触发 P0 自动 compact-replay：最多重试 AUTO_COMPACT_MAX_RETRIES(2) 次后停止，且不重复写 user 历史。
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo', taskMode: 'local' }));
+      const s9 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && ![sid1, sid2, sid3, sid5, sid6, sid7].includes(msg.sessionId));
+      const sid9 = s9.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'trigger claude auto compact p0 loop', sessionId: sid9, mode: 'yolo', agent: 'claude' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /连续 2 次自动压缩并重放仍超出上下文限制/.test(msg.message || ''));
+      const done9 = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid9 && msg.willContinue === false);
+      assert(done9.willContinue === false, 'Auto compact-replay cap must stop without continuing');
+      const saved9 = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sid9}.json`), 'utf8'));
+      if (saved9.claudeSessionId) mockStateFiles.push(path.join(os.tmpdir(), `cc-web-mock-claude-${saved9.claudeSessionId}.json`));
+      assert((saved9.messages || []).filter((m) => m.role === 'user').length === 1, 'Auto compact-replay cap must not duplicate user history');
+      const spawns9 = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'process_spawn' && e.sessionId === sid9.slice(0, 8));
+      assert(spawns9.length === 5, `Expected run + 2 compact/replay pairs (5 spawns), got ${spawns9.length}`);
+
       ws.close();
     });
   } finally {

@@ -190,6 +190,23 @@ function readStdin() {
     })}\n`);
   }
 
+  if (input === 'explain codex context window prose') {
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: {
+        id: 'item_msg',
+        type: 'agent_message',
+        text: 'Normal Codex prose discussing context window, maximum context length, and Prompt is too long.',
+      },
+    })}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    process.stdout.write(`${JSON.stringify({
+      type: 'turn.completed',
+      usage: { input_tokens: 10, cached_input_tokens: 2, output_tokens: 5 },
+    })}\n`);
+    return;
+  }
+
   if (input === '/compact') {
     state.compacted = true;
     fs.writeFileSync(statePath, JSON.stringify(state));

@@ -130,6 +130,70 @@ function readStdin() {
     process.exit(1);
   }
 
+  if (effectiveInput === 'trigger claude auto compact p0 loop') {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    if (homeDir) {
+      const projDir = path.join(homeDir, '.claude', 'projects', path.resolve(process.cwd()).replace(/^\//, '-').replace(/\//g, '-'));
+      fs.mkdirSync(projDir, { recursive: true });
+      const transcriptPath = path.join(projDir, `${sessionId}.jsonl`);
+      if (!fs.existsSync(transcriptPath)) {
+        fs.writeFileSync(transcriptPath, `${JSON.stringify({ type: 'user', sessionId, cwd: process.cwd(), message: { role: 'user', content: effectiveInput } })}\n`);
+      }
+    }
+    process.stderr.write('API Error: Prompt is too long: 1048576 tokens > 1000000 maximum\n');
+    process.exit(1);
+  }
+
+  if (effectiveInput === 'explain context window prose') {
+    process.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      session_id: sessionId,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Normal prose discussing context window, maximum context length, and Prompt is too long.' }],
+      },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      session_id: sessionId,
+      total_cost_usd: 0.001,
+    })}\n`);
+    return;
+  }
+
+  if (effectiveInput === 'trigger claude result is_error limit' && !state.resultIsErrorDone) {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    if (homeDir) {
+      const projDir = path.join(homeDir, '.claude', 'projects', path.resolve(process.cwd()).replace(/^\//, '-').replace(/\//g, '-'));
+      fs.mkdirSync(projDir, { recursive: true });
+      const transcriptPath = path.join(projDir, `${sessionId}.jsonl`);
+      if (!fs.existsSync(transcriptPath)) {
+        fs.writeFileSync(transcriptPath, `${JSON.stringify({ type: 'user', sessionId, cwd: process.cwd(), message: { role: 'user', content: effectiveInput } })}\n`);
+      }
+    }
+    state.resultIsErrorPending = true;
+    fs.writeFileSync(statePath, JSON.stringify(state));
+    process.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      session_id: sessionId,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'API Error: Prompt is too long' }],
+      },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      result: 'Prompt is too long',
+      session_id: sessionId,
+      total_cost_usd: 0.001,
+    })}\n`);
+    return;
+  }
+
   if (
     effectiveInput === 'trigger claude midrun guard'
     || effectiveInput === 'trigger claude midrun overflow loop'
@@ -248,6 +312,10 @@ function readStdin() {
   if (effectiveInput === '/compact') {
     const boundaryUuid = crypto.randomUUID();
     state.compacted = true;
+    if (state.resultIsErrorPending) {
+      state.resultIsErrorDone = true;
+      state.resultIsErrorPending = false;
+    }
     fs.writeFileSync(statePath, JSON.stringify(state));
     const homeDir = process.env.HOME || process.env.USERPROFILE || '';
     if (homeDir) {
