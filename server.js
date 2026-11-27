@@ -32,7 +32,11 @@ const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 const { createAgentRuntime } = require('./lib/agent-runtime');
 const {
+  BYTES_PER_TOKEN_CONSERVATIVE,
+  canSyncClaudeSnapshot,
   estimateClaudeContextUsage,
+  inspectClaudeTranscriptContext,
+  isOneMillionContext,
   shouldPreemptiveCompact,
 } = require('./lib/context-usage');
 const { createAuthStore } = require('./lib/auth');
@@ -784,6 +788,30 @@ const AUTOCOMPACT_PCT = Math.min(99, Math.max(10, parseInt(process.env.CC_WEB_AU
 // 非压缩进程正常退出 / 手动 /compact / 删除会话 时解除。
 const preemptCompactGuard = new Set();
 
+// 第 2 层运行中上下文守护配置（均带开箱即用默认值，可通过环境变量覆盖）
+function parsePositiveIntEnv(name, fallback, minValue = 1) {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const text = String(raw).trim();
+  if (!/^\d+$/.test(text)) return fallback;
+  const parsed = Number(text);
+  return Number.isSafeInteger(parsed) && parsed >= minValue ? parsed : fallback;
+}
+
+const MIDRUN_GUARD_ENABLED = process.env.CC_WEB_MIDRUN_GUARD !== '0';
+const MIDRUN_CLAUDE_LIVE_OVERRIDE = parsePositiveIntEnv('CC_WEB_MIDRUN_CLAUDE_LIVE_LIMIT', parsePositiveIntEnv('CC_WEB_MIDRUN_LIVE_LIMIT', null));
+const MIDRUN_CODEX_LIVE_LIMIT = parsePositiveIntEnv('CC_WEB_MIDRUN_CODEX_LIVE_LIMIT', 800000);
+const MIDRUN_PERSISTED_OVERRIDE = parsePositiveIntEnv('CC_WEB_MIDRUN_PERSISTED_LIMIT', null);
+const MIDRUN_EMERGENCY_OVERRIDE = parsePositiveIntEnv('CC_WEB_MIDRUN_EMERGENCY_LIMIT', null);
+const MIDRUN_EMERGENCY_LIMIT = MIDRUN_EMERGENCY_OVERRIDE ?? 780000;
+const MIDRUN_GRACE_MS = parsePositiveIntEnv('CC_WEB_MIDRUN_GRACE_MS', 15000, 0);
+const MIDRUN_MAX_CONTINUATIONS = parsePositiveIntEnv('CC_WEB_MIDRUN_MAX_CONTINUATIONS', 3);
+const MIDRUN_MONITOR_INTERVAL_MS = parsePositiveIntEnv('CC_WEB_MIDRUN_MONITOR_INTERVAL_MS', 15000, 100);
+const MIDRUN_CLAUDE_DISK_SYNC_MS = 30000;
+
+// 单次用户请求连续触发运行中熔断续跑计数：sessionId -> count
+const midRunCompactCounts = new Map();
+
 // Per-session loop timers. Schedule data itself is persisted on session.loop.
 const activeLoops = new Map();
 const LOOP_MIN_INTERVAL_MS = 1000;
@@ -1355,6 +1383,20 @@ function loadClaudeJsonModelMap() {
 
 // Apply model config to runtime MODEL_MAP only (env vars are injected per-spawn, not here)
 const CLAUDE_SETTINGS_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'settings.json');
+function resolveClaudeContextSettings(session, env = process.env) {
+  let settings = {};
+  try { settings = JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8')); } catch {}
+  const modelConfig = loadModelConfig();
+  const template = modelConfig.mode === 'custom'
+    ? (modelConfig.templates || []).find((item) => item.name === modelConfig.activeTemplate)
+    : null;
+  const model = session?.model || template?.defaultModel || env.ANTHROPIC_MODEL
+    || settings.env?.ANTHROPIC_MODEL || settings.model || '';
+  const disableValues = [env.CLAUDE_CODE_DISABLE_1M_CONTEXT, settings.env?.CLAUDE_CODE_DISABLE_1M_CONTEXT];
+  const disabled = disableValues.some((value) => ['1', 'true'].includes(String(value || '').toLowerCase()));
+  return { model: MODEL_MAP[String(model).toLowerCase()] || model, disable1m: disabled ? '1' : '' };
+}
+
 const SETTINGS_API_KEYS = ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL','ANTHROPIC_DEFAULT_SONNET_MODEL','ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_REASONING_MODEL'];
@@ -3585,6 +3627,242 @@ function broadcastBackgroundDone(sessionId, entry, exceptWs = null) {
   return sess;
 }
 
+function formatGuardTokenCount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function buildMidRunContinuationPrompt(rootTaskText, count) {
+  return [
+    `[系统提示：上一轮执行过程中因上下文接近窗口安全上限，cc-web 已在第 ${count} 次安全边界暂停并完成了 /compact 上下文压缩。]`,
+    '请基于压缩摘要与当前工作区已落盘的真实状态，直接接着完成先前尚未收尾的工作，不要从头重复已经完成的步骤。',
+    rootTaskText ? `原始任务要求：\n${rootTaskText}` : '',
+  ].filter(Boolean).join('\n\n');
+}
+
+function recoverMidRunInput(inputText) {
+  const text = String(inputText || '');
+  if (text.trim() === '/compact') return { isCompact: true, rootTaskText: null };
+  const match = text.match(/^\[系统提示：上一轮执行过程中因上下文接近窗口安全上限，cc-web 已在第 (\d+) 次安全边界暂停/);
+  if (!match || !Number.isSafeInteger(Number(match[1])) || Number(match[1]) < 1) return { isCompact: false, rootTaskText: text };
+  const rootMarker = '\n\n原始任务要求：\n';
+  const rootOffset = text.indexOf(rootMarker, match[0].length);
+  return { isCompact: false, hideInHistory: true, count: Number(match[1]), rootTaskText: rootOffset < 0 ? '' : text.slice(rootOffset + rootMarker.length) };
+}
+
+function clearMidRunGraceTimer(guard) {
+  if (guard?.graceTimer) {
+    clearTimeout(guard.graceTimer);
+    guard.graceTimer = null;
+  }
+}
+
+function createContextGuard(session, startedAtMs, initialSnap = null, isRecoveryAttach = false) {
+  const isClaude = isClaudeSession(session);
+  const claudeJsonlPath = isClaude && session?.claudeSessionId
+    ? locateClaudeSessionJsonl(session.claudeSessionId)
+    : null;
+  const snap = initialSnap || (claudeJsonlPath ? inspectClaudeTranscriptContext(claudeJsonlPath) : null);
+  const codexRolloutPath = !isClaude && session?.codexThreadId
+    ? locateCodexThreadJsonl(session)
+    : null;
+  let codexRolloutOffset = 0;
+  if (codexRolloutPath) {
+    try { codexRolloutOffset = fs.statSync(codexRolloutPath).size; } catch {}
+  }
+  const now = Date.now();
+  return {
+    claudeJsonlPath,
+    isOneMillionModel: isClaude && (() => {
+      const context = resolveClaudeContextSettings(session);
+      return isOneMillionContext(context.model, context.disable1m);
+    })(),
+    lastDiskBoundaryOffset: snap?.lastCompactLineOffset ?? null,
+    codexRolloutPath,
+    codexRolloutOffset,
+    liveUsageTokens: 0,
+    baseSegmentBytes: isRecoveryAttach ? 0 : (snap?.segmentBytes || 0),
+    deltaSegmentBytes: 0,
+    diskSyncedSegmentBytes: snap?.segmentBytes || 0,
+    diskSyncedUsageTokens: snap?.usageTokens || 0,
+    inFlightToolIds: new Set(),
+    lastCheckAtMs: startedAtMs || now,
+    lastDiskSyncAtMs: now,
+    pendingTrigger: null,
+    graceTimer: null,
+    abortedForCompact: false,
+  };
+}
+
+function sendGracefulSignalLadder(sessionId, entry) {
+  // SIGINT gives CLI a chance to cancel and persist in-flight tool output;
+  // SIGTERM/SIGKILL are escalation only.
+  killProcess(entry.pid, false, 'SIGINT');
+  const termTimer = setTimeout(() => {
+    if (activeProcesses.get(sessionId) !== entry) return;
+    killProcess(entry.pid, false, 'SIGTERM');
+    const killTimer = setTimeout(() => {
+      if (activeProcesses.get(sessionId) !== entry) return;
+      killProcess(entry.pid, true);
+    }, 1000);
+    killTimer.unref?.();
+  }, 2000);
+  termTimer.unref?.();
+}
+
+function triggerMidRunCompactAbort(sessionId, entry, info = {}) {
+  const guard = entry?.contextGuard;
+  if (!guard || guard.abortedForCompact || entry.abortedByUser) return;
+  if (activeProcesses.get(sessionId) !== entry) return;
+  clearMidRunGraceTimer(guard);
+  guard.pendingTrigger = null;
+  guard.abortedForCompact = true;
+  guard.abortedDetails = info;
+  plog('WARN', 'midrun_context_abort', {
+    sessionId: sessionId.slice(0, 8),
+    pid: entry.pid,
+    agent: entry.agent || 'claude',
+    source: info.source || 'unknown',
+    liveTokens: info.liveTokens || 0,
+    persistedEstTokens: info.persistedEstTokens || 0,
+    inFlightTools: guard.inFlightToolIds?.size || 0,
+    emergency: !!info.exceededEmergency,
+  });
+  sendGracefulSignalLadder(sessionId, entry);
+}
+
+function getClaudeMidRunLimits(oneMillion) {
+  return {
+    live: MIDRUN_CLAUDE_LIVE_OVERRIDE ?? (oneMillion ? 820000 : 170000),
+    persisted: MIDRUN_PERSISTED_OVERRIDE ?? (oneMillion ? 800000 : 170000),
+    emergency: MIDRUN_EMERGENCY_OVERRIDE ?? (oneMillion ? 900000 : 180000),
+  };
+}
+
+function evaluateMidRunContextGuard(sessionId, entry, source = 'event') {
+  if (!MIDRUN_GUARD_ENABLED) return;
+  const guard = entry?.contextGuard;
+  if (!guard || entry.recoveryReplay || entry.guardReplay || entry.abortedByUser || guard.abortedForCompact) return;
+  if (activeProcesses.get(sessionId) !== entry) return;
+  if (pendingSlashCommands.get(sessionId)?.kind === 'compact') return;
+
+  if (entry.agent === 'claude' && !guard.claudeJsonlPath) {
+    const s = loadSession(sessionId);
+    if (s?.claudeSessionId) guard.claudeJsonlPath = locateClaudeSessionJsonl(s.claudeSessionId);
+  }
+
+  guard.lastCheckAtMs = Date.now();
+  const isCodex = entry.agent === 'codex';
+  const oneMillion = !isCodex && guard.isOneMillionModel;
+  const claudeLimits = getClaudeMidRunLimits(oneMillion);
+  const liveLimit = isCodex ? MIDRUN_CODEX_LIVE_LIMIT : claudeLimits.live;
+  const liveTokens = guard.liveUsageTokens || guard.diskSyncedUsageTokens || 0;
+  const totalBytes = Math.max(
+    (guard.baseSegmentBytes || 0) + (guard.deltaSegmentBytes || 0),
+    guard.diskSyncedSegmentBytes || 0,
+  );
+  const persistedEstTokens = totalBytes > 0 ? Math.ceil(totalBytes / BYTES_PER_TOKEN_CONSERVATIVE) : 0;
+
+  const exceededLive = liveTokens >= liveLimit;
+  const exceededPersisted = isCodex
+    ? persistedEstTokens >= MIDRUN_CODEX_LIVE_LIMIT
+    : persistedEstTokens >= claudeLimits.persisted;
+  const emergencyLimit = isCodex
+    ? Math.max(MIDRUN_EMERGENCY_LIMIT, MIDRUN_CODEX_LIVE_LIMIT)
+    : claudeLimits.emergency;
+  const exceededEmergency = persistedEstTokens >= emergencyLimit || liveTokens >= emergencyLimit;
+
+  if (!exceededLive && !exceededPersisted && !exceededEmergency) {
+    clearMidRunGraceTimer(guard);
+    guard.pendingTrigger = null;
+    return;
+  }
+
+  if (guard.inFlightToolIds.size === 0 || exceededEmergency || source === 'grace_timeout') {
+    triggerMidRunCompactAbort(sessionId, entry, {
+      source,
+      liveTokens,
+      persistedEstTokens,
+      exceededEmergency,
+    });
+    return;
+  }
+
+  if (!guard.pendingTrigger) {
+    guard.pendingTrigger = {
+      source,
+      liveTokens,
+      persistedEstTokens,
+      detectedAtMs: Date.now(),
+    };
+    guard.graceTimer = setTimeout(() => {
+      guard.graceTimer = null;
+      if (activeProcesses.get(sessionId) !== entry) return;
+      if (entry.abortedByUser || guard.abortedForCompact) return;
+      evaluateMidRunContextGuard(sessionId, entry, 'grace_timeout');
+    }, MIDRUN_GRACE_MS);
+    guard.graceTimer.unref?.();
+  }
+}
+
+function syncCodexRolloutGuardIncremental(sessionId, entry) {
+  const guard = entry?.contextGuard;
+  if (!guard) return;
+  if (!guard.codexRolloutPath) {
+    const session = loadSession(sessionId);
+    if (session?.codexThreadId) {
+      guard.codexRolloutPath = locateCodexThreadJsonl(session);
+      if (guard.codexRolloutPath) guard.codexRolloutOffset = 0;
+    }
+  }
+  if (!guard.codexRolloutPath) return;
+  let stat;
+  try { stat = fs.statSync(guard.codexRolloutPath); } catch { return; }
+  if (stat.size <= guard.codexRolloutOffset) return;
+  let fd;
+  try {
+    fd = fs.openSync(guard.codexRolloutPath, 'r');
+    const bytesToRead = stat.size - guard.codexRolloutOffset;
+    const buf = Buffer.allocUnsafe(bytesToRead);
+    const bytesRead = fs.readSync(fd, buf, 0, bytesToRead, guard.codexRolloutOffset);
+    if (bytesRead <= 0) return;
+    const chunk = buf.subarray(0, bytesRead).toString('utf8');
+    const lastNewline = chunk.lastIndexOf('\n');
+    if (lastNewline < 0) return;
+    const complete = chunk.slice(0, lastNewline + 1);
+    guard.codexRolloutOffset += Buffer.byteLength(complete, 'utf8');
+    for (const line of complete.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let rec;
+      try { rec = JSON.parse(trimmed); } catch { continue; }
+      if (rec?.type === 'compacted') {
+        guard.liveUsageTokens = 0;
+        guard.baseSegmentBytes = 0;
+        guard.deltaSegmentBytes = 0;
+        clearMidRunGraceTimer(guard);
+        guard.pendingTrigger = null;
+      } else if (rec?.type === 'event_msg' && rec.payload?.type === 'token_count') {
+        const inputTokens = Number(rec.payload?.info?.last_token_usage?.input_tokens);
+        if (Number.isFinite(inputTokens) && inputTokens > 0) {
+          guard.liveUsageTokens = inputTokens;
+        }
+      } else if (rec?.type === 'token_usage_record' && rec.payload?.usage) {
+        const inputTokens = Number(rec.payload.usage.input_tokens);
+        if (Number.isFinite(inputTokens) && inputTokens > 0) {
+          guard.liveUsageTokens = inputTokens;
+        }
+      }
+    }
+  } catch {
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
 /**
  * 子进程退出后的统一处理（约 193 行，server.js 最复杂的函数）。
  *
@@ -3604,6 +3882,7 @@ function broadcastBackgroundDone(sessionId, entry, exceptWs = null) {
 function handleProcessComplete(sessionId, exitCode, signal) {
   const entry = activeProcesses.get(sessionId);
   if (!entry) return;
+  clearMidRunGraceTimer(entry.contextGuard);
 
   const completeTime = new Date().toISOString();
   const wsConnected = !!entry.ws && entry.ws.readyState === 1;
@@ -3640,7 +3919,9 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     }
   } catch {}
 
-  const intentionalAbort = !!entry.abortedByUser || signal === 'SIGINT' || signal === 'SIGTERM';
+  const midRunCompactAbort = !!entry.contextGuard?.abortedForCompact && !entry.abortedByUser;
+  const userAbort = !!entry.abortedByUser || (!midRunCompactAbort && (signal === 'SIGINT' || signal === 'SIGTERM'));
+  const intentionalAbort = userAbort || midRunCompactAbort;
   const actionableStderr = stripBenignRuntimeDiagnostics(stderrSnippet);
   const rawCompletionError = intentionalAbort ? null : entry.lastError || (
     ((typeof exitCode === 'number' && exitCode !== 0) || !!signal)
@@ -3714,7 +3995,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     saveSession(session);
     completionError = null;
   }
-  if (session && (entry.fullText || shouldRetryCodexEmptyFinal)) {
+  if (session && (entry.fullText || shouldRetryCodexEmptyFinal || (midRunCompactAbort && (entry.toolCalls?.length > 0 || entry.segments?.length > 0)))) {
     const msg = {
       role: 'assistant',
       content: entry.fullText,
@@ -3753,6 +4034,7 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   let shouldReturnForFollowup = false;
   let shouldAutoCompact = false;
   let compactAutoRetryRequested = false;
+  let midRunLimitReached = false;
 
   // Compact/replay is a logical continuation of the failed turn, not a UI-only
   // action. Decide it before checking WebSocket state so a detached task can
@@ -3761,25 +4043,62 @@ function handleProcessComplete(sessionId, exitCode, signal) {
     const retry = pendingCompactRetries.get(sessionId);
     compactAutoRetryRequested = !!(retry?.text && retry?.reason === 'auto');
     if (compactAutoRetryRequested) {
-      if (contextLimitExceeded) {
+      if (contextLimitExceeded || completionError || userAbort || (typeof exitCode === 'number' && exitCode !== 0)) {
         pendingCompactRetries.delete(sessionId);
       } else {
         shouldReturnForFollowup = true;
       }
     }
   }
-  if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
-    pendingCompactRetries.set(sessionId, {
-      text: pendingRetry?.text || '',
-      mode: pendingRetry?.mode || session.permissionMode || 'yolo',
-      reason: 'auto',
-    });
-    shouldAutoCompact = true;
+  if (contextLimitExceeded && !pendingSlash && !midRunCompactAbort && !userAbort && session && getRuntimeSessionId(session)) {
+    // A hidden mid-run continuation can itself hit P0 repeatedly. Count those
+    // compactions against the same budget as proactive mid-run interruptions.
+    const isMidRunContinuation = !!entry.midRunContinuation;
+    const nextCount = (midRunCompactCounts.get(sessionId) || 0) + 1;
+    if (isMidRunContinuation && nextCount > MIDRUN_MAX_CONTINUATIONS) {
+      midRunLimitReached = true;
+    } else {
+      if (isMidRunContinuation) midRunCompactCounts.set(sessionId, nextCount);
+      pendingCompactRetries.set(sessionId, {
+        text: pendingRetry?.text || entry.inputText || '',
+        mode: pendingRetry?.mode || entry.mode || session.permissionMode || 'yolo',
+        reason: 'auto',
+        hideInHistory: pendingRetry?.hideInHistory || entry.hideInHistory,
+        rootTaskText: pendingRetry?.rootTaskText || entry.rootTaskText,
+      });
+      shouldAutoCompact = true;
+    }
+  }
+
+  let midRunCodexPaused = false;
+  if (midRunCompactAbort && session) {
+    if (entry.agent === 'codex') {
+      midRunCodexPaused = true;
+    } else {
+      const nextCount = (midRunCompactCounts.get(sessionId) || 0) + 1;
+      if (nextCount > MIDRUN_MAX_CONTINUATIONS) {
+        midRunLimitReached = true;
+      } else if (session.claudeSessionId) {
+        midRunCompactCounts.set(sessionId, nextCount);
+        const rootTaskText = entry.rootTaskText || pendingRetry?.rootTaskText || pendingRetry?.text || entry.inputText || '';
+        pendingCompactRetries.set(sessionId, {
+          text: buildMidRunContinuationPrompt(rootTaskText, nextCount),
+          rootTaskText,
+          mode: entry.mode || session.permissionMode || 'yolo',
+          reason: 'auto',
+          hideInHistory: true,
+        });
+        shouldAutoCompact = true;
+      }
+    }
   }
 
   const willContinue = !!((retryCodexWithoutResume && wsConnected)
     || (shouldRetryCodexEmptyFinal && wsConnected)
     || shouldReturnForFollowup || shouldAutoCompact);
+  if (!midRunCompactAbort && !willContinue && pendingSlash?.kind !== 'compact' && !contextLimitExceeded) {
+    midRunCompactCounts.delete(sessionId);
+  }
   const shouldFinalizeTurnStats = !willContinue
     && !intentionalAbort
     && !completionError
@@ -3827,8 +4146,8 @@ function handleProcessComplete(sessionId, exitCode, signal) {
   if (wsConnected) {
     if (pendingSlash?.kind === 'compact') {
       if (compactAutoRetryRequested) {
-        if (contextLimitExceeded) {
-          wsSend(entry.ws, { type: 'system_message', message: '已尝试执行 /compact，但仍未成功解除上下文超限。请手动缩小输入范围后重试。' });
+        if (!shouldReturnForFollowup) {
+          wsSend(entry.ws, { type: 'system_message', message: '自动 /compact 未成功，已暂停续跑，请检查错误后手动处理。' });
         } else {
           wsSend(entry.ws, { type: 'system_message', message: compactDoneMessage(entry.agent || 'claude') });
           wsSend(entry.ws, { type: 'system_message', message: compactAutoResumeMessage(entry.agent || 'claude') });
@@ -3840,8 +4159,42 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       }
     }
 
-    if (contextLimitExceeded && !pendingSlash && session && getRuntimeSessionId(session)) {
+    if (contextLimitExceeded && !pendingSlash && shouldAutoCompact) {
       wsSend(entry.ws, { type: 'system_message', message: compactAutoStartMessage(entry.agent || 'claude') });
+    }
+    if (midRunLimitReached && !midRunCompactAbort) {
+      wsSend(entry.ws, {
+        type: 'system_message',
+        kind: 'compact',
+        message: `◎ 本次任务已连续 ${MIDRUN_MAX_CONTINUATIONS} 次自动压缩，续跑仍然超出上下文限制，已暂停，请手动处理。`,
+      });
+    }
+
+    if (midRunCompactAbort) {
+      if (shouldAutoCompact) {
+        wsSend(entry.ws, {
+          type: 'system_message',
+          kind: 'compact',
+          message: '◎ 运行中上下文接近安全上限，已保存当前进展并自动压缩后继续执行',
+        });
+      } else if (midRunLimitReached) {
+        wsSend(entry.ws, {
+          type: 'system_message',
+          kind: 'compact',
+          message: `◎ 本次任务已连续 ${MIDRUN_MAX_CONTINUATIONS} 次触发运行中上下文保护上限，已保存当前进展并暂停，请检查是否存在超大输出循环后手动继续。`,
+        });
+      } else if (midRunCodexPaused) {
+        const approxNum = Math.max(
+          entry.contextGuard?.abortedDetails?.liveTokens || 0,
+          entry.contextGuard?.abortedDetails?.persistedEstTokens || 0,
+        );
+        const approxStr = formatGuardTokenCount(approxNum) || '800,000';
+        wsSend(entry.ws, {
+          type: 'system_message',
+          kind: 'compact',
+          message: `◎ Codex 运行中上下文已超过安全阈值（约 ${approxStr} tokens），为避免线程超限损坏已自动暂停，请精简后续指令或新建会话继续。`,
+        });
+      }
     }
 
     if (shouldRetryCodexEmptyFinal) {
@@ -3931,7 +4284,15 @@ function handleProcessComplete(sessionId, exitCode, signal) {
       const retry = pendingCompactRetries.get(sessionId);
       if (retry?.text) {
         pendingCompactRetries.delete(sessionId);
-        handleMessage(continuationWs, { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' });
+        handleMessage(
+          continuationWs,
+          { text: retry.text, sessionId, mode: retry.mode || session.permissionMode || 'yolo' },
+          {
+            hideInHistory: !!retry.hideInHistory,
+            midRunContinuation: !!retry.hideInHistory,
+            rootTaskText: retry.rootTaskText || null,
+          },
+        );
       }
       return;
     }
@@ -3969,6 +4330,43 @@ setInterval(() => {
     }
   }
 }, PID_MONITOR_INTERVAL_MS);
+
+// Global mid-run context patrol (15s interval): syncs Claude transcript / Codex rollout
+// on disk for long-running processes and triggers safe boundary abort before hitting 1M limit.
+if (MIDRUN_GUARD_ENABLED) {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [sessionId, entry] of activeProcesses) {
+      const guard = entry?.contextGuard;
+      if (!guard || entry.recoveryReplay || entry.guardReplay || entry.abortedByUser || guard.abortedForCompact) continue;
+      if (!entry.pid || !isProcessRunning(entry.pid)) continue;
+      if (pendingSlashCommands.get(sessionId)?.kind === 'compact') continue;
+      if (entry.agent === 'codex') {
+        syncCodexRolloutGuardIncremental(sessionId, entry);
+        evaluateMidRunContextGuard(sessionId, entry, 'timer');
+        continue;
+      }
+      if (entry.agent === 'claude') {
+        if (!guard.claudeJsonlPath) {
+          const s = loadSession(sessionId);
+          if (s?.claudeSessionId) guard.claudeJsonlPath = locateClaudeSessionJsonl(s.claudeSessionId);
+        }
+        const runAgeMs = now - (entry.startedAtMs || now);
+        if (guard.claudeJsonlPath && runAgeMs >= 15000 && now - (guard.lastDiskSyncAtMs || 0) >= MIDRUN_CLAUDE_DISK_SYNC_MS) {
+          guard.lastDiskSyncAtMs = now;
+          const snap = inspectClaudeTranscriptContext(guard.claudeJsonlPath);
+          if (canSyncClaudeSnapshot(guard.diskSyncAfterBoundary, snap)) {
+            guard.diskSyncAfterBoundary = null;
+            guard.lastDiskBoundaryOffset = snap.lastCompactLineOffset;
+            guard.diskSyncedSegmentBytes = snap.segmentBytes;
+            if (!guard.liveUsageTokens && snap.usageTokens !== null) guard.diskSyncedUsageTokens = snap.usageTokens;
+          }
+        }
+        evaluateMidRunContextGuard(sessionId, entry, 'timer');
+      }
+    }
+  }, MIDRUN_MONITOR_INTERVAL_MS).unref?.();
+}
 
 cleanupExpiredAttachments();
 setInterval(cleanupExpiredAttachments, 6 * 60 * 60 * 1000);
@@ -4030,7 +4428,23 @@ function recoverProcesses() {
           lastError: null,
           errorSent: false,
           tailer: null,
+          contextGuard: createContextGuard(session, runStartedAtMs, null, true),
+          guardReplay: true,
         };
+        try {
+          const input = fs.readFileSync(path.join(dir, 'input.txt'), 'utf8');
+          try {
+            const parsed = JSON.parse(input);
+            entry.inputText = parsed.message?.content?.filter(block => block.type === 'text').map(block => block.text).join('\n') || '';
+          } catch { entry.inputText = input; }
+          const recovered = recoverMidRunInput(entry.inputText);
+          entry.rootTaskText = recovered.rootTaskText;
+          entry.hideInHistory = !!recovered.hideInHistory;
+          entry.midRunContinuation = !!recovered.hideInHistory;
+          if (recovered.isCompact) pendingSlashCommands.set(sessionId, { kind: 'compact' });
+          if (recovered.hideInHistory) midRunCompactCounts.set(sessionId, recovered.count);
+          entry.mode = session?.permissionMode || 'yolo';
+        } catch {}
         activeProcesses.set(sessionId, entry);
 
         if (fs.existsSync(outputPath)) {
@@ -4042,6 +4456,8 @@ function recoverProcesses() {
           });
           entry.tailer.start();
         }
+        entry.guardReplay = false;
+        evaluateMidRunContextGuard(sessionId, entry, 'recovery');
       } else {
         // Process finished while server was down — read all output and save
         console.log(`[recovery] Processing completed output for session ${sessionId}`);
@@ -5170,6 +5586,7 @@ async function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
 
       wsSend(ws, { type: 'system_message', message: compactStartMessage(agent) });
       preemptCompactGuard.delete(session.id); // 手动 /compact 会重置水位，解除预防压缩护栏
+      midRunCompactCounts.delete(session.id);
       pendingSlashCommands.set(session.id, { kind: 'compact' });
       handleMessage(ws, { text: '/compact', sessionId: session.id, mode: session.permissionMode || 'yolo' }, { hideInHistory: true });
       break;
@@ -5669,8 +6086,10 @@ function deleteSessionCleanup(sessionId) {
     if (pending.sessionId === sessionId) pendingClaudeRecoveries.delete(token);
   }
   preemptCompactGuard.delete(sessionId);
+  midRunCompactCounts.delete(sessionId);
   if (activeProcesses.has(sessionId)) {
     const entry = activeProcesses.get(sessionId);
+    clearMidRunGraceTimer(entry.contextGuard);
     try { killProcess(entry.pid); } catch {}
     if (entry.tailer) entry.tailer.stop();
     activeProcesses.delete(sessionId);
@@ -5784,18 +6203,8 @@ function handleAbort(ws) {
 
   plog('INFO', 'user_abort', { sessionId: sessionId.slice(0, 8), pid: entry.pid });
   entry.abortedByUser = true;
-  // SIGINT gives Codex a chance to cancel and persist the in-flight tool output.
-  // SIGTERM/SIGKILL are escalation only: killing too early leaves custom tool calls
-  // without outputs, which makes the next resume fail and forces a context reset.
-  killProcess(entry.pid, false, 'SIGINT');
-  setTimeout(() => {
-    if (activeProcesses.get(sessionId) !== entry) return;
-    killProcess(entry.pid, false, 'SIGTERM');
-    setTimeout(() => {
-      if (activeProcesses.get(sessionId) !== entry) return;
-      killProcess(entry.pid, true);
-    }, 1000);
-  }, 2000);
+  clearMidRunGraceTimer(entry.contextGuard);
+  sendGracefulSignalLadder(sessionId, entry);
   // handleProcessComplete will be triggered by the PID monitor
 }
 
@@ -5814,7 +6223,13 @@ function handleAbort(ws) {
  */
 async function handleMessage(ws, msg, options = {}) {
   const { text, sessionId, mode } = msg;
-  const { hideInHistory = false, recoveryReplay = false, codexEmptyFinalRetry = false } = options;
+  const {
+    hideInHistory = false,
+    recoveryReplay = false,
+    codexEmptyFinalRetry = false,
+    midRunContinuation = false,
+    rootTaskText = null,
+  } = options;
   const textValue = typeof text === 'string' ? text : '';
   const attachments = Array.isArray(msg.attachments) ? msg.attachments.slice(0, MAX_MESSAGE_ATTACHMENTS) : [];
   const normalizedText = textValue.trim();
@@ -5872,6 +6287,9 @@ async function handleMessage(ws, msg, options = {}) {
 	    };
 	  }
   normalizeSession(session);
+  if (!midRunContinuation && !hideInHistory) {
+    midRunCompactCounts.delete(session.id);
+  }
   if (!isClaudeSession(session) && prepareCodexThreadProvider(session)) saveSession(session);
 
   if (normalizedText.startsWith('/') && !/^\/goal(?:\s|$)/i.test(normalizedText) && resolvedAttachments.length > 0) {
@@ -5915,6 +6333,7 @@ async function handleMessage(ws, msg, options = {}) {
   // Codex 交给 model_auto_compact_token_limit 在真实用户消息那一轮压缩。
   // 约束：定位/估算/判定任何一步不确定（无 jsonl、无 usage、解析失败、带附件无法重放、
   // 处于自动压缩重试循环等）一律不触发，直接走原流程——正常路径零改变。
+  let initialClaudeSnap = null;
   if (
     isClaudeSession(session)
     && session.claudeSessionId
@@ -5927,16 +6346,18 @@ async function handleMessage(ws, msg, options = {}) {
   ) {
     try {
       const jsonlPath = locateClaudeSessionJsonl(session.claudeSessionId);
-      const usageTokens = jsonlPath ? estimateClaudeContextUsage(jsonlPath) : null;
+      initialClaudeSnap = jsonlPath ? inspectClaudeTranscriptContext(jsonlPath) : null;
+      const usageTokens = initialClaudeSnap?.effectiveTokens ?? null;
+      const context = resolveClaudeContextSettings(session);
       if (usageTokens !== null
-          && shouldPreemptiveCompact(usageTokens, session.model, AUTOCOMPACT_PCT)) {
+          && shouldPreemptiveCompact(usageTokens, context.model, AUTOCOMPACT_PCT, context.disable1m)) {
         preemptCompactGuard.add(session.id);
         session.updated = new Date().toISOString();
         saveSession(session);
         plog('INFO', 'preemptive_compact', {
           sessionId: session.id.slice(0, 8),
           usageTokens,
-          windowTokens: /1m/i.test(String(session.model || '')) ? 1_000_000 : 200_000,
+          windowTokens: isOneMillionContext(context.model, context.disable1m) ? 1_000_000 : 200_000,
           pct: AUTOCOMPACT_PCT,
           model: session.model || 'default',
           agent: getSessionAgent(session),
@@ -5974,10 +6395,12 @@ async function handleMessage(ws, msg, options = {}) {
 
   const currentSessionId = session.id;
 
-  for (const [, entry] of activeProcesses) {
-    if (entry.ws === ws) entry.ws = null;
+  if (ws) {
+    for (const [, entry] of activeProcesses) {
+      if (entry.ws === ws) entry.ws = null;
+    }
+    wsSessionMap.set(ws, currentSessionId);
   }
-  wsSessionMap.set(ws, currentSessionId);
 
   if (!sessionId) {
     wsSend(ws, {
@@ -6194,6 +6617,8 @@ async function handleMessage(ws, msg, options = {}) {
     codexResumeFallbackAttempted: !!options.codexResumeFallbackAttempted,
     codexEmptyFinalRetry,
     hideInHistory,
+    midRunContinuation,
+    rootTaskText: rootTaskText || (!hideInHistory ? textValue : null),
     fullText: '',
     attachments: resolvedAttachments,
     toolCalls: [],
@@ -6213,6 +6638,7 @@ async function handleMessage(ws, msg, options = {}) {
     codexRuntimeKey: spawnSpec.codexRuntimeKey || '',
     codexProvider: spawnSpec.codexProvider || '',
     tailer: null,
+    contextGuard: createContextGuard(session, processStartedAtMs, initialClaudeSnap, false),
   };
   activeProcesses.set(currentSessionId, entry);
   sendSessionList(ws);
@@ -6283,6 +6709,9 @@ const {
   saveSession,
   setRuntimeSessionId,
   getRuntimeSessionId,
+  onContextCheck: evaluateMidRunContextGuard,
+  locateClaudeSessionJsonl,
+  resolveClaudeContextSettings,
 });
 
 // === Check Update ===

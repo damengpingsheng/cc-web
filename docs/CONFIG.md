@@ -46,6 +46,14 @@
 | `CC_WEB_CODEX_PROXY_DISABLED` | — | 设为 `1` 时禁用自动代理托管（隔离测试或改用外部兼容实例） |
 | `CC_WEB_WS_PING_INTERVAL_MS` | `25000` | WebSocket 心跳间隔（毫秒）。每轮 ping 全部客户端，连续两轮无 pong terminate 死连接 |
 | `CC_WEB_AUTOCOMPACT_PCT` | `80` | Claude 预防性水位压缩阈值（%，收敛到 10-99）。resume 前读 transcript jsonl 水位，达到 窗口（`[1m]` 模型 1M / 其他 200K）× 该比例 时先自动 `/compact` 再重放原消息。详见 [RUNTIME.md "自动 compact 重试"](./RUNTIME.md#自动-compact-重试) |
+| `CC_WEB_CLAUDE_AUTOCOMPACT_WINDOW` | 自动（常规 `200000` / `1m` 模型 `800000`） | 传给 Claude CLI 的 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`，激活工具循环内原生自动压缩门控；设为 `0` 关闭第 1 层注入。外部已设 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 或 `DISABLE_AUTO_COMPACT` 时不覆盖 |
+| `CC_WEB_MIDRUN_GUARD` | `1` | 设为 `0` 关闭第 2 层运行中双指标主动熔断续跑 |
+| `CC_WEB_MIDRUN_CLAUDE_LIVE_LIMIT` | `170000`（普通模型）/ `820000`（`1m` 模型） | Claude 单次 API 上报触发保护的上限；兼容旧变量 `CC_WEB_MIDRUN_LIVE_LIMIT` |
+| `CC_WEB_MIDRUN_CODEX_LIVE_LIMIT` | `800000` | Codex 单次 API 上报触发保护的上限 |
+| `CC_WEB_MIDRUN_PERSISTED_LIMIT` | `170000`（普通模型）/ `800000`（`1m` 模型） | 自上次压缩起未压缩对话段（`baseSegmentBytes + deltaSegmentBytes` 按 `3.0 B/tok` 估算）触发熔断的上限 |
+| `CC_WEB_MIDRUN_EMERGENCY_LIMIT` | `180000`（普通模型）/ `900000`（`1m` 模型） | 紧急硬线：突破后不再等待在途工具宽限期，立即触发信号阶梯终止以保住会话可压缩性 |
+| `CC_WEB_MIDRUN_GRACE_MS` | `15000` | 达到常规熔断线但仍有在途工具未返回时，等待最后一个工具自然收尾的最大宽限毫秒数 |
+| `CC_WEB_MIDRUN_MAX_CONTINUATIONS` | `3` | 单次用户请求连续触发「运行中熔断 → `/compact` → 自动续跑」的最大次数（防异常死循环） |
 | `AI_SESSION_TRACE_ROOT` | `~/.ai-session-trace` | Claude transcript 过期后，用于查找 hook 保存的 `transcript.jsonl` / `transcript.sha256` 快照；只有摘要与 session ID 均校验通过才允许恢复 |
 | `CC_WEB_IP_WHITELIST` | — | 暴力破解豁免 IP 列表 |
 | `CC_WEB_TRUSTED_PROXIES` | — | 可信反向代理 CIDR/IP 列表（仅这些来源的 X-Forwarded-For 才被信任），默认空 = 最严格 |
@@ -55,6 +63,8 @@
 | `LLMPROXY_API_KEY` | — | llmproxy key，用于 llmproxy 请求与用量查询；不会回退到 `OPENAI_API_KEY` 或 APIRouter key |
 | `PUSHPLUS_TOKEN` | — | 遗留：首次运行迁移到 `config/notify.json` |
 | `CC_WEB_PASSWORD` | — | 遗留：首次运行迁移到 `config/auth.json` |
+
+消息字节按 `3.0 B/tok` 只是启发式估算，不是 token 上界；图片和 PDF 的 base64 不按文本计数，实际多模态 token 无法由该估算确定。自动压缩也不保证保留所有附件细节。
 
 上述变量既可在进程环境设置，也可写入 `~/.agents/codex.env` 或 `~/.agents/claude.env`。Claude 的 APIRouter 凭据不会借用通用 `ANTHROPIC_*`；llmproxy 才允许用通用 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 作为兼容回退。
 

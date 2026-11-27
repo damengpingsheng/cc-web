@@ -1744,21 +1744,28 @@ async function testAuthStoreTokenMigration() {
   console.log('Auth-store token migration checks passed.');
 }
 
-// Unit coverage for lib/context-usage.js (P2 预防性水位压缩核心)：
-//   - estimateClaudeContextUsage 从文件末尾向前找最后一条含 usage 的 assistant 行，
-//     返回 input + cache_read + cache_creation 三项之和（更早的 usage 行、坏行不参与）
-//   - 无 usage / 文件不存在 → null（调用方必须跳过预防逻辑）
+// Unit coverage for lib/context-usage.js (P2 预防性水位压缩 + 第 3 层运行中边界加固)：
+//   - estimateClaudeContextUsage 从文件末尾向前扫到最近主链 compact_boundary，
+//     取 max(最近有效主链 assistant usage 或 postTokens, ceil(segmentBytes / 3.0))
+//   - 0-usage / <synthetic> / isApiErrorMessage / isSidechain 均不计入有效 usage
+//   - 无有效 usage 且无消息负载 / 文件不存在 → null
 //   - shouldPreemptiveCompact：[1m] / 普通窗口 × 高低水位组合
 async function testContextUsage() {
   const {
+    canSyncClaudeSnapshot,
     estimateClaudeContextUsage,
+    estimateMessageBytes,
+    inspectClaudeTranscriptContext,
+    isOneMillionContext,
     shouldPreemptiveCompact,
+    sumUsageTokens,
   } = require('../lib/context-usage');
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-usage-'));
 
-  const usageLine = (usage) => JSON.stringify({
+  const usageLine = (usage, extra = {}) => JSON.stringify({
     type: 'assistant',
-    message: { content: [{ type: 'text', text: 'ok' }], usage },
+    ...extra,
+    message: { content: [{ type: 'text', text: 'ok' }], ...(extra.model ? { model: extra.model } : {}), usage },
   });
 
   const jsonlPath = path.join(tempDir, 'session.jsonl');
@@ -1773,9 +1780,92 @@ async function testContextUsage() {
 
   assert(estimateClaudeContextUsage(jsonlPath) === 1000, 'estimate should sum the LAST usage-bearing assistant line (900+90+10)');
 
+  // 0-usage 占位行必须返回 null（sumUsageTokens），且不得覆盖更早的有效 usage
+  assert(sumUsageTokens({ input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }) === null,
+    'sumUsageTokens must treat all-zero usage as null');
+  const zeroUsageOnlyPath = path.join(tempDir, 'zero-usage-only.jsonl');
+  fs.writeFileSync(zeroUsageOnlyPath, `${usageLine({ input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })}\n`);
+  assert(inspectClaudeTranscriptContext(zeroUsageOnlyPath)?.usageTokens === null,
+    '0-usage assistant line must yield usageTokens === null');
+  const zeroAfterValidPath = path.join(tempDir, 'zero-after-valid.jsonl');
+  fs.writeFileSync(zeroAfterValidPath, [
+    usageLine({ input_tokens: 4000, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 }),
+    usageLine({ input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }),
+    usageLine({ input_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, { model: '<synthetic>' }),
+    usageLine({ input_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, { isApiErrorMessage: true }),
+    '',
+  ].join('\n'));
+  assert(inspectClaudeTranscriptContext(zeroAfterValidPath)?.usageTokens === 5000,
+    '0-usage, <synthetic>, and isApiErrorMessage lines must be skipped when resolving usageTokens');
+
+  // 旁支（isSidechain: true）既不计入 usageTokens，也不计入主链 segmentBytes
+  const sidechainPath = path.join(tempDir, 'sidechain.jsonl');
+  fs.writeFileSync(sidechainPath, [
+    usageLine({ input_tokens: 2000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }),
+    JSON.stringify({
+      type: 'assistant',
+      isSidechain: true,
+      message: {
+        content: [{ type: 'text', text: 'x'.repeat(20000) }],
+        usage: { input_tokens: 999999, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      },
+    }),
+    '',
+  ].join('\n'));
+  const sidechainSnap = inspectClaudeTranscriptContext(sidechainPath);
+  assert(sidechainSnap?.usageTokens === 2000, 'sidechain usage must not override main-chain usageTokens');
+  assert(sidechainSnap?.segmentBytes < 1000, 'sidechain payload must not inflate main-chain segmentBytes');
+
+  // compact_boundary 截断倒扫并回退到 postTokens，不越界读到压缩前的大 usage
+  const compactBoundaryPath = path.join(tempDir, 'compact-boundary.jsonl');
+  fs.writeFileSync(compactBoundaryPath, [
+    usageLine({ input_tokens: 241946, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }),
+    JSON.stringify({
+      type: 'system',
+      subtype: 'compact_boundary',
+      isSidechain: false,
+      compactMetadata: { trigger: 'manual', preTokens: 250552, postTokens: 14633 },
+    }),
+    JSON.stringify({ type: 'user', message: { content: 'continue task' } }),
+    '',
+  ].join('\n'));
+  const compactSnap = inspectClaudeTranscriptContext(compactBoundaryPath);
+  assert(compactSnap?.usageTokens === null, 'compact_boundary without post-compact assistant usage must have usageTokens === null');
+  assert(compactSnap?.postCompactTokens === 14633, 'compact_boundary must fall back to compactMetadata.postTokens');
+  assert(compactSnap?.lastCompactLineOffset > 0, 'compact_boundary must record byte offset');
+  assert(estimateClaudeContextUsage(compactBoundaryPath) === 14633,
+    'estimateClaudeContextUsage after compact_boundary must return postTokens (14633), not pre-compact 241946');
+
+  // effectiveTokens 取 max(usageTokens, estimatedSegmentTokens)
+  const inflatedSegmentPath = path.join(tempDir, 'inflated-segment.jsonl');
+  fs.writeFileSync(inflatedSegmentPath, [
+    JSON.stringify({ type: 'user', message: { content: 'tool_result:' + 'A'.repeat(300000) } }),
+    usageLine({ input_tokens: 5000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }),
+    '',
+  ].join('\n'));
+  const inflatedSnap = inspectClaudeTranscriptContext(inflatedSegmentPath);
+  assert(inflatedSnap?.usageTokens === 5000, 'inflated segment fixture should retain API usageTokens=5000');
+  assert(inflatedSnap?.estimatedSegmentTokens > 100000, 'inflated segment should estimate > 100k tokens');
+  assert(inflatedSnap?.effectiveTokens === inflatedSnap?.estimatedSegmentTokens && inflatedSnap.effectiveTokens > 100000,
+    'effectiveTokens must take max(usageTokens, estimatedSegmentTokens)');
+
+  const binaryMessage = { content: [{ type: 'tool_result', content: [
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'A'.repeat(2000000) } },
+    { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'A'.repeat(2000000) } },
+    { type: 'text', text: 'visible text' },
+  ] }] };
+  const binaryPath = path.join(tempDir, 'binary.jsonl');
+  fs.writeFileSync(binaryPath, `${JSON.stringify({ type: 'user', message: binaryMessage })}\n`);
+  assert(estimateMessageBytes(binaryMessage) < 1000, 'nested image and PDF base64 must not count as text');
+  assert(inspectClaudeTranscriptContext(binaryPath)?.segmentBytes === estimateMessageBytes(binaryMessage),
+    'disk and live estimates must use the same calculation');
+
   const noUsagePath = path.join(tempDir, 'no-usage.jsonl');
   fs.writeFileSync(noUsagePath, `${JSON.stringify({ type: 'assistant', message: { content: [] } })}\n`);
-  assert(estimateClaudeContextUsage(noUsagePath) === null, 'jsonl without usage must return null');
+  assert(inspectClaudeTranscriptContext(noUsagePath)?.usageTokens === null, 'jsonl without usage must have usageTokens === null');
+  const metadataOnlyPath = path.join(tempDir, 'meta-only.jsonl');
+  fs.writeFileSync(metadataOnlyPath, `${JSON.stringify({ type: 'progress', data: { step: 1 } })}\n`);
+  assert(estimateClaudeContextUsage(metadataOnlyPath) === null, 'jsonl without messages or usage must return null');
   assert(estimateClaudeContextUsage(path.join(tempDir, 'missing.jsonl')) === null, 'missing file must return null');
 
   // 4 combos: window size from model label × water level (threshold 80%)
@@ -1784,6 +1874,13 @@ async function testContextUsage() {
   assert(shouldPreemptiveCompact(160000, 'claude-sonnet-4-6', 80) === true, '200k window: 160k reaches 80% threshold');
   assert(shouldPreemptiveCompact(159999, 'claude-sonnet-4-6', 80) === false, '200k window: 159,999 is below 80% threshold');
   assert(shouldPreemptiveCompact(null, 'claude-opus-4-6[1m]', 80) === false, 'null usage must never preempt');
+  assert(!isOneMillionContext('claude-opus-4-6[1m]', 'true'), 'disabled 1M must use ordinary window');
+  assert(shouldPreemptiveCompact(160000, 'claude-opus-4-6[1m]', 80, '1'), 'disabled 1M must preempt at 160k');
+  assert(!canSyncClaudeSnapshot({ afterOffset: 100 }, { lastCompactLineOffset: 100 }), 'old boundary cannot unlock sync');
+  assert(canSyncClaudeSnapshot({ afterOffset: 100 }, { lastCompactLineOffset: 101 }), 'new boundary without UUID must unlock sync');
+  assert(!canSyncClaudeSnapshot({ afterOffset: null }, { lastCompactLineOffset: 101 }), 'unknown baseline must not unlock sync');
+  assert(!canSyncClaudeSnapshot({ uuid: 'new' }, { lastCompactUuid: 'old', lastCompactLineOffset: 101 }), 'different UUID cannot unlock sync');
+  assert(canSyncClaudeSnapshot({ uuid: 'new' }, { lastCompactUuid: 'new' }), 'matching UUID must unlock sync');
 
   fs.rmSync(tempDir, { recursive: true, force: true });
   console.log('Context usage estimation checks passed.');
@@ -3017,7 +3114,10 @@ async function main() {
 
   // P2 unit tests: lib/context-usage.js (watermark estimation + preempt threshold)
   await testContextUsage();
+  await testClaudeAutoCompactWindow();
   await testRecoveryReplayRuntime();
+  await testMidRunRecoveryAttach();
+  await testMidRunContextGuard();
 
   // Static + HTTP-header checks for XSS hardening (Goal 2)
   await testXssHardening();
@@ -4687,6 +4787,348 @@ async function testClaudeSnapshotRecovery() {
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
   console.log('Claude snapshot recovery checks passed.');
+}
+
+// 第 1 层单测：buildClaudeSpawnSpec 注入 CLAUDE_CODE_AUTO_COMPACT_WINDOW 的各种边界
+async function testClaudeAutoCompactWindow() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  const settingsStart = source.indexOf('function resolveClaudeContextSettings(');
+  const settingsEnd = source.indexOf('\nconst SETTINGS_API_KEYS', settingsStart);
+  let fakeSettings = {};
+  const resolveContext = new Function('fs', 'CLAUDE_SETTINGS_PATH', 'loadModelConfig', 'MODEL_MAP',
+    `${source.slice(settingsStart, settingsEnd)}\nreturn resolveClaudeContextSettings;`)(
+    { readFileSync: () => JSON.stringify(fakeSettings) }, 'settings.json', () => ({ mode: 'local' }),
+    { opus: 'claude-opus-4-6[1m]' },
+  );
+  fakeSettings = { model: 'opus', env: { CLAUDE_CODE_DISABLE_1M_CONTEXT: 'true' } };
+  const disabled = resolveContext({ model: null }, {});
+  assert(disabled.model === 'claude-opus-4-6[1m]' && disabled.disable1m === '1',
+    'default alias and settings disable flag must both be resolved');
+  fakeSettings = { model: 'claude-opus-4-6[1m]' };
+  assert(resolveContext({ model: null }, {}).model === 'claude-opus-4-6[1m]', 'missing session model must use settings default');
+  const makeRuntime = (extraEnv = {}, resolve = null) => createAgentRuntime({
+    processEnv: { HOME: os.tmpdir(), ...extraEnv },
+    CLAUDE_PATH: 'claude',
+    CODEX_PATH: 'codex',
+    MODEL_MAP: {},
+    loadModelConfig: () => ({ mode: 'local' }),
+    applyCustomTemplateToSettings: () => {},
+    loadCodexConfig: () => ({ gateway: 'direct-apirouter' }),
+    prepareCodexCustomRuntime: () => null,
+    resolveAnthropicGateway: () => ({ baseUrl: 'https://apirouter.example', authToken: 'tok' }),
+    gatewayParts: () => ({ gateway: 'direct-apirouter', transport: 'direct', upstream: 'apirouter' }),
+    wsSend: () => {},
+    truncateObj: (x) => x,
+    sanitizeToolInput: (_, x) => x,
+    isInjectedClaudeUserEntry: () => false,
+    loadSession: () => null,
+    saveSession: () => {},
+    setRuntimeSessionId: () => {},
+    getRuntimeSessionId: () => null,
+    resolveClaudeContextSettings: resolve,
+  });
+
+  const baseOpts = { settingsPath: '/tmp/test-claude-settings.json' };
+  const std = makeRuntime().buildClaudeSpawnSpec({ model: 'gemini-4-hydrogen', permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(std.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '200000', 'Non-1M model must inject 200000 into env');
+  assert(std.settingsEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '200000', 'Non-1M model must inject 200000 into settingsEnv');
+
+  const onem = makeRuntime().buildClaudeSpawnSpec({ model: 'claude-opus-4-6[1m]', permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(onem.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '800000', '1M model must inject 800000 into env');
+  assert(onem.settingsEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '800000', '1M model must inject 800000 into settingsEnv');
+
+  const dis1m = makeRuntime({ CLAUDE_CODE_DISABLE_1M_CONTEXT: '1' })
+    .buildClaudeSpawnSpec({ model: 'claude-opus-4-6[1m]', permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(dis1m.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '200000', 'CLAUDE_CODE_DISABLE_1M_CONTEXT=1 must fall back to 200000');
+
+  const defaultModel = makeRuntime({}, resolveContext)
+    .buildClaudeSpawnSpec({ model: null, permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(defaultModel.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '800000', 'default settings model must set 1M window');
+  fakeSettings = { model: 'opus', env: { CLAUDE_CODE_DISABLE_1M_CONTEXT: 'true' } };
+  const settingsDisabled = makeRuntime({}, resolveContext)
+    .buildClaudeSpawnSpec({ model: null, permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(settingsDisabled.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '200000', 'settings disable flag must set ordinary window');
+
+  const off = makeRuntime({ CC_WEB_CLAUDE_AUTOCOMPACT_WINDOW: '0' })
+    .buildClaudeSpawnSpec({ model: 'gemini-4-hydrogen', permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(!off.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW && !off.settingsEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+    'CC_WEB_CLAUDE_AUTOCOMPACT_WINDOW=0 must disable injection');
+
+  const customWin = makeRuntime({ CC_WEB_CLAUDE_AUTOCOMPACT_WINDOW: '350000' })
+    .buildClaudeSpawnSpec({ model: 'gemini-4-hydrogen', permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(customWin.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '350000', 'Explicit CC_WEB_CLAUDE_AUTOCOMPACT_WINDOW must be respected');
+
+  const disAuto = makeRuntime({ DISABLE_AUTO_COMPACT: '1' })
+    .buildClaudeSpawnSpec({ model: 'gemini-4-hydrogen', permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(!disAuto.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, 'DISABLE_AUTO_COMPACT=1 must skip injection');
+
+  const ext = makeRuntime({ CLAUDE_CODE_AUTO_COMPACT_WINDOW: '500000' })
+    .buildClaudeSpawnSpec({ model: 'gemini-4-hydrogen', permissionMode: 'yolo', cwd: '/tmp' }, baseOpts);
+  assert(ext.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW === '500000' && !ext.settingsEnv.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+    'External CLAUDE_CODE_AUTO_COMPACT_WINDOW must be preserved without override');
+
+  const promptStart = source.indexOf('function buildMidRunContinuationPrompt(');
+  const promptEnd = source.indexOf('\nfunction clearMidRunGraceTimer(', promptStart);
+  const { buildMidRunContinuationPrompt, recoverMidRunInput } = new Function(
+    `${source.slice(promptStart, promptEnd)}\nreturn { buildMidRunContinuationPrompt, recoverMidRunInput };`,
+  )();
+  assert(recoverMidRunInput(' /compact\n').isCompact && recoverMidRunInput('/compact').rootTaskText === null,
+    'recovered compact must not become a task');
+  const root = 'original task\n\n原始任务要求：\nkeep this nested text';
+  const recovered = recoverMidRunInput(buildMidRunContinuationPrompt(root, 2));
+  assert(recovered.hideInHistory && recovered.count === 2 && recovered.rootTaskText === root,
+    'recovered continuation must restore the original task and retry count');
+  const revisedPrompt = buildMidRunContinuationPrompt(root, 3).replace('请基于压缩摘要与当前工作区已落盘的真实状态，直接接着完成先前尚未收尾的工作，不要从头重复已经完成的步骤。', '请继续尚未完成的任务。');
+  const revised = recoverMidRunInput(revisedPrompt);
+  assert(revised.hideInHistory && revised.count === 3 && revised.rootTaskText === root,
+    'recovery must preserve the task when continuation instructions change');
+  const noRoot = recoverMidRunInput(buildMidRunContinuationPrompt('', 1));
+  assert(noRoot.hideInHistory && noRoot.count === 1 && noRoot.rootTaskText === '', 'continuation without a root must remain hidden');
+  const fallback = recoverMidRunInput('normal task');
+  assert(!fallback.hideInHistory && fallback.rootTaskText === 'normal task', 'normal tasks must be unchanged');
+
+  const configStart = source.indexOf('function parsePositiveIntEnv(');
+  const configEnd = source.indexOf('\n// 单次用户请求连续触发运行中熔断续跑计数', configStart);
+  const limitsStart = source.indexOf('function getClaudeMidRunLimits(');
+  const limitsEnd = source.indexOf('\nfunction evaluateMidRunContextGuard(', limitsStart);
+  const limitsFor = (env, oneMillion) => new Function('process',
+    `${source.slice(configStart, configEnd)}\n${source.slice(limitsStart, limitsEnd)}\nreturn getClaudeMidRunLimits;`,
+  )({ env })(oneMillion);
+  const limitsEqual = (actual, expected) => JSON.stringify(actual) === JSON.stringify(expected);
+  assert(limitsEqual(limitsFor({}, false), { live: 170000, persisted: 170000, emergency: 180000 }), 'ordinary model defaults');
+  assert(limitsEqual(limitsFor({ CC_WEB_MIDRUN_CLAUDE_LIVE_LIMIT: 'abc', CC_WEB_MIDRUN_PERSISTED_LIMIT: '0', CC_WEB_MIDRUN_EMERGENCY_LIMIT: '-1' }, true),
+    { live: 820000, persisted: 800000, emergency: 900000 }), 'invalid overrides must preserve 1M defaults');
+  assert(limitsEqual(limitsFor({ CC_WEB_MIDRUN_CLAUDE_LIVE_LIMIT: '12junk', CC_WEB_MIDRUN_LIVE_LIMIT: '710000', CC_WEB_MIDRUN_PERSISTED_LIMIT: '700000', CC_WEB_MIDRUN_EMERGENCY_LIMIT: '850000' }, true),
+    { live: 710000, persisted: 700000, emergency: 850000 }), 'valid overrides and legacy fallback must apply');
+
+  const runtime = makeRuntime();
+  const guard = { lastDiskBoundaryOffset: 80, inFlightToolIds: new Set() };
+  runtime.processClaudeEvent({ contextGuard: guard, ws: null },
+    { type: 'system', subtype: 'compact_boundary' }, 'session');
+  assert(guard.diskSyncAfterBoundary.afterOffset === 80, 'UUID-less compact must retain its disk baseline');
+  console.log('Claude auto-compact window injection and recovery metadata checks passed.');
+}
+
+async function testMidRunRecoveryAttach() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-midrun-recovery-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const projectDir = path.join(homeDir, '.claude', 'projects', 'test-project');
+  for (const dir of [configDir, sessionsDir, logsDir, projectDir]) mkdirp(dir);
+  const children = [];
+  const cases = [
+    { id: 'compact-recovery', input: '/compact' },
+    { id: 'hidden-recovery', input: '[系统提示：上一轮执行过程中因上下文接近窗口安全上限，cc-web 已在第 2 次安全边界暂停并完成了 /compact 上下文压缩。]\n\n请基于压缩摘要与当前工作区已落盘的真实状态，直接接着完成先前尚未收尾的工作，不要从头重复已经完成的步骤。\n\n原始任务要求：\noriginal task' },
+  ];
+  cases.push({ id: 'disabled-1m', input: cases[1].input, usage: 170000 });
+  try {
+    for (const item of cases) {
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: true });
+      children.push(child);
+      const run = path.join(sessionsDir, `${item.id}-run`);
+      mkdirp(run);
+      fs.writeFileSync(path.join(run, 'pid'), String(child.pid));
+      fs.writeFileSync(path.join(run, 'input.txt'), item.input);
+      fs.writeFileSync(path.join(run, 'output.jsonl'), '');
+      fs.writeFileSync(path.join(run, 'error.log'), '');
+      fs.writeFileSync(path.join(sessionsDir, `${item.id}.json`), JSON.stringify({
+        id: item.id, agent: 'claude', claudeSessionId: item.id,
+        model: 'claude-opus-4-6[1m]', cwd: tempRoot, permissionMode: 'yolo', messages: [],
+      }));
+      fs.writeFileSync(path.join(projectDir, `${item.id}.jsonl`), `${JSON.stringify({
+        type: 'assistant', message: { content: [], usage: { input_tokens: item.usage || 850000 } },
+      })}\n`);
+    }
+    const port = await getFreePort();
+    await withServer({
+      PORT: String(port), CC_WEB_PASSWORD: 'RecoveryGuard!234', CC_WEB_CONFIG_DIR: configDir,
+      CC_WEB_SESSIONS_DIR: sessionsDir, CC_WEB_LOGS_DIR: logsDir, HOME: homeDir,
+      CODEX_HOME: path.join(homeDir, '.codex'), CLAUDE_PATH: MOCK_CLAUDE,
+      CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
+      CC_WEB_MIDRUN_MAX_CONTINUATIONS: '2', CC_WEB_MIDRUN_MONITOR_INTERVAL_MS: '200',
+    }, async () => {
+      const logPath = path.join(logsDir, 'process.log');
+      const records = () => {
+        try { return fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)); } catch { return []; }
+      };
+      await waitForCondition(() => records().some((r) => r.event === 'midrun_context_abort' && r.sessionId === 'hidden-r'),
+        'recovered hidden continuation must still be checked');
+      await waitForCondition(() => records().some((r) => r.event === 'midrun_context_abort' && r.sessionId === 'disabled'),
+        'disabled 1M must trigger at the ordinary-model threshold');
+      await sleep(1200);
+      assert(children[0].exitCode === null && children[0].signalCode === null, 'recovered /compact must not be interrupted');
+      assert(!records().some((r) => r.event === 'midrun_context_abort' && r.sessionId === 'compact-'),
+        'recovered /compact must bypass context guard');
+      await waitForCondition(() => records().some((r) => r.event === 'process_complete' && r.sessionId === 'hidden-r'),
+        'recovered hidden continuation must finish after guard interruption');
+      assert(!records().some((r) => r.event === 'process_spawn' && r.sessionId === 'hidden-r'),
+        'recovered retry count at the limit must prevent another compact');
+    });
+  } finally {
+    for (const child of children) { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); }
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+  console.log('Mid-run recovery attach checks passed.');
+}
+
+// 第 2 层闭环：运行中双指标熔断 → 等待在途工具收尾 → SIGINT 保存进度 → /compact → 隐藏续跑 → 超上限停机 + Codex 800k 停机
+async function testMidRunContextGuard() {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-midrun-guard-'));
+  const configDir = path.join(tempRoot, 'config');
+  const sessionsDir = path.join(tempRoot, 'sessions');
+  const logsDir = path.join(tempRoot, 'logs');
+  const homeDir = path.join(tempRoot, 'home');
+  const workDir = path.join(tempRoot, 'work');
+  for (const dir of [configDir, sessionsDir, logsDir, homeDir, workDir]) mkdirp(dir);
+  const password = 'MidRunGuard!234';
+  const port = await getFreePort();
+  const mockStateFiles = [];
+
+  try {
+    await withServer({
+      PORT: String(port),
+      CC_WEB_PASSWORD: password,
+      CC_WEB_CONFIG_DIR: configDir,
+      CC_WEB_SESSIONS_DIR: sessionsDir,
+      CC_WEB_LOGS_DIR: logsDir,
+      HOME: homeDir,
+      CODEX_HOME: path.join(homeDir, '.codex'),
+      CLAUDE_PATH: MOCK_CLAUDE,
+      CODEX_PATH: MOCK_CODEX,
+      CC_WEB_MIDRUN_PERSISTED_LIMIT: '350000',
+      CC_WEB_MIDRUN_MAX_CONTINUATIONS: '2',
+      CC_WEB_MIDRUN_GRACE_MS: '5000',
+      CC_WEB_MIDRUN_MONITOR_INTERVAL_MS: '200',
+    }, async () => {
+      const { ws, messages } = await connectWs(port, password);
+      await nextMessage(messages, ws, (msg) => msg.type === 'session_list');
+
+      // 1) Claude 连续 450KB tool_result 在第 3 个 tool_result 收尾后熔断 → /compact → 隐藏续跑 → done(willContinue=false)
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo', taskMode: 'local' }));
+      const s1 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude');
+      const sid1 = s1.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'trigger claude midrun guard', sessionId: sid1, mode: 'yolo', agent: 'claude' }));
+
+      const midrunNotice1 = await nextMessage(messages, ws, (msg) => (
+        msg.type === 'system_message' && /运行中上下文接近安全上限/.test(msg.message || '')
+      ));
+      assert(midrunNotice1.kind === 'compact', 'Mid-run abort notice must have kind=compact');
+      const done1 = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid1 && msg.willContinue === true);
+      assert(done1.willContinue === true, 'Aborted turn before /compact must set willContinue=true');
+
+      await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /Claude compact finished/.test(msg.text || ''));
+      await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /上下文已压缩/.test(msg.message || ''));
+      const contDelta1 = await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /MIDRUN_CONTINUATION_COMPLETED: HAS_ROOT/.test(msg.text || ''));
+      assert(/MIDRUN_CONTINUATION_COMPLETED: HAS_ROOT/.test(contDelta1.text || ''), 'Continuation turn must receive rootTaskText');
+      const finalDone1 = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid1 && msg.willContinue === false);
+      assert(finalDone1.willContinue === false, 'Final continuation turn must emit done with willContinue=false');
+      assert(!messages.some((msg) => msg.type === 'error'), 'Mid-run abort + continuation must not emit error messages');
+
+      const saved1 = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sid1}.json`), 'utf8'));
+      if (saved1.claudeSessionId) mockStateFiles.push(path.join(os.tmpdir(), `cc-web-mock-claude-${saved1.claudeSessionId}.json`));
+      const userMsgs1 = (saved1.messages || []).filter((m) => m.role === 'user');
+      assert(userMsgs1.length === 1 && userMsgs1[0].content === 'trigger claude midrun guard',
+        `Mid-run continuation must not add visible user messages (got ${userMsgs1.length})`);
+      const assistantMsgs1 = (saved1.messages || []).filter((m) => m.role === 'assistant');
+      assert(assistantMsgs1.length >= 2, `Expected phase + continuation assistant messages (got ${assistantMsgs1.length})`);
+      assert(/MIDRUN_HALF_PROGRESS_TEXT/.test(assistantMsgs1[0].content || ''), 'First-half text must be saved');
+      assert((assistantMsgs1[0].toolCalls || []).length === 3 && assistantMsgs1[0].toolCalls.every((t) => t.done === true),
+        `First-half must persist exactly 3 completed tool calls (got ${(assistantMsgs1[0].toolCalls || []).length})`);
+
+      const mockState1 = JSON.parse(fs.readFileSync(path.join(os.tmpdir(), `cc-web-mock-claude-${saved1.claudeSessionId}.json`), 'utf8'));
+      assert(mockState1.sigintAtStep === 3 && mockState1.sigintInFlight === false,
+        `SIGINT must arrive after 3rd tool_result finishes (step=${mockState1.sigintAtStep}, inFlight=${mockState1.sigintInFlight})`);
+
+      const spawns1 = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'process_spawn' && e.sessionId === sid1.slice(0, 8));
+      assert(spawns1.length === 3, `Expected 3 spawns (run + compact + continuation), got ${spawns1.length}`);
+
+      // 2) 在途工具宽限期：liveTokens >= 820k 在 assistant 阶段触发，但必须等正在进行的 tool_use 收尾后才发 SIGINT
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo', taskMode: 'local' }));
+      const s2 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.sessionId !== sid1);
+      const sid2 = s2.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'trigger claude midrun grace', sessionId: sid2, mode: 'yolo', agent: 'claude' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /MIDRUN_CONTINUATION_COMPLETED/.test(msg.text || ''));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid2 && msg.willContinue === false);
+      const saved2 = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sid2}.json`), 'utf8'));
+      if (saved2.claudeSessionId) mockStateFiles.push(path.join(os.tmpdir(), `cc-web-mock-claude-${saved2.claudeSessionId}.json`));
+      const mockState2 = JSON.parse(fs.readFileSync(path.join(os.tmpdir(), `cc-web-mock-claude-${saved2.claudeSessionId}.json`), 'utf8'));
+      assert(mockState2.sigintAtStep === 1 && mockState2.sigintInFlight === false,
+        `Grace mode must wait for in-flight tool completion before SIGINT (inFlight=${mockState2.sigintInFlight})`);
+
+      // 3) 防无限续跑护栏：连续超过 CC_WEB_MIDRUN_MAX_CONTINUATIONS=2 后正常停机告警
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo', taskMode: 'local' }));
+      const s3 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && msg.sessionId !== sid1 && msg.sessionId !== sid2);
+      const sid3 = s3.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'trigger claude midrun overflow loop', sessionId: sid3, mode: 'yolo', agent: 'claude' }));
+      const limitNotice = await nextMessage(messages, ws, (msg) => (
+        msg.type === 'system_message' && /连续 2 次触发运行中上下文保护上限/.test(msg.message || '')
+      ));
+      assert(limitNotice.kind === 'compact', 'Max continuations notice must be emitted');
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid3 && msg.willContinue === false);
+      const saved3 = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sid3}.json`), 'utf8'));
+      if (saved3.claudeSessionId) mockStateFiles.push(path.join(os.tmpdir(), `cc-web-mock-claude-${saved3.claudeSessionId}.json`));
+      const aborts3 = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'midrun_context_abort' && e.sessionId === sid3.slice(0, 8));
+      assert(aborts3.length === 3, `Expected 3 mid-run aborts (2 continuations + 1 stop), got ${aborts3.length}`);
+
+      // 4) Codex 运行中 rollout last_token_usage > 800,000：安全暂停，不注入 /compact
+      ws.send(JSON.stringify({
+        type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', taskMode: 'local', codexGateway: 'direct-apirouter',
+      }));
+      const s4 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex');
+      const sid4 = s4.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'trigger codex midrun limit', sessionId: sid4, mode: 'yolo', agent: 'codex' }));
+      const codexNotice = await nextMessage(messages, ws, (msg) => (
+        msg.type === 'system_message' && /Codex 运行中上下文已超过安全阈值/.test(msg.message || '')
+      ));
+      assert(/850,000/.test(codexNotice.message || ''), `Codex notice must include approximate token count (got ${codexNotice.message})`);
+      const codexDone = await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid4 && msg.willContinue === false);
+      assert(codexDone.willContinue === false, 'Codex mid-run pause must not auto-continue with /compact');
+      const codexSpawns = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'process_spawn' && e.sessionId === sid4.slice(0, 8));
+      assert(codexSpawns.length === 1, `Codex mid-run pause must never spawn /compact (got ${codexSpawns.length})`);
+
+      // 累计 usage 超限但单次 usage 很低时不能误中断。
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'codex', cwd: workDir, mode: 'yolo', taskMode: 'local', codexGateway: 'direct-apirouter' }));
+      const sCum = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.sessionId !== sid4);
+      ws.send(JSON.stringify({ type: 'message', text: 'trigger codex cumulative usage', sessionId: sCum.sessionId, mode: 'yolo', agent: 'codex' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'text_delta' && /CODEX_CUMULATIVE_OK/.test(msg.text || ''));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sCum.sessionId && msg.willContinue === false);
+      const cumulativeAborts = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'midrun_context_abort' && e.sessionId === sCum.sessionId.slice(0, 8));
+      assert(cumulativeAborts.length === 0, 'Cumulative Codex usage must not trigger mid-run protection');
+
+      // 5) 隐藏续跑反复遇到 P0：只允许预算内再次 compact，然后暂停。
+      ws.send(JSON.stringify({ type: 'new_session', agent: 'claude', cwd: workDir, mode: 'yolo', taskMode: 'local' }));
+      const s5 = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'claude' && ![sid1, sid2, sid3].includes(msg.sessionId));
+      const sid5 = s5.sessionId;
+      ws.send(JSON.stringify({ type: 'message', text: 'trigger claude midrun p0 loop', sessionId: sid5, mode: 'yolo', agent: 'claude' }));
+      await nextMessage(messages, ws, (msg) => msg.type === 'system_message' && /连续 2 次自动压缩，续跑仍然超出上下文限制/.test(msg.message || ''));
+      await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === sid5 && msg.willContinue === false);
+      const saved5 = JSON.parse(fs.readFileSync(path.join(sessionsDir, `${sid5}.json`), 'utf8'));
+      if (saved5.claudeSessionId) mockStateFiles.push(path.join(os.tmpdir(), `cc-web-mock-claude-${saved5.claudeSessionId}.json`));
+      assert((saved5.messages || []).filter((m) => m.role === 'user').length === 1, 'P0 replay must remain hidden');
+      const spawns5 = fs.readFileSync(path.join(logsDir, 'process.log'), 'utf8')
+        .split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+        .filter((e) => e?.event === 'process_spawn' && e.sessionId === sid5.slice(0, 8));
+      assert(spawns5.length === 5, `Expected run + 2 compact/replay pairs, got ${spawns5.length}`);
+
+      ws.close();
+    });
+  } finally {
+    for (const f of mockStateFiles) {
+      try { fs.unlinkSync(f); } catch {}
+    }
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+  console.log('Mid-run context guard checks passed.');
 }
 
 main().catch((err) => {

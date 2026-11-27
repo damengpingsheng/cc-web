@@ -130,9 +130,139 @@ function readStdin() {
     process.exit(1);
   }
 
+  if (
+    effectiveInput === 'trigger claude midrun guard'
+    || effectiveInput === 'trigger claude midrun overflow loop'
+    || effectiveInput === 'trigger claude midrun grace'
+    || effectiveInput === 'trigger claude midrun p0 loop'
+    || (/上一轮执行过程中因上下文接近窗口安全上限/.test(effectiveInput) && state.midrunOverflowLoop)
+  ) {
+    if (effectiveInput === 'trigger claude midrun p0 loop') {
+      state.midrunP0Loop = true;
+      fs.writeFileSync(statePath, JSON.stringify(state));
+    }
+    if (effectiveInput === 'trigger claude midrun overflow loop') {
+      state.midrunOverflowLoop = true;
+      fs.writeFileSync(statePath, JSON.stringify(state));
+    }
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    if (homeDir) {
+      const projDir = path.join(homeDir, '.claude', 'projects', path.resolve(process.cwd()).replace(/^\//, '-').replace(/\//g, '-'));
+      fs.mkdirSync(projDir, { recursive: true });
+      const transcriptPath = path.join(projDir, `${sessionId}.jsonl`);
+      if (!fs.existsSync(transcriptPath)) {
+        fs.writeFileSync(transcriptPath, `${JSON.stringify({
+          type: 'user',
+          sessionId,
+          cwd: process.cwd(),
+          message: { role: 'user', content: effectiveInput },
+        })}\n`);
+      }
+    }
+    const isGraceMode = effectiveInput === 'trigger claude midrun grace';
+    let currentStep = 0;
+    let inFlight = false;
+    const recordSigint = () => {
+      try {
+        const cur = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+        Object.assign(state, cur);
+      } catch {}
+      state.sigintHistory = Array.isArray(state.sigintHistory) ? state.sigintHistory : [];
+      state.sigintHistory.push({ step: currentStep, inFlight });
+      state.sigintAtStep = currentStep;
+      state.sigintInFlight = inFlight;
+      fs.writeFileSync(statePath, JSON.stringify(state));
+      process.removeListener('SIGINT', recordSigint);
+      process.kill(process.pid, 'SIGINT');
+    };
+    process.on('SIGINT', recordSigint);
+
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    process.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      session_id: sessionId,
+      message: { content: [{ type: 'text', text: 'MIDRUN_HALF_PROGRESS_TEXT' }] },
+    })}\n`);
+
+    const totalSteps = isGraceMode ? 1 : 5;
+    for (let i = 1; i <= totalSteps; i++) {
+      currentStep = i;
+      inFlight = true;
+      const toolUseId = `call_midrun_${i}`;
+      const usage = isGraceMode
+        ? { input_tokens: 850000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 10 }
+        : { input_tokens: 1000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 10 };
+      process.stdout.write(`${JSON.stringify({
+        type: 'assistant',
+        session_id: sessionId,
+        message: {
+          content: [{ type: 'tool_use', id: toolUseId, name: 'Read', input: { file_path: `/tmp/file-${i}.txt` } }],
+          usage,
+        },
+      })}\n`);
+      await wait(isGraceMode ? 250 : 120);
+      process.stdout.write(`${JSON.stringify({
+        type: 'user',
+        session_id: sessionId,
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: toolUseId, content: isGraceMode ? 'ok' : 'X'.repeat(450 * 1024) }],
+        },
+      })}\n`);
+      inFlight = false;
+      await wait(350);
+    }
+
+    process.stdout.write(`${JSON.stringify({
+      type: 'result',
+      session_id: sessionId,
+      total_cost_usd: 0,
+      duration_api_ms: 500,
+      usage: { input_tokens: 1000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 20 },
+    })}\n`);
+    return;
+  }
+
+  if (/上一轮执行过程中因上下文接近窗口安全上限/.test(effectiveInput) && state.midrunP0Loop) {
+    process.stderr.write('API Error: Prompt is too long: 1048576 tokens > 1000000 maximum\n');
+    process.exit(1);
+  }
+
+  if (/上一轮执行过程中因上下文接近窗口安全上限/.test(effectiveInput)) {
+    const continuationText = `MIDRUN_CONTINUATION_COMPLETED: ${effectiveInput.includes('原始任务要求：') ? 'HAS_ROOT' : 'NO_ROOT'}`;
+    process.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      session_id: sessionId,
+      message: { content: [{ type: 'text', text: continuationText }] },
+    })}\n`);
+    process.stdout.write(`${JSON.stringify({
+      type: 'result',
+      session_id: sessionId,
+      total_cost_usd: 0,
+      duration_api_ms: 500,
+      usage: { input_tokens: 2000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 30 },
+    })}\n`);
+    return;
+  }
+
   if (effectiveInput === '/compact') {
+    const boundaryUuid = crypto.randomUUID();
     state.compacted = true;
     fs.writeFileSync(statePath, JSON.stringify(state));
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    if (homeDir) {
+      const projDir = path.join(homeDir, '.claude', 'projects', path.resolve(process.cwd()).replace(/^\//, '-').replace(/\//g, '-'));
+      const transcriptPath = path.join(projDir, `${sessionId}.jsonl`);
+      if (fs.existsSync(transcriptPath)) {
+        fs.appendFileSync(transcriptPath, `${JSON.stringify({
+          type: 'system',
+          subtype: 'compact_boundary',
+          uuid: boundaryUuid,
+          isSidechain: false,
+          compactMetadata: { trigger: 'manual', preTokens: 93158, postTokens: 5762 },
+        })}\n`);
+      }
+    }
     process.stdout.write(`${JSON.stringify({
       type: 'assistant',
       session_id: sessionId,
@@ -143,6 +273,7 @@ function readStdin() {
     process.stdout.write(`${JSON.stringify({
       type: 'system',
       subtype: 'compact_boundary',
+      uuid: boundaryUuid,
       compact_metadata: { trigger: 'manual', pre_tokens: 93158, post_tokens: 5762, duration_ms: 1234 },
       session_id: sessionId,
     })}\n`);

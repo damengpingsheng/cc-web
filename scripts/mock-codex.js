@@ -116,6 +116,43 @@ function readStdin() {
     return;
   }
 
+  if (input === 'trigger codex midrun limit' || input === 'trigger codex cumulative usage') {
+    const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    const rolloutDir = path.join(codexHome, 'sessions', '2026', '11', '26');
+    fs.mkdirSync(rolloutDir, { recursive: true });
+    const rolloutPath = path.join(rolloutDir, `rollout-2026-11-26T00-00-00-${threadId}.jsonl`);
+    const cumulative = input === 'trigger codex cumulative usage';
+    fs.writeFileSync(rolloutPath, [
+      JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: threadId } }),
+      JSON.stringify(cumulative ? {
+        timestamp: new Date().toISOString(), type: 'token_usage_record',
+        payload: { usage: { input_tokens: 1000 }, turn_token_usage: { input_tokens: 1500000 } },
+      } : {
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 850000, cached_input_tokens: 0, output_tokens: 100 } } },
+      }),
+      '',
+    ].join('\n'));
+    if (cumulative) {
+      setTimeout(() => {
+        process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { id: 'cum_msg', type: 'agent_message', text: 'CODEX_CUMULATIVE_OK' } })}\n`);
+        process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1000, output_tokens: 10 } })}\n`);
+      }, 1200);
+      return;
+    }
+    process.stdout.write(`${JSON.stringify({
+      type: 'item.completed',
+      item: { id: 'item_codex_midrun_msg', type: 'agent_message', text: 'CODEX_HALF_OUTPUT' },
+    })}\n`);
+    const keepAlive = setInterval(() => {}, 1000);
+    process.once('SIGINT', () => {
+      clearInterval(keepAlive);
+      process.exit(0);
+    });
+    return;
+  }
+
   if (input === 'trigger codex repeated empty final') {
     state.codexRepeatEmptyFinal = true;
     fs.writeFileSync(statePath, JSON.stringify(state));

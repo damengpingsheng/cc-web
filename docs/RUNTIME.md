@@ -128,8 +128,8 @@ handleProcessComplete                  ← server.js
 
 服务重启时 `recoverProcesses()` 扫描所有残留的 `*-run/` 目录：
 
-- 子进程仍存活 → 重新 attach（继续 tail）
-- 子进程已退出 → 把输出 finalize 进 session JSON
+- 子进程仍存活 → 重新 attach（初始化 `contextGuard` 并继续 tail）
+- 子进程已退出 → 把输出 finalize 进 session JSON（`recoveryReplay: true`，跳过运行中守护）
 
 **关键含义**：服务重启**不会**终止进行中的 Claude/Codex 工作。
 
@@ -207,6 +207,20 @@ CLI 执行压缩时 cc-web 把 compact 边界事件转成 `system_message`（`ki
 Codex 不注入 `/compact`：`codex exec` 会把它当普通用户消息，压缩轮多一条无意义回复；且 80% 水位（237,500 × 0.8 = 190,000）低于 Codex 自身的 `model_auto_compact_token_limit`（本机 200,000），中间区间只会白跑一轮。Codex 的压缩交给它自己在真实用户消息那一轮完成；真正撞 context limit 时仍由上面 P0 兜底。
 
 **零改变约束**：定位不到原生文件 / 无 usage / 解析异常 / 带附件（无法重放）/ 文本为空——一律静默走原流程。防循环护栏 `preemptCompactGuard`：预防压缩后直到观察到一次正常（非 slash 注入）运行完成、或用户手动 `/compact`、或删除会话之前，不再对同一会话重复预防压缩。
+
+`lib/context-usage.js` 的 `inspectClaudeTranscriptContext(jsonlPath)` 从末尾向前扫描到最近一条主链 `compact_boundary` 即停：跳过 `0-usage` 占位、`isSidechain`、`isApiErrorMessage` 与 `<synthetic>` 条目，未压缩完前优先回退 `compactMetadata.postTokens`，并将有效 `usageTokens` 与未压缩段负载字节估算（`ceil(segmentBytes / 3.0)`）取较大值作为 `effectiveTokens`，避免被内存态 microcompact 欺骗。
+
+#### 运行中上下文守护（三层纵深防御）
+
+为避免单轮长工具循环冲破上游 1M 硬上限导致 `--resume /compact` 自身也被拦截死锁，系统在运行时叠加三层保护：
+
+1. **第 1 层（原生压缩门控激活，`lib/agent-runtime.js::buildClaudeSpawnSpec`）**：默认向子进程 `env` 与 `--settings` env 注入 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`（`1m` 模型 `800000`，其余 `200000`，`CC_WEB_CLAUDE_AUTOCOMPACT_WINDOW=0` 可关闭），确保网关别名模型在工具循环内也能启用 Claude Code 原生自动压缩。
+2. **第 2 层（运行中双指标巡检与安全边界熔断续跑，`lib/agent-runtime.js` + `server.js`）**：
+   - `activeProcesses` entry 挂接内存态 `contextGuard`（跟踪 `liveUsageTokens`、`baseSegmentBytes + deltaSegmentBytes`、`inFlightToolIds`、`graceTimer`、`abortedForCompact`）。
+   - Claude 在 `processClaudeEvent` 的 `compact_boundary` 重置计数，在 `assistant` / `user(tool_result)` 实时累加字节并追踪在途工具；Codex 通过 15s 巡检增量读取 rollout `token_count` 并跟踪 `item.started` / `item.completed`。流式 compact 事件无 UUID 时，只有磁盘中 compact 边界的偏移大于已知旧边界才恢复磁盘校准；若旧边界不可知则本轮不再接受磁盘校准，避免把旧数据当成新压缩结果。
+   - 越过 `CC_WEB_MIDRUN_CLAUDE_LIVE_LIMIT`、`CC_WEB_MIDRUN_CODEX_LIVE_LIMIT` 或 `CC_WEB_MIDRUN_PERSISTED_LIMIT` 时：无在途工具（或突破 `CC_WEB_MIDRUN_EMERGENCY_LIMIT`）立即经 `SIGINT → SIGTERM → SIGKILL` 优雅终止；若有在途工具则启动 `CC_WEB_MIDRUN_GRACE_MS` 宽限期等待工具收尾。
+   - `handleProcessComplete` 区分 `abortedForCompact` 与 `abortedByUser`：先落盘前半程文本与已完成 `toolCalls`，Claude 侧若未超过 `CC_WEB_MIDRUN_MAX_CONTINUATIONS` 则经 `pendingSlashCommands` + `pendingCompactRetries`（`hideInHistory: true` + `rootTaskText`）自动 `/compact` 后隐藏续跑；Codex 侧在突破 `800000` 时安全停机提示而不注入无效 `/compact`。服务重启时可识别正在运行的 `/compact` 和隐藏续跑；但等待 `/compact` 完成后的重试任务仅保存在内存中，重启后不会自动恢复，需手动继续。
+3. **第 3 层（事前扫描加固，`lib/context-usage.js`）**：统一为 spawn 前 P2 校验与运行中基线提供 `inspectClaudeTranscriptContext` 估算快照。
 
 ### `/goal` 多轮自治
 
