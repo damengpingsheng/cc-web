@@ -181,6 +181,16 @@
     }
   }
   let sessionOverviewFavorites = loadSessionOverviewFavorites();
+  const SESSION_OVERVIEW_COLLAPSED_GROUPS_KEY = 'cc-web-session-overview-collapsed-groups';
+  function loadSessionOverviewCollapsedGroups() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SESSION_OVERVIEW_COLLAPSED_GROUPS_KEY) || '[]');
+      return new Set(Array.isArray(saved) ? saved.filter((key) => typeof key === 'string' && key) : []);
+    } catch {
+      return new Set();
+    }
+  }
+  let sessionOverviewCollapsedGroups = loadSessionOverviewCollapsedGroups();
   let sessionOverviewOpen = false;
   let sessionOverviewHistoryEntry = false;
   let sessionTitleAuditHistoryEntry = false;
@@ -1917,22 +1927,44 @@
       </div>`;
   }
 
-  function buildSessionOverviewGroup(title, groupSessions) {
+  function toggleSessionOverviewGroupCollapse(button) {
+    const groupKey = button?.dataset.overviewGroupKey || '';
+    const group = button?.closest('.session-overview-group');
+    const items = group?.querySelector('.session-overview-group-items');
+    if (!groupKey || !group || !items) return;
+    const collapsed = !sessionOverviewCollapsedGroups.has(groupKey);
+    if (collapsed) sessionOverviewCollapsedGroups.add(groupKey);
+    else sessionOverviewCollapsedGroups.delete(groupKey);
+    try {
+      localStorage.setItem(SESSION_OVERVIEW_COLLAPSED_GROUPS_KEY, JSON.stringify([...sessionOverviewCollapsedGroups]));
+    } catch {}
+    group.classList.toggle('collapsed', collapsed);
+    items.hidden = collapsed;
+    button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    const title = group.querySelector('.session-overview-group-heading h2')?.textContent || '会话';
+    button.setAttribute('aria-label', `${collapsed ? '展开' : '折叠'}分组 ${title}`);
+  }
+
+  function buildSessionOverviewGroup(title, groupSessions, groupKey) {
     const claudeCount = groupSessions.filter((session) => normalizeAgent(session.agent) === 'claude').length;
     const codexCount = groupSessions.length - claudeCount;
+    const collapsed = sessionOverviewCollapsedGroups.has(groupKey);
+    const itemsId = `session-overview-items-${encodeURIComponent(groupKey)}`;
     return `
-      <section class="session-overview-group">
+      <section class="session-overview-group${collapsed ? ' collapsed' : ''}">
         <header class="session-overview-group-header">
           <div class="session-overview-group-heading">
+            <span class="session-overview-group-arrow" aria-hidden="true">▾</span>
             <h2>${escapeHtml(title)}</h2>
-            <span>${groupSessions.length} 个会话</span>
+            <span class="session-overview-group-count">${groupSessions.length} 个会话</span>
           </div>
           <div class="session-overview-group-mix">
             ${claudeCount ? `<span class="agent-claude">Claude ${claudeCount}</span>` : ''}
             ${codexCount ? `<span class="agent-codex">Codex ${codexCount}</span>` : ''}
           </div>
+          <button type="button" class="session-overview-group-toggle" data-overview-group-toggle data-overview-group-key="${escapeHtml(groupKey)}" aria-expanded="${collapsed ? 'false' : 'true'}" aria-controls="${escapeHtml(itemsId)}" aria-label="${collapsed ? '展开' : '折叠'}分组 ${escapeHtml(title)}"></button>
         </header>
-        <div class="session-overview-group-items">${groupSessions.map(buildSessionOverviewItem).join('')}</div>
+        <div id="${escapeHtml(itemsId)}" class="session-overview-group-items"${collapsed ? ' hidden' : ''}>${groupSessions.map(buildSessionOverviewItem).join('')}</div>
       </section>`;
   }
 
@@ -2056,7 +2088,7 @@
       return;
     }
 
-    const sections = favoriteMatches.length > 0 ? [buildSessionOverviewGroup('置顶', favoriteMatches)] : [];
+    const sections = favoriteMatches.length > 0 ? [buildSessionOverviewGroup('置顶', favoriteMatches, 'favorite')] : [];
 
     const buckets = new Map();
     const groupOrder = [];
@@ -2081,7 +2113,8 @@
       });
       sections.push(...groupOrder.map((group) => {
         const items = group.id ? buckets.get(group.id) : ungrouped;
-        return items.length > 0 ? buildSessionOverviewGroup(group.title, items) : '';
+        const groupKey = group.id ? `group:${group.id}` : 'ungrouped';
+        return items.length > 0 ? buildSessionOverviewGroup(group.title, items, groupKey) : '';
       }));
     } else {
       const dateBuckets = new Map();
@@ -2092,7 +2125,7 @@
       }
       sections.push(...['今天', '昨天', '最近 7 天', '更早']
         .filter((label) => dateBuckets.has(label))
-        .map((label) => buildSessionOverviewGroup(label, dateBuckets.get(label))));
+        .map((label) => buildSessionOverviewGroup(label, dateBuckets.get(label), `date:${label}`)));
     }
     sessionOverviewList.innerHTML = sections.join('');
   }
@@ -7981,6 +8014,11 @@
     });
   });
   sessionOverviewList?.addEventListener('click', (e) => {
+    const groupToggle = e.target.closest('[data-overview-group-toggle]');
+    if (groupToggle) {
+      toggleSessionOverviewGroupCollapse(groupToggle);
+      return;
+    }
     const favoriteButton = e.target.closest('[data-overview-favorite-id]');
     if (favoriteButton) {
       toggleSessionOverviewFavorite(favoriteButton.dataset.overviewFavoriteId);
