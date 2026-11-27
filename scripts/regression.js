@@ -3852,6 +3852,8 @@ async function testSessionTitleAudit() {
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
       titleApiRequest = JSON.parse(body);
+      assert(req.headers['x-litellm-end-user-id'] === 'title-regression-user', 'Title API must identify the real end user');
+      assert(/^cc-web-title-audit-\d+$/.test(req.headers['x-session-id'] || ''), 'Title audit must send a stable per-request session id');
       const prompt = titleApiRequest.messages?.[0]?.content || '';
       const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
       const content = JSON.stringify(candidates.map((candidate) => ({ id: candidate.id, title: `整理后的标题：${candidate.oldTitle}` })));
@@ -3901,6 +3903,7 @@ async function testSessionTitleAudit() {
       CC_WEB_SESSIONS_DIR: sessionsDir,
       CC_WEB_LOGS_DIR: logsDir,
       HOME: homeDir,
+      CODEX_LITELLM_END_USER_ID: 'title-regression-user',
       CLAUDE_PATH: MOCK_CLAUDE,
       CODEX_PATH: MOCK_CODEX,
     }, async () => {
@@ -3986,6 +3989,7 @@ async function testAutoSessionTitle() {
   const port = await getFreePort();
   let apiRequests = 0;
   let titlePrompt = '';
+  let lastTitleSessionHeader = '';
   let jiraRequests = 0;
   const jiraApiServer = http.createServer((req, res) => {
     jiraRequests += 1;
@@ -4005,7 +4009,11 @@ async function testAutoSessionTitle() {
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', () => {
       apiRequests += 1;
-      const prompt = JSON.parse(body).messages?.[0]?.content || '';
+      titleApiRequest = JSON.parse(body);
+      assert(req.headers['x-litellm-end-user-id'] === 'title-regression-user', 'Auto-title API must identify the real end user');
+      lastTitleSessionHeader = req.headers['x-session-id'] || '';
+      assert(lastTitleSessionHeader, 'Auto-title API must send the source session id');
+      const prompt = titleApiRequest.messages?.[0]?.content || '';
       titlePrompt = prompt;
       const candidates = JSON.parse(prompt.slice(prompt.lastIndexOf('\n') + 1));
       const badTitles = [
@@ -4041,6 +4049,7 @@ async function testAutoSessionTitle() {
       CC_WEB_SESSIONS_DIR: sessionsDir,
       CC_WEB_LOGS_DIR: logsDir,
       HOME: homeDir,
+      CODEX_LITELLM_END_USER_ID: 'title-regression-user',
       JIRA_API_TOKEN: 'jira-test-token',
       JIRA_BASE_URL: `http://127.0.0.1:${jiraApiPort}`,
       CLAUDE_PATH: MOCK_CLAUDE,

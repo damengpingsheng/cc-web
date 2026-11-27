@@ -283,6 +283,15 @@ function getSummaryApiCredentials(summaryConfig) {
   return null;
 }
 
+function summaryApiIdentity() {
+  return String(
+    process.env.CODEX_LITELLM_END_USER_ID
+    || process.env.LOGNAME
+    || process.env.USER
+    || '',
+  ).trim();
+}
+
 function callSummaryApi(creds, prompt, options = {}) {
   return new Promise((resolve) => {
     try {
@@ -295,13 +304,17 @@ function callSummaryApi(creds, prompt, options = {}) {
         max_tokens: options.maxTokens || 1024,
         messages: [{ role: 'user', content: prompt }],
       });
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${creds.apiKey}`,
+        'Content-Length': Buffer.byteLength(body),
+      };
+      const endUser = summaryApiIdentity();
+      if (endUser) headers['X-LiteLLM-End-User-Id'] = endUser;
+      if (options.sessionId) headers['X-Session-Id'] = String(options.sessionId);
       const req = mod.request(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${creds.apiKey}`,
-          'Content-Length': Buffer.byteLength(body),
-        },
+        headers,
         timeout: options.timeoutMs || 20000,
       }, (res) => {
         let data = '';
@@ -311,18 +324,19 @@ function callSummaryApi(creds, prompt, options = {}) {
           try {
             const json = JSON.parse(data);
             const text = json.choices?.[0]?.message?.content || json.content?.[0]?.text || '';
-            resolve({ ok: !!text, text: text.trim() });
+            const error = text ? '' : (json.error?.message || `HTTP ${res.statusCode}：摘要 API 未返回文本`);
+            resolve({ ok: !!text, text: text.trim(), statusCode: res.statusCode, error });
           } catch {
-            resolve({ ok: false, text: '' });
+            resolve({ ok: false, text: '', statusCode: res.statusCode, error: `HTTP ${res.statusCode}：摘要 API 返回了无效 JSON` });
           }
         });
       });
-      req.on('error', () => resolve({ ok: false, text: '' }));
-      req.on('timeout', () => { req.destroy(); resolve({ ok: false, text: '' }); });
+      req.on('error', (error) => resolve({ ok: false, text: '', error: error.message }));
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, text: '', error: '摘要 API 请求超时' }); });
       req.write(body);
       req.end();
-    } catch {
-      resolve({ ok: false, text: '' });
+    } catch (error) {
+      resolve({ ok: false, text: '', error: error.message });
     }
   });
 }
@@ -2491,8 +2505,9 @@ async function handleAuditSessionTitles(ws) {
   }
 
   const enriched = await Promise.all(candidates.map(attachJiraIssues));
-  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(enriched), { maxTokens: 4096, timeoutMs: 45000 });
+  const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt(enriched), { maxTokens: 4096, timeoutMs: 45000, sessionId: `cc-web-title-audit-${Date.now()}` });
   const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, enriched) : new Map();
+  if (!result.ok) plog('WARN', 'session_title_api_failed', { error: result.error || 'no_text' });
   wsSend(ws, {
     type: 'session_title_audit',
     candidates: enriched.map((candidate) => ({
@@ -2502,7 +2517,7 @@ async function handleAuditSessionTitles(ws) {
     aiStatus: suggestions.size > 0 ? 'ready' : 'failed',
     aiMessage: suggestions.size > 0
       ? `已根据完整对话生成 ${suggestions.size} 条建议，请确认后应用。`
-      : '标题建议生成失败，候选已列出，可手工填写。',
+      : `标题建议生成失败${result.error ? `：${result.error}` : ''}，候选已列出，可手工填写。`,
   });
 }
 
@@ -2564,8 +2579,15 @@ function scheduleAutoSessionTitle(sessionId) {
 
   state.running = (async () => {
     const enrichedCandidate = await attachJiraIssues(candidate);
-    const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt([enrichedCandidate]), { maxTokens: 4096, timeoutMs: 45000 });
+    const result = await callSummaryApi(creds, buildSessionTitleSuggestionPrompt([enrichedCandidate]), { maxTokens: 4096, timeoutMs: 45000, sessionId });
     const suggestions = result.ok ? parseSessionTitleSuggestions(result.text, [enrichedCandidate]) : new Map();
+    if (!result.ok) {
+      plog('WARN', 'auto_title_api_failed', {
+        sessionId: sessionId.slice(0, 8),
+        statusCode: result.statusCode || null,
+        error: result.error || 'no_text',
+      });
+    }
     const suggestedTitle = suggestions.get(sessionId) || '';
     const newTitle = suggestedTitle && titleIncludesJiraSummary(suggestedTitle, enrichedCandidate)
       ? suggestedTitle
